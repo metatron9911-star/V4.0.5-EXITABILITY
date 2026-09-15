@@ -2,6 +2,8 @@ import json
 import math
 import pandas as pd
 import streamlit as st
+import io
+from datetime import datetime, timezone
 
 from engine import V4Engine, CFG, age_text
 from monitoring import RuntimeSupervisor
@@ -172,6 +174,49 @@ def candidate_table(engine: V4Engine) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+def _protocol_excel(engine, hours):
+    cutoff = int((__import__("time").time() - hours * 3600) * 1000)
+    positions = pd.DataFrame(engine.db.q(
+        "SELECT * FROM positions WHERE entry_ms>=? OR COALESCE(exit_ms,0)>=? ORDER BY id DESC", (cutoff, cutoff)))
+    ledger = pd.DataFrame(engine.db.q(
+        "SELECT * FROM ledger WHERE ts_ms>=? ORDER BY id DESC", (cutoff,)))
+    snapshots = pd.DataFrame(engine.db.q(
+        "SELECT * FROM snapshots WHERE ts_ms>=? ORDER BY ts_ms DESC", (cutoff,)))
+    candidates = pd.DataFrame(engine.db.q(
+        "SELECT * FROM candidates WHERE first_seen_ms>=? ORDER BY first_seen_ms DESC", (cutoff,)))
+
+    stats = engine.stats()
+    summary_rows = [
+        ["version", "v4.0.7"],
+        ["period_hours", hours],
+        ["starting_capital_usd", stats.get("paper_capital", 0)],
+        ["cash_usd", stats.get("cash", 0)],
+        ["open_marked_value_usd", stats.get("open_value", 0)],
+        ["total_equity_usd", stats.get("equity", 0)],
+        ["total_pnl_usd", stats.get("total_pnl", 0)],
+        ["realized_pnl_usd", stats.get("realized", 0)],
+        ["positions_in_period", len(positions)],
+        ["ledger_rows_in_period", len(ledger)],
+        ["snapshots_in_period", len(snapshots)],
+        ["candidates_in_period", len(candidates)],
+    ]
+    if not positions.empty and "status" in positions.columns:
+        closed = positions[positions["status"].eq("CLOSED")].copy()
+        summary_rows += [["closed_positions_in_period", len(closed)]]
+    else:
+        summary_rows += [["closed_positions_in_period", 0]]
+
+    summary = pd.DataFrame(summary_rows, columns=["metric", "value"])
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        summary.to_excel(w, index=False, sheet_name="SUMMARY")
+        positions.to_excel(w, index=False, sheet_name="POSITIONS")
+        ledger.to_excel(w, index=False, sheet_name="LEDGER")
+        snapshots.to_excel(w, index=False, sheet_name="SNAPSHOTS")
+        candidates.to_excel(w, index=False, sheet_name="CANDIDATES")
+    return out.getvalue()
+
+
 e = get_engine()
 sup = get_supervisor(e)
 
@@ -313,6 +358,36 @@ led = pd.DataFrame(
     )
 )
 st.dataframe(led, width="stretch", hide_index=True)
+
+
+st.subheader("📤 Export work protocol to Excel")
+periods = {
+    "1 hour": 1,
+    "4 hours": 4,
+    "12 hours": 12,
+    "24 hours": 24,
+    "7 days": 24 * 7,
+    "14 days": 24 * 14,
+    "1 month": 24 * 30,
+    "6 months": 24 * 183,
+    "1 year": 24 * 365,
+}
+label = st.selectbox("Protocol period", list(periods.keys()), index=3)
+try:
+    xbytes = _protocol_excel(e, periods[label])
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    st.download_button(
+        "⬇️ Download protocol .xlsx",
+        data=xbytes,
+        file_name=f"V4_protocol_{label.replace(' ', '_')}_{stamp}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    st.caption(
+        "Workbook sheets: SUMMARY, POSITIONS, LEDGER, SNAPSHOTS, CANDIDATES. "
+        "Export is read-only and does not change strategy or PAPER positions."
+    )
+except Exception as exc:
+    st.warning(f"Excel protocol unavailable: {exc!r}")
 
 st.subheader("🧪 Relaxed-gates Replay Lab")
 st.caption("Replays only the snapshots already stored in /data/v4.sqlite3. This is a diagnostic, not a claim of historical profitability. Sparse tokens are reported separately.")
