@@ -99,6 +99,8 @@ class MarketData:
         self.last_birdeye = {"ok": False, "status": "NOT TESTED", "ts_ms": 0, "items": 0, "detail": ""}
         self.last_dex = {"ok": False, "status": "NOT TESTED", "ts_ms": 0, "items": 0, "detail": ""}
         self._last_birdeye_poll_ms = 0
+        self._sol_price_cache = (0, 0.0)
+        self._priority_fee_cache = (0, 0)
 
     def birdeye_new_listings(self, force=False) -> List[Dict[str, Any]]:
         interval = int(os.getenv("BIRDEYE_POLL_INTERVAL_SEC", CFG.get("birdeye_poll_interval_sec", 1800)))
@@ -197,6 +199,100 @@ class MarketData:
         except Exception as exc:
             return {"ok":False,"reason":repr(exc)[:160]}
 
+    def swap_v2_order_quote(self, input_mint: str, output_mint: str, raw_amount: int) -> Dict[str, Any]:
+        """Read-only Jupiter Swap V2 order quote. No taker => no transaction/signing."""
+        if not self.jupiter_key:
+            return {"ok": False, "reason": "JUPITER_API_KEY missing"}
+        try:
+            r = self.s.get("https://api.jup.ag/swap/v2/order",
+                           headers={"x-api-key": self.jupiter_key},
+                           params={"inputMint": input_mint, "outputMint": output_mint, "amount": int(raw_amount)},
+                           timeout=10)
+            if not r.ok:
+                return {"ok": False, "reason": f"Jupiter V2 HTTP {r.status_code}"}
+            j = r.json()
+            if j.get("error") or not j.get("outAmount"):
+                return {"ok": False, "reason": str(j.get("error") or "no V2 quote")[:160]}
+            pf = j.get("platformFee") or {}
+            return {
+                "ok": True, "out_amount_raw": int(j.get("outAmount") or 0),
+                "price_impact_pct": float(j.get("priceImpact") or j.get("priceImpactPct") or 0),
+                "fee_bps": float(j.get("feeBps") or 0),
+                "platform_fee_bps": float(pf.get("feeBps") or 0),
+                "platform_fee_amount_raw": int(pf.get("amount") or 0),
+                "fee_mint": pf.get("feeMint") or j.get("feeMint") or "",
+                "router": j.get("router") or "", "mode": j.get("mode") or ""
+            }
+        except Exception as exc:
+            return {"ok": False, "reason": repr(exc)[:160]}
+
+    def entry_quote(self, mint: str, usd_amount: float) -> Dict[str, Any]:
+        q = self.swap_v2_order_quote(USDC_MINT, mint, max(1, int(usd_amount * 1_000_000)))
+        if not q.get("ok"):
+            return q
+        dec = self.token_decimals(mint)
+        if dec is None:
+            return {"ok": False, "reason": "token decimals unavailable"}
+        q["out_qty"] = float(q["out_amount_raw"]) / (10 ** dec)
+        return q
+
+    def sell_quote(self, mint: str, token_amount: float) -> Dict[str, Any]:
+        dec = self.token_decimals(mint)
+        if dec is None:
+            return {"ok": False, "reason": "token decimals unavailable"}
+        raw = max(1, int(token_amount * (10 ** dec)))
+        q = self.swap_v2_order_quote(mint, USDC_MINT, raw)
+        if q.get("ok"):
+            q["out_usdc"] = float(q["out_amount_raw"]) / 1_000_000
+        return q
+
+    def sol_price_usd(self) -> float:
+        ts, cached = self._sol_price_cache
+        if cached > 0 and now_ms() - ts < 60_000:
+            return cached
+        try:
+            sol_mint = "So11111111111111111111111111111111111111112"
+            r = self.s.get(f"https://api.dexscreener.com/latest/dex/tokens/{sol_mint}", timeout=6)
+            r.raise_for_status()
+            pairs = r.json().get("pairs") or []
+            pairs = [x for x in pairs if (x.get("chainId") or "").lower() == "solana"]
+            best = max(pairs, key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0))
+            px = float(best.get("priceUsd") or 0)
+            if px > 0:
+                self._sol_price_cache = (now_ms(), px)
+                return px
+        except Exception:
+            pass
+        return 0.0
+
+    def network_fee_estimate_usd(self) -> Tuple[float, Dict[str, Any]]:
+        """Estimate base + recent priority fee. Falls back to configured PAPER network cost."""
+        fallback = float(CFG.get("paper_network_cost_usd_per_tx", 0.01))
+        priority_lamports = 0
+        ts, cached = self._priority_fee_cache
+        if now_ms() - ts < 30_000:
+            priority_lamports = int(cached)
+        elif self.helius_key:
+            try:
+                r = self.s.post(f"https://mainnet.helius-rpc.com/?api-key={self.helius_key}",
+                    json={"jsonrpc":"2.0","id":1,"method":"getRecentPrioritizationFees","params":[]}, timeout=6)
+                vals = sorted(int(x.get("prioritizationFee") or 0) for x in (r.json().get("result") or []))
+                if vals:
+                    priority_lamports = vals[min(len(vals)-1, int(0.75*(len(vals)-1)))]
+                    self._priority_fee_cache = (now_ms(), priority_lamports)
+            except Exception:
+                pass
+        sol_px = self.sol_price_usd()
+        if sol_px <= 0:
+            return fallback, {"source": "config_fallback", "usd": fallback}
+        base_lamports = 5000
+        usd = (base_lamports + priority_lamports) / 1_000_000_000 * sol_px
+        # Keep a conservative floor because swaps may include tips/extra landing cost not visible in a quote-only request.
+        floor = float(CFG.get("paper_network_cost_floor_usd", fallback))
+        usd = max(usd, floor)
+        return usd, {"source": "solana+helius", "base_lamports": base_lamports,
+                     "priority_lamports_p75": priority_lamports, "sol_usd": sol_px, "usd": usd}
+
     def helius_health(self) -> Dict[str, Any]:
         if not self.helius_key:
             return {"ok": False, "status": "NO KEY", "detail": "HELIUS_API_KEY missing"}
@@ -242,7 +338,7 @@ class Scorer:
 
 
 class PositionManager:
-    """PAPER position manager for v4.0.8 COMPOUND HARVEST + MOONBAG + REENTRY GUARD.
+    """PAPER position manager for v4.0.8 TRUE-NET COMPOUND HARVEST + MOONBAG + REENTRY GUARD.
 
     Compound rule: every +15% from the current cycle anchor, harvest 10% of the
     current working base to cash; the remaining +5% becomes the next working base.
@@ -250,8 +346,9 @@ class PositionManager:
     The working leg can later stop/trail independently; the moonbag is kept for
     configured x10/x100-style milestones.
     """
-    def __init__(self, db: DBStore):
+    def __init__(self, db: DBStore, md: MarketData):
         self.db = db
+        self.md = md
         self.lock = threading.RLock()
 
     def _available_cash(self):
@@ -293,30 +390,61 @@ class PositionManager:
             n_open = self.db.q("SELECT COUNT(*) n FROM positions WHERE status IN ('OPEN','MOONBAG')")[0]["n"]
             if n_open >= int(CFG.get("max_open_positions", 1)):
                 return False
-            usd = float(CFG["position_size_usd"])
-            # Never create PAPER leverage accidentally: a new stake must be funded by PAPER cash.
-            if self._available_cash() + 1e-9 < usd:
+            stake_usd = float(CFG["position_size_usd"])
+            network_usd, net_meta = self.md.network_fee_estimate_usd()
+            q = self.md.entry_quote(mint, stake_usd)
+            if q.get("ok") and float(q.get("out_qty") or 0) > 0:
+                qty = float(q["out_qty"])
+                effective_entry = stake_usd / qty
+                mark_value = qty * price
+                execution_cost = max(0.0, stake_usd - mark_value)
+                qnote = (f"Jupiter V2 router={q.get('router') or '?'} fee={q.get('fee_bps',0):g}bps "
+                         f"platform={q.get('platform_fee_bps',0):g}bps impact={q.get('price_impact_pct',0):.4g}%")
+            else:
+                # Conservative fallback only if the quote service is temporarily unavailable.
+                fallback_pct = float(CFG.get("paper_friction_pct_per_buy", CFG.get("paper_friction_pct_per_sale", 0)))
+                execution_cost = stake_usd * fallback_pct / 100
+                qty = max(0.0, stake_usd - execution_cost) / price
+                effective_entry = stake_usd / qty if qty > 0 else price
+                qnote = f"quote fallback: {q.get('reason','unavailable')} / model {fallback_pct:g}%"
+            total_cash_cost = stake_usd + network_usd
+            total_cost_for_pnl = total_cash_cost
+            if self._available_cash() + 1e-9 < total_cash_cost:
                 return False
-            qty = usd / price
             self.db.execute("""INSERT INTO positions(
                 mint,symbol,status,entry_ms,entry_price,initial_usd,token_qty,remaining_qty,peak_price,
                 active_qty,moonbag_qty,compound_anchor_price,working_base_usd,harvest_count,moonbag_milestone_idx
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (mint, symbol, "OPEN", now_ms(), price, usd, qty, qty, price,
-                 qty, 0.0, price, usd, 0, 0))
+                (mint, symbol, "OPEN", now_ms(), effective_entry, total_cost_for_pnl, qty, qty, max(price,effective_entry),
+                 qty, 0.0, effective_entry, qty*effective_entry, 0, 0))
+            total_fee = execution_cost + network_usd
+            note = f"TRUE-NET paper BUY • {qnote} • network=${network_usd:.5f} ({net_meta.get('source')})"
             self.db.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                            (now_ms(), "PAPER", "BUY", mint, symbol, usd, qty, price, 0, "paper fill"))
-        notify(f"🟢 V4 PAPER BUY\n{symbol}\nEntry: ${price:.10g}\nPosition: ${usd:.2f}\nMode: PAPER")
+                            (now_ms(), "PAPER", "BUY", mint, symbol, total_cash_cost, qty, effective_entry, total_fee, note))
+        notify(f"🟢 V4 PAPER BUY TRUE-NET\n{symbol}\nMark: ${price:.10g}\nEffective entry: ${effective_entry:.10g}\nStake: ${stake_usd:.2f}\nEstimated costs: ${total_fee:.4f}\nMode: PAPER")
         return True
 
     def _sale(self, p, action, qty, price, note):
         if qty <= 0: return 0.0, 0.0
-        gross = qty * price
-        friction = gross * float(CFG["paper_friction_pct_per_sale"]) / 100 + float(CFG["paper_network_cost_usd_per_tx"])
-        net = max(0.0, gross - friction)
+        mark_gross = qty * price
+        network_usd, net_meta = self.md.network_fee_estimate_usd()
+        q = self.md.sell_quote(p["mint"], qty)
+        if q.get("ok"):
+            quoted_usdc = float(q.get("out_usdc") or 0)
+            execution_cost = max(0.0, mark_gross - quoted_usdc)
+            net = max(0.0, quoted_usdc - network_usd)
+            qnote = (f"Jupiter V2 router={q.get('router') or '?'} fee={q.get('fee_bps',0):g}bps "
+                     f"platform={q.get('platform_fee_bps',0):g}bps impact={q.get('price_impact_pct',0):.4g}%")
+        else:
+            fallback_pct = float(CFG.get("paper_friction_pct_per_sale", 0))
+            execution_cost = mark_gross * fallback_pct / 100
+            net = max(0.0, mark_gross - execution_cost - network_usd)
+            qnote = f"quote fallback: {q.get('reason','unavailable')} / model {fallback_pct:g}%"
+        total_cost = execution_cost + network_usd
+        full_note = f"{note} • TRUE-NET • {qnote} • network=${network_usd:.5f} ({net_meta.get('source')})"
         self.db.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (now_ms(), "PAPER", action, p["mint"], p["symbol"], net, qty, price, friction, note))
-        return net, friction
+                        (now_ms(), "PAPER", action, p["mint"], p["symbol"], net, qty, price, total_cost, full_note))
+        return net, total_cost
 
     def update(self, mint, price, position_id=None):
         if price <= 0: return False
@@ -444,7 +572,7 @@ class PositionManager:
 
 class V4Engine:
     def __init__(self):
-        self.db = DBStore(); self.md = MarketData(); self.sc = Scorer(); self.pm = PositionManager(self.db)
+        self.db = DBStore(); self.md = MarketData(); self.sc = Scorer(); self.pm = PositionManager(self.db, self.md)
         self.last_error = ""; self.last_scan = 0; self.scan_lock = threading.Lock(); self.exitability_alerted=set()
         self.scan_diag = {"status": "NOT RUN", "ts_ms": 0}
 
