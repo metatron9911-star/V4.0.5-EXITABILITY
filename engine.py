@@ -51,6 +51,25 @@ class DBStore:
               tx_sig TEXT, note TEXT
             );
             """)
+            # v4.0.7 additive migration: preserve the existing Railway SQLite database.
+            cols = {r[1] for r in self.cx.execute("PRAGMA table_info(positions)").fetchall()}
+            migrations = {
+                "active_qty": "REAL",
+                "moonbag_qty": "REAL DEFAULT 0",
+                "compound_anchor_price": "REAL",
+                "working_base_usd": "REAL",
+                "harvest_count": "INTEGER DEFAULT 0",
+                "moonbag_milestone_idx": "INTEGER DEFAULT 0"
+            }
+            for col, ddl in migrations.items():
+                if col not in cols:
+                    self.cx.execute(f"ALTER TABLE positions ADD COLUMN {col} {ddl}")
+            self.cx.execute("UPDATE positions SET active_qty=remaining_qty WHERE active_qty IS NULL")
+            self.cx.execute("UPDATE positions SET moonbag_qty=0 WHERE moonbag_qty IS NULL")
+            self.cx.execute("UPDATE positions SET compound_anchor_price=entry_price WHERE compound_anchor_price IS NULL OR compound_anchor_price<=0")
+            self.cx.execute("UPDATE positions SET working_base_usd=active_qty*compound_anchor_price WHERE working_base_usd IS NULL OR working_base_usd<=0")
+            self.cx.execute("UPDATE positions SET harvest_count=0 WHERE harvest_count IS NULL")
+            self.cx.execute("UPDATE positions SET moonbag_milestone_idx=0 WHERE moonbag_milestone_idx IS NULL")
             self.cx.commit()
     def q(self, sql, args=()):
         with self.lock:
@@ -218,75 +237,160 @@ class Scorer:
 
 
 class PositionManager:
+    """PAPER position manager for v4.0.7 COMPOUND HARVEST + MOONBAG.
+
+    Compound rule: every +15% from the current cycle anchor, harvest 10% of the
+    current working base to cash; the remaining +5% becomes the next working base.
+    After N compound harvests, a small token reserve is carved out as a moonbag.
+    The working leg can later stop/trail independently; the moonbag is kept for
+    configured x10/x100-style milestones.
+    """
     def __init__(self, db: DBStore):
         self.db = db
         self.lock = threading.RLock()
+
+    def _available_cash(self):
+        capital = float(CFG.get("paper_capital_usd", 150))
+        buys = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action='BUY'")[0]["n"] or 0)
+        proceeds = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action IN ('HARVEST','MOONBAG_HARVEST','EXIT')")[0]["n"] or 0)
+        return capital - buys + proceeds
+
     def open_paper(self, mint, symbol, price):
         if price <= 0: return False
-        # V4.0.6 invariant: one mint can have only one OPEN PAPER position.
-        # The lock makes the check+insert atomic inside this process.
         with self.lock:
-            if self.db.q("SELECT id FROM positions WHERE status='OPEN' AND mint=? LIMIT 1", (mint,)):
+            if self.db.q("SELECT id FROM positions WHERE status IN ('OPEN','MOONBAG') AND mint=? LIMIT 1", (mint,)):
                 return False
-            n_open = self.db.q("SELECT COUNT(*) n FROM positions WHERE status='OPEN'")[0]["n"]
+            n_open = self.db.q("SELECT COUNT(*) n FROM positions WHERE status IN ('OPEN','MOONBAG')")[0]["n"]
             if n_open >= int(CFG.get("max_open_positions", 1)):
                 return False
-            usd = float(CFG["position_size_usd"]); qty = usd / price
-            self.db.execute("INSERT INTO positions(mint,symbol,status,entry_ms,entry_price,initial_usd,token_qty,remaining_qty,peak_price) VALUES(?,?,?,?,?,?,?,?,?)",
-                            (mint, symbol, "OPEN", now_ms(), price, usd, qty, qty, price))
+            usd = float(CFG["position_size_usd"])
+            # Never create PAPER leverage accidentally: a new stake must be funded by PAPER cash.
+            if self._available_cash() + 1e-9 < usd:
+                return False
+            qty = usd / price
+            self.db.execute("""INSERT INTO positions(
+                mint,symbol,status,entry_ms,entry_price,initial_usd,token_qty,remaining_qty,peak_price,
+                active_qty,moonbag_qty,compound_anchor_price,working_base_usd,harvest_count,moonbag_milestone_idx
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (mint, symbol, "OPEN", now_ms(), price, usd, qty, qty, price,
+                 qty, 0.0, price, usd, 0, 0))
             self.db.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
                             (now_ms(), "PAPER", "BUY", mint, symbol, usd, qty, price, 0, "paper fill"))
         notify(f"🟢 V4 PAPER BUY\n{symbol}\nEntry: ${price:.10g}\nPosition: ${usd:.2f}\nMode: PAPER")
         return True
+
+    def _sale(self, p, action, qty, price, note):
+        if qty <= 0: return 0.0, 0.0
+        gross = qty * price
+        friction = gross * float(CFG["paper_friction_pct_per_sale"]) / 100 + float(CFG["paper_network_cost_usd_per_tx"])
+        net = max(0.0, gross - friction)
+        self.db.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (now_ms(), "PAPER", action, p["mint"], p["symbol"], net, qty, price, friction, note))
+        return net, friction
+
     def update(self, mint, price, position_id=None):
         if price <= 0: return False
         with self.lock:
             if position_id is None:
-                rows = self.db.q("SELECT * FROM positions WHERE status='OPEN' AND mint=? ORDER BY id LIMIT 1", (mint,))
+                rows = self.db.q("SELECT * FROM positions WHERE status IN ('OPEN','MOONBAG') AND mint=? ORDER BY id LIMIT 1", (mint,))
             else:
-                rows = self.db.q("SELECT * FROM positions WHERE status='OPEN' AND id=? AND mint=?", (position_id, mint))
+                rows = self.db.q("SELECT * FROM positions WHERE status IN ('OPEN','MOONBAG') AND id=? AND mint=?", (position_id, mint))
             if not rows: return False
             p = rows[0]
-        peak = max(float(p["peak_price"]), price)
-        self.db.execute("UPDATE positions SET peak_price=? WHERE id=?", (peak, p["id"]))
-        gain = (price / p["entry_price"] - 1) * 100
-        idx = int(p["milestone_idx"]); rem = float(p["remaining_qty"]); realized = float(p["realized_usd"])
-        milestones = CFG["milestones"]
-        while idx < len(milestones) and gain >= milestones[idx]["gain_pct"]:
-            cur = rem * price; basis = float(p["initial_usd"]) * (rem / float(p["token_qty"]))
-            profit = max(0, cur - basis); harvest = profit * milestones[idx]["harvest_profit_pct"] / 100
-            sell_qty = min(rem, harvest / price); gross = sell_qty * price
-            friction = gross * CFG["paper_friction_pct_per_sale"] / 100 + CFG["paper_network_cost_usd_per_tx"]
-            net = max(0, gross - friction); rem -= sell_qty; realized += net
-            self.db.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                            (now_ms(), "PAPER", "HARVEST", p["mint"], p["symbol"], net, sell_qty, price, friction, f"milestone +{milestones[idx]['gain_pct']}%"))
-            notify(f"💰 V4 PAPER HARVEST\n{p['symbol']}\nMilestone: +{milestones[idx]['gain_pct']}%\nHarvest NET: ${net:.2f}\nRealized total: ${realized:.2f}\nMoonbag continues")
-            idx += 1
-            self.db.execute("UPDATE positions SET remaining_qty=?,realized_usd=?,milestone_idx=? WHERE id=?", (rem, realized, idx, p["id"]))
-        first_hit = idx >= 1
-        stop_hit = ((not first_hit and price <= p["entry_price"] * (1 - CFG["pre_tp_stop_pct"] / 100)) or
-                    (first_hit and price <= peak * (1 - CFG["trailing_drawdown_after_first_milestone_pct"] / 100)))
+
+        peak = max(float(p["peak_price"] or p["entry_price"]), price)
+        active = float(p.get("active_qty") if p.get("active_qty") is not None else p["remaining_qty"] or 0)
+        moonbag = float(p.get("moonbag_qty") or 0)
+        anchor = float(p.get("compound_anchor_price") or p["entry_price"])
+        base = float(p.get("working_base_usd") or (active * anchor))
+        hcount = int(p.get("harvest_count") or 0)
+        mb_idx = int(p.get("moonbag_milestone_idx") or 0)
+        realized = float(p.get("realized_usd") or 0)
+
+        trigger_pct = float(CFG.get("compound_trigger_pct", 15))
+        cash_pct = float(CFG.get("compound_cash_pct_of_base", 10))
+        reserve_after = int(CFG.get("moonbag_reserve_after_harvests", 3))
+        reserve_pct = float(CFG.get("moonbag_reserve_pct_of_remaining", 10))
+
+        # Multiple cycles can be crossed in one price jump. Each cycle is anchored
+        # at the previous harvest price; gross harvest is 10% of that cycle's base.
+        while active > 0 and price >= anchor * (1 + trigger_pct / 100):
+            target_gross = base * cash_pct / 100
+            sell_qty = min(active, target_gross / price)
+            if sell_qty <= 0: break
+            net, friction = self._sale(p, "HARVEST", sell_qty, price,
+                                       f"compound +{trigger_pct:g}% / cash {cash_pct:g}% of base")
+            active -= sell_qty
+            realized += net
+            hcount += 1
+            anchor = price
+            base = active * price
+
+            # Once enough profit cycles have been banked, ring-fence a small tail.
+            if moonbag <= 0 and hcount >= reserve_after and active > 0 and reserve_pct > 0:
+                reserve = active * reserve_pct / 100
+                active -= reserve
+                moonbag += reserve
+                base = active * price
+                notify(f"🌙 V4 MOONBAG CREATED\n{p['symbol']}\nReserve: {reserve_pct:g}% of remaining tokens\nWorking leg continues")
+
+            remaining = active + moonbag
+            self.db.execute("""UPDATE positions SET remaining_qty=?,active_qty=?,moonbag_qty=?,realized_usd=?,
+                compound_anchor_price=?,working_base_usd=?,harvest_count=?,peak_price=? WHERE id=?""",
+                (remaining, active, moonbag, realized, anchor, base, hcount, peak, p["id"]))
+            notify(f"💰 V4 COMPOUND HARVEST\n{p['symbol']}\nCycle: +{trigger_pct:g}%\nCash NET: ${net:.2f}\nNew working base: ${base:.2f}\nHarvests: {hcount}\nMoonbag: {'ON' if moonbag>0 else 'not yet'}")
+
+        # Moonbag ladder is independent from the working leg and measured from entry.
+        mb_levels = CFG.get("moonbag_milestones", [])
+        entry = float(p["entry_price"])
+        multiple = price / entry if entry > 0 else 0
+        while moonbag > 0 and mb_idx < len(mb_levels) and multiple >= float(mb_levels[mb_idx]["multiple"]):
+            level = mb_levels[mb_idx]
+            sell_pct = float(level.get("sell_pct", 50))
+            sell_qty = moonbag * sell_pct / 100
+            net, friction = self._sale(p, "MOONBAG_HARVEST", sell_qty, price,
+                                       f"moonbag x{level['multiple']:g} / sell {sell_pct:g}%")
+            moonbag -= sell_qty
+            realized += net
+            mb_idx += 1
+            remaining = active + moonbag
+            self.db.execute("UPDATE positions SET remaining_qty=?,moonbag_qty=?,realized_usd=?,moonbag_milestone_idx=?,peak_price=? WHERE id=?",
+                            (remaining, moonbag, realized, mb_idx, peak, p["id"]))
+            notify(f"🌙💰 V4 MOONBAG HARVEST\n{p['symbol']}\nLevel: x{level['multiple']:g}\nCash NET: ${net:.2f}\nMoonbag remaining: {moonbag:.6g} tokens")
+
+        # Working-leg protection. Before any compound harvest use the hard stop.
+        # Afterwards trail from the local peak. The protected moonbag is NOT sold by this stop.
+        first_hit = hcount >= 1
+        stop_hit = active > 0 and ((not first_hit and price <= entry * (1 - float(CFG["pre_tp_stop_pct"]) / 100)) or
+                    (first_hit and price <= peak * (1 - float(CFG["trailing_drawdown_after_first_milestone_pct"]) / 100)))
         if stop_hit:
-            gross = rem * price; friction = gross * CFG["paper_friction_pct_per_sale"] / 100 + CFG["paper_network_cost_usd_per_tx"]
-            net = max(0, gross - friction); realized += net
-            reason = "pre-TP stop" if not first_hit else "50% trailing from peak"
-            # Atomic close guard: only the first caller may transition OPEN -> CLOSED.
+            sell_qty = active
+            net, friction = self._sale(p, "EXIT", sell_qty, price,
+                                       "pre-harvest stop" if not first_hit else "working-leg trailing stop")
+            realized += net
+            active = 0.0
+            remaining = moonbag
+            if moonbag > 0:
+                status, reason = "MOONBAG", "WORKING_STOP_MOONBAG_REMAINS"
+            else:
+                status, reason = "CLOSED", ("STOP" if not first_hit else "TRAILING")
             with self.db.lock:
-                cur = self.db.cx.execute(
-                    "UPDATE positions SET status='CLOSED',remaining_qty=0,realized_usd=?,exit_ms=?,exit_price=?,reason=? WHERE id=? AND status='OPEN'",
-                    (realized, now_ms(), price, "STOP" if not first_hit else "TRAILING", p["id"])
-                )
-                if cur.rowcount != 1:
-                    self.db.cx.rollback()
-                    return False
-                self.db.cx.execute(
-                    "INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (now_ms(), "PAPER", "EXIT", p["mint"], p["symbol"], net, rem, price, friction, reason)
-                )
+                self.db.cx.execute("""UPDATE positions SET status=?,remaining_qty=?,active_qty=0,moonbag_qty=?,realized_usd=?,
+                    exit_ms=?,exit_price=?,reason=?,peak_price=? WHERE id=?""",
+                    (status, remaining, moonbag, realized, now_ms(), price, reason, peak, p["id"]))
                 self.db.cx.commit()
-            pnl = realized - float(p["initial_usd"])
-            notify(f"🔴 V4 PAPER EXIT\n{p['symbol']}\nReason: {reason}\nExit: ${price:.10g}\nRealized proceeds: ${realized:.2f}\nP&L: ${pnl:+.2f}")
+            pnl_so_far = realized + moonbag * price - float(p["initial_usd"])
+            notify(f"🔴 V4 WORKING LEG EXIT\n{p['symbol']}\nExit: ${price:.10g}\nCash proceeds total: ${realized:.2f}\nMoonbag remains: {'YES' if moonbag>0 else 'NO'}\nMarked P&L: ${pnl_so_far:+.2f}")
             return True
+
+        # Fully close after the final moonbag sale if no working leg remains.
+        if active <= 0 and moonbag <= 0:
+            self.db.execute("UPDATE positions SET status='CLOSED',remaining_qty=0,reason='MOONBAG_COMPLETE',exit_ms=?,exit_price=?,peak_price=? WHERE id=?",
+                            (now_ms(), price, peak, p["id"]))
+        else:
+            status = "OPEN" if active > 0 else "MOONBAG"
+            self.db.execute("UPDATE positions SET status=?,remaining_qty=?,active_qty=?,moonbag_qty=?,realized_usd=?,peak_price=?,compound_anchor_price=?,working_base_usd=?,harvest_count=?,moonbag_milestone_idx=? WHERE id=?",
+                            (status, active+moonbag, active, moonbag, realized, peak, anchor, base, hcount, mb_idx, p["id"]))
         return True
 
 
@@ -323,7 +427,7 @@ class V4Engine:
         try:
             listings, src = self.md.discovery(); d.update(src); d["discovered"] = len(listings)
             # Always update open PAPER positions even if they are no longer in the discovery feed.
-            for p in self.db.q("SELECT id,mint,symbol,remaining_qty FROM positions WHERE status='OPEN'"):
+            for p in self.db.q("SELECT id,mint,symbol,remaining_qty FROM positions WHERE status IN ('OPEN','MOONBAG')"):
                 pair = self.md.dex_pair(p["mint"])
                 if pair:
                     price = float(pair.get("priceUsd") or 0)
@@ -382,9 +486,9 @@ class V4Engine:
     def stats(self):
         capital = float(CFG.get("paper_capital_usd", 150))
         buys = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action='BUY'")[0]["n"] or 0)
-        proceeds = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action IN ('HARVEST','EXIT')")[0]["n"] or 0)
+        proceeds = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action IN ('HARVEST','MOONBAG_HARVEST','EXIT')")[0]["n"] or 0)
         cash = capital - buys + proceeds
-        open_rows = self.db.q("SELECT mint,remaining_qty FROM positions WHERE status='OPEN'")
+        open_rows = self.db.q("SELECT mint,remaining_qty FROM positions WHERE status IN ('OPEN','MOONBAG')")
         open_value = 0.0
         for p in open_rows:
             row = self.db.q("SELECT price FROM candidates WHERE mint=?", (p["mint"],))
@@ -392,7 +496,7 @@ class V4Engine:
             open_value += float(p["remaining_qty"] or 0) * px
         equity = cash + open_value
         realized_pnl = float(self.db.q("SELECT COALESCE(SUM(realized_usd-initial_usd),0) n FROM positions WHERE status='CLOSED'")[0]["n"] or 0)
-        harvested = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action='HARVEST'")[0]["n"] or 0)
+        harvested = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action IN ('HARVEST','MOONBAG_HARVEST')")[0]["n"] or 0)
         return {
             "candidates": self.db.q("SELECT COUNT(*) n FROM candidates")[0]["n"],
             "open": len(open_rows),

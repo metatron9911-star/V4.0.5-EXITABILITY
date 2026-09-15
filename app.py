@@ -2,8 +2,6 @@ import json
 import math
 import pandas as pd
 import streamlit as st
-import io
-from datetime import datetime, timezone
 
 from engine import V4Engine, CFG, age_text
 from monitoring import RuntimeSupervisor
@@ -174,44 +172,10 @@ def candidate_table(engine: V4Engine) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
-
-def _protocol_excel(engine, hours):
-    cutoff = int((__import__("time").time() - hours * 3600) * 1000)
-    positions = pd.DataFrame(engine.db.q(
-        "SELECT * FROM positions WHERE entry_ms>=? OR COALESCE(exit_ms,0)>=? ORDER BY id DESC", (cutoff, cutoff)))
-    ledger = pd.DataFrame(engine.db.q(
-        "SELECT * FROM ledger WHERE ts_ms>=? ORDER BY id DESC", (cutoff,)))
-    snapshots = pd.DataFrame(engine.db.q(
-        "SELECT * FROM snapshots WHERE ts_ms>=? ORDER BY ts_ms DESC", (cutoff,)))
-    candidates = pd.DataFrame(engine.db.q(
-        "SELECT * FROM candidates WHERE first_seen_ms>=? ORDER BY first_seen_ms DESC", (cutoff,)))
-    summary_rows=[]
-    if not positions.empty:
-        closed=positions[positions.status.eq("CLOSED")].copy()
-        if not closed.empty:
-            closed["pnl_usd"]=closed["realized_usd"].fillna(0)-closed["initial_usd"].fillna(0)
-        summary_rows += [
-            ["period_hours", hours], ["positions", len(positions)],
-            ["closed", len(closed)], ["winners", int((closed.get("pnl_usd",pd.Series(dtype=float))>0).sum())],
-            ["losers", int((closed.get("pnl_usd",pd.Series(dtype=float))<0).sum())],
-            ["closed_pnl_usd", float(closed.get("pnl_usd",pd.Series(dtype=float)).sum())]
-        ]
-    else:
-        summary_rows += [["period_hours",hours],["positions",0],["closed",0],["winners",0],["losers",0],["closed_pnl_usd",0]]
-    summary=pd.DataFrame(summary_rows,columns=["metric","value"])
-    out=io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as w:
-        summary.to_excel(w,index=False,sheet_name="SUMMARY")
-        positions.to_excel(w,index=False,sheet_name="POSITIONS")
-        ledger.to_excel(w,index=False,sheet_name="LEDGER")
-        snapshots.to_excel(w,index=False,sheet_name="SNAPSHOTS")
-        candidates.to_excel(w,index=False,sheet_name="CANDIDATES")
-    return out.getvalue()
-
 e = get_engine()
 sup = get_supervisor(e)
 
-st.title("🚀 V4 Momentum Hunter — PAPER v4.0.6")
+st.title("🚀 V4 Momentum Hunter — PAPER v4.0.7")
 st.caption(
     "Solana momentum scanner • Moonbag Ladder • background PAPER scanner • "
     "transparent score/risk diagnostics • AUTO execution physically disabled"
@@ -261,14 +225,15 @@ c2.metric("Open PAPER", stats["open"])
 c3.metric("Closed", stats["closed"])
 c4.metric("Realized P&L", f"${stats['realized']:.2f}")
 
-st.subheader("🧾 PAPER accounting — v4.0.6")
+st.subheader("🧾 PAPER accounting — v4.0.7")
 a1,a2,a3,a4,a5 = st.columns(5)
 a1.metric("Starting capital", f"${stats['paper_capital']:.2f}")
 a2.metric("Cash", f"${stats['cash']:.2f}")
 a3.metric("Open marked value", f"${stats['open_value']:.2f}")
 a4.metric("Total equity", f"${stats['equity']:.2f}")
 a5.metric("Total P&L", f"${stats['total_pnl']:+.2f}")
-st.caption(f"Harvested proceeds (not profit by themselves): ${stats['harvested_proceeds']:.2f}. Realized P&L counts only fully CLOSED positions. Open value uses latest stored candidate price.")
+st.caption(f"Harvested cash proceeds: ${stats['harvested_proceeds']:.2f}. Realized P&L counts only fully CLOSED positions. Open value uses latest stored candidate price.")
+st.caption("v4.0.7 COMPOUND HARVEST: each +15% cycle banks 10% of the working base to CASH and compounds the remaining +5%. After 3 harvests, 10% of remaining tokens are ring-fenced as MOONBAG; 50% of that moonbag is harvested at x10 and x100.")
 
 st.subheader("🔬 Last scan diagnostics")
 d = dict(e.scan_diag or {})
@@ -335,7 +300,7 @@ st.subheader("📦 Positions")
 pos = pd.DataFrame(
     e.db.q(
         "SELECT id,symbol,status,entry_price,initial_usd,remaining_qty,peak_price,"
-        "realized_usd,milestone_idx,reason FROM positions ORDER BY id DESC LIMIT 100"
+        "realized_usd,working_base_usd,harvest_count,active_qty,moonbag_qty,moonbag_milestone_idx,reason FROM positions ORDER BY id DESC LIMIT 100"
     )
 )
 st.dataframe(pos, width="stretch", hide_index=True)
@@ -348,18 +313,6 @@ led = pd.DataFrame(
     )
 )
 st.dataframe(led, width="stretch", hide_index=True)
-
-
-st.subheader("📤 Export work protocol to Excel")
-periods={"1 hour":1,"12 hours":12,"24 hours":24,"7 days":24*7,"14 days":24*14,"1 month":24*30,"6 months":24*183,"1 year":24*365}
-label=st.selectbox("Protocol period", list(periods.keys()), index=2)
-try:
-    xbytes=_protocol_excel(e, periods[label])
-    stamp=datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    st.download_button("⬇️ Download protocol .xlsx", data=xbytes, file_name=f"V4_protocol_{label.replace(' ','_')}_{stamp}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.caption("Workbook sheets: SUMMARY, POSITIONS, LEDGER, SNAPSHOTS, CANDIDATES. Export is read-only and does not change strategy or PAPER positions.")
-except Exception as exc:
-    st.warning(f"Excel protocol unavailable: {exc!r}")
 
 st.subheader("🧪 Relaxed-gates Replay Lab")
 st.caption("Replays only the snapshots already stored in /data/v4.sqlite3. This is a diagnostic, not a claim of historical profitability. Sparse tokens are reported separately.")
