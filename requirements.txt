@@ -1,0 +1,5 @@
+streamlit>=1.37
+pandas>=2.2
+requests>=2.32
+websocket-client>=1.8
+python-dotenv>=1.0
