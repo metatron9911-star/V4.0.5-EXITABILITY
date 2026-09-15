@@ -1,5 +1,5 @@
 {
-  "version": "4.0.5",
+  "version": "4.0.6",
   "mode": "PAPER",
   "auto_trading_hard_lock": true,
   "chain": "solana",

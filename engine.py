@@ -218,22 +218,36 @@ class Scorer:
 
 
 class PositionManager:
-    def __init__(self, db: DBStore): self.db = db
+    def __init__(self, db: DBStore):
+        self.db = db
+        self.lock = threading.RLock()
     def open_paper(self, mint, symbol, price):
         if price <= 0: return False
-        n_open=self.db.q("SELECT COUNT(*) n FROM positions WHERE status='OPEN'")[0]["n"]
-        if n_open >= int(CFG.get("max_open_positions",1)): return False
-        usd = float(CFG["position_size_usd"]); qty = usd / price
-        self.db.execute("INSERT INTO positions(mint,symbol,status,entry_ms,entry_price,initial_usd,token_qty,remaining_qty,peak_price) VALUES(?,?,?,?,?,?,?,?,?)",
-                        (mint, symbol, "OPEN", now_ms(), price, usd, qty, qty, price))
-        self.db.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (now_ms(), "PAPER", "BUY", mint, symbol, usd, qty, price, 0, "paper fill"))
+        # V4.0.6 invariant: one mint can have only one OPEN PAPER position.
+        # The lock makes the check+insert atomic inside this process.
+        with self.lock:
+            if self.db.q("SELECT id FROM positions WHERE status='OPEN' AND mint=? LIMIT 1", (mint,)):
+                return False
+            n_open = self.db.q("SELECT COUNT(*) n FROM positions WHERE status='OPEN'")[0]["n"]
+            if n_open >= int(CFG.get("max_open_positions", 1)):
+                return False
+            usd = float(CFG["position_size_usd"]); qty = usd / price
+            self.db.execute("INSERT INTO positions(mint,symbol,status,entry_ms,entry_price,initial_usd,token_qty,remaining_qty,peak_price) VALUES(?,?,?,?,?,?,?,?,?)",
+                            (mint, symbol, "OPEN", now_ms(), price, usd, qty, qty, price))
+            self.db.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (now_ms(), "PAPER", "BUY", mint, symbol, usd, qty, price, 0, "paper fill"))
         notify(f"🟢 V4 PAPER BUY\n{symbol}\nEntry: ${price:.10g}\nPosition: ${usd:.2f}\nMode: PAPER")
         return True
-    def update(self, mint, price):
-        rows = self.db.q("SELECT * FROM positions WHERE status='OPEN' AND mint=?", (mint,))
-        if not rows or price <= 0: return
-        p = rows[0]; peak = max(float(p["peak_price"]), price)
+    def update(self, mint, price, position_id=None):
+        if price <= 0: return False
+        with self.lock:
+            if position_id is None:
+                rows = self.db.q("SELECT * FROM positions WHERE status='OPEN' AND mint=? ORDER BY id LIMIT 1", (mint,))
+            else:
+                rows = self.db.q("SELECT * FROM positions WHERE status='OPEN' AND id=? AND mint=?", (position_id, mint))
+            if not rows: return False
+            p = rows[0]
+        peak = max(float(p["peak_price"]), price)
         self.db.execute("UPDATE positions SET peak_price=? WHERE id=?", (peak, p["id"]))
         gain = (price / p["entry_price"] - 1) * 100
         idx = int(p["milestone_idx"]); rem = float(p["remaining_qty"]); realized = float(p["realized_usd"])
@@ -256,12 +270,24 @@ class PositionManager:
             gross = rem * price; friction = gross * CFG["paper_friction_pct_per_sale"] / 100 + CFG["paper_network_cost_usd_per_tx"]
             net = max(0, gross - friction); realized += net
             reason = "pre-TP stop" if not first_hit else "50% trailing from peak"
-            self.db.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                            (now_ms(), "PAPER", "EXIT", p["mint"], p["symbol"], net, rem, price, friction, reason))
-            self.db.execute("UPDATE positions SET status='CLOSED',remaining_qty=0,realized_usd=?,exit_ms=?,exit_price=?,reason=? WHERE id=?",
-                            (realized, now_ms(), price, "STOP" if not first_hit else "TRAILING", p["id"]))
+            # Atomic close guard: only the first caller may transition OPEN -> CLOSED.
+            with self.db.lock:
+                cur = self.db.cx.execute(
+                    "UPDATE positions SET status='CLOSED',remaining_qty=0,realized_usd=?,exit_ms=?,exit_price=?,reason=? WHERE id=? AND status='OPEN'",
+                    (realized, now_ms(), price, "STOP" if not first_hit else "TRAILING", p["id"])
+                )
+                if cur.rowcount != 1:
+                    self.db.cx.rollback()
+                    return False
+                self.db.cx.execute(
+                    "INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (now_ms(), "PAPER", "EXIT", p["mint"], p["symbol"], net, rem, price, friction, reason)
+                )
+                self.db.cx.commit()
             pnl = realized - float(p["initial_usd"])
-            notify(f"🔴 V4 PAPER EXIT\n{p['symbol']}\nReason: {reason}\nExit: ${price:.10g}\nRealized: ${realized:.2f}\nP&L: ${pnl:+.2f}")
+            notify(f"🔴 V4 PAPER EXIT\n{p['symbol']}\nReason: {reason}\nExit: ${price:.10g}\nRealized proceeds: ${realized:.2f}\nP&L: ${pnl:+.2f}")
+            return True
+        return True
 
 
 class V4Engine:
@@ -297,18 +323,23 @@ class V4Engine:
         try:
             listings, src = self.md.discovery(); d.update(src); d["discovered"] = len(listings)
             # Always update open PAPER positions even if they are no longer in the discovery feed.
-            for p in self.db.q("SELECT mint,symbol,remaining_qty FROM positions WHERE status='OPEN'"):
+            for p in self.db.q("SELECT id,mint,symbol,remaining_qty FROM positions WHERE status='OPEN'"):
                 pair = self.md.dex_pair(p["mint"])
                 if pair:
                     price = float(pair.get("priceUsd") or 0)
                     if price > 0:
-                        self.pm.update(p["mint"], price); d["open_positions_updated"] += 1
+                        self.pm.update(p["mint"], price, position_id=p["id"]); d["open_positions_updated"] += 1
                         q=self.md.exitability_quote(p["mint"],float(p.get("remaining_qty") or 0))
                         bad=(not q.get("ok")) or float(q.get("impact_pct") or 999)>float(CFG.get("exitability_emergency_impact_pct",10))
                         if bad:
                             d["open_exitability_bad"] += 1
                             if p["mint"] not in self.exitability_alerted:
-                                notify(f"🚨 V4 EXITABILITY ALERT\n{p.get('symbol')}\nSell route degraded/lost: {q.get('reason') or ('impact '+str(round(float(q.get('impact_pct') or 0),2))+'%')}\nPAPER only — inspect immediately")
+                                
+                                if not q.get("ok"):
+                                    detail = f"SELL ROUTE LOST — NO VALID QUOTE\nReason: {q.get('reason') or 'unknown'}"
+                                else:
+                                    detail = f"SELL ROUTE DEGRADED\nImpact: {float(q.get('impact_pct')):.2f}%"
+                                notify(f"🚨 V4 EXITABILITY ALERT\n{p.get('symbol')}\n{detail}\nPAPER only — inspect immediately")
                                 self.exitability_alerted.add(p["mint"])
                         else:
                             self.exitability_alerted.discard(p["mint"])
@@ -349,9 +380,24 @@ class V4Engine:
         return d
 
     def stats(self):
+        capital = float(CFG.get("paper_capital_usd", 150))
+        buys = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action='BUY'")[0]["n"] or 0)
+        proceeds = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action IN ('HARVEST','EXIT')")[0]["n"] or 0)
+        cash = capital - buys + proceeds
+        open_rows = self.db.q("SELECT mint,remaining_qty FROM positions WHERE status='OPEN'")
+        open_value = 0.0
+        for p in open_rows:
+            row = self.db.q("SELECT price FROM candidates WHERE mint=?", (p["mint"],))
+            px = float(row[0]["price"] or 0) if row else 0.0
+            open_value += float(p["remaining_qty"] or 0) * px
+        equity = cash + open_value
+        realized_pnl = float(self.db.q("SELECT COALESCE(SUM(realized_usd-initial_usd),0) n FROM positions WHERE status='CLOSED'")[0]["n"] or 0)
+        harvested = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action='HARVEST'")[0]["n"] or 0)
         return {
             "candidates": self.db.q("SELECT COUNT(*) n FROM candidates")[0]["n"],
-            "open": self.db.q("SELECT COUNT(*) n FROM positions WHERE status='OPEN'")[0]["n"],
+            "open": len(open_rows),
             "closed": self.db.q("SELECT COUNT(*) n FROM positions WHERE status='CLOSED'")[0]["n"],
-            "realized": self.db.q("SELECT COALESCE(SUM(realized_usd-initial_usd),0) n FROM positions WHERE status='CLOSED'")[0]["n"]
+            "realized": realized_pnl,
+            "paper_capital": capital, "cash": cash, "open_value": open_value,
+            "equity": equity, "total_pnl": equity-capital, "harvested_proceeds": harvested
         }

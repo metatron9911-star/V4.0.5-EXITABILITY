@@ -122,6 +122,7 @@ class RuntimeSupervisor:
             f"Discovery: {d.get('discovered',0)} • pairs {d.get('pairs_found',0)} • eligible {d.get('eligible',0)} • opened {d.get('paper_opened',0)}",
             f"Filters: no_pair {d.get('no_pair',0)} • low_liq {d.get('low_liquidity',0)} • low_score {d.get('low_score',0)} • high_risk {d.get('high_risk',0)} • exit_fail {d.get('exitability_failed',0)} • open_exit_bad {d.get('open_exitability_bad',0)}",
             f"PAPER: candidates {stats['candidates']} • open {stats['open']} • closed {stats['closed']} • realized P&L ${stats['realized']:.2f}",
+            f"PAPER equity: cash ${stats.get('cash',0):.2f} • open value ${stats.get('open_value',0):.2f} • equity ${stats.get('equity',0):.2f} • total P&L ${stats.get('total_pnl',0):+.2f}",
             "AUTO trading: HARD LOCKED"
         ]
         return "\n".join(lines)
