@@ -55,6 +55,11 @@ class DBStore:
               position_id INTEGER, reason TEXT, price REAL
             );
             CREATE INDEX IF NOT EXISTS idx_stop_events_mint_ts ON stop_events(mint, ts_ms);
+            CREATE TABLE IF NOT EXISTS trend_watch(
+              mint TEXT PRIMARY KEY, symbol TEXT, first_qualified_ms INTEGER, last_check_ms INTEGER,
+              history_score REAL, history_ok INTEGER, confirm_count INTEGER DEFAULT 0,
+              last_price REAL, metrics TEXT, reason TEXT
+            );
             """)
             # v4.0.7 additive migration: preserve the existing Railway SQLite database.
             cols = {r[1] for r in self.cx.execute("PRAGMA table_info(positions)").fetchall()}
@@ -162,6 +167,33 @@ class MarketData:
             return max(sol, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
         except Exception:
             return None
+
+    def birdeye_ohlcv(self, mint: str, hours: float = 5.0, interval: str = "5m") -> Dict[str, Any]:
+        """Historical token candles from Birdeye V3. Read-only.
+        Returns closed candles only where possible; no trading action.
+        """
+        if not self.birdeye_key:
+            return {"ok": False, "reason": "BIRDEYE_API_KEY missing", "items": []}
+        end = int(time.time())
+        start = end - int(hours * 3600)
+        try:
+            r = self.s.get("https://public-api.birdeye.so/defi/v3/ohlcv",
+                headers={"X-API-KEY": self.birdeye_key, "x-chain": "solana", "accept": "application/json"},
+                params={"address": mint, "type": interval, "currency": "usd",
+                        "time_from": start, "time_to": end, "mode": "range",
+                        "padding": "false", "outlier": "true"}, timeout=10)
+            if not r.ok:
+                return {"ok": False, "reason": f"Birdeye OHLCV HTTP {r.status_code}", "items": []}
+            j = r.json() if r.content else {}
+            items = ((j.get("data") or {}).get("items") or [])
+            items = [x for x in items if float(x.get("c") or 0) > 0 and int(x.get("unix_time") or 0) > 0]
+            items.sort(key=lambda x: int(x.get("unix_time") or 0))
+            # Ignore the current still-forming 5m candle.
+            sec = 300 if interval == "5m" else 60
+            closed = [x for x in items if int(x.get("unix_time") or 0) + sec <= end]
+            return {"ok": True, "items": closed, "reason": "", "source": "Birdeye V3 OHLCV"}
+        except Exception as exc:
+            return {"ok": False, "reason": repr(exc)[:180], "items": []}
 
     def token_decimals(self, mint: str) -> Optional[int]:
         if not self.helius_key:
@@ -338,7 +370,7 @@ class Scorer:
 
 
 class PositionManager:
-    """PAPER position manager for v4.0.8 TRUE-NET COMPOUND HARVEST + MOONBAG + REENTRY GUARD.
+    """PAPER position manager for v4.0.9 CAPITAL PROTECT + TRUE-NET + COMPOUND HARVEST + MOONBAG.
 
     Compound rule: every +15% from the current cycle anchor, harvest 10% of the
     current working base to cash; the remaining +5% becomes the next working base.
@@ -516,24 +548,38 @@ class PositionManager:
                             (remaining, moonbag, realized, mb_idx, peak, p["id"]))
             notify(f"🌙💰 V4 MOONBAG HARVEST\n{p['symbol']}\nLevel: x{level['multiple']:g}\nCash NET: ${net:.2f}\nMoonbag remaining: {moonbag:.6g} tokens")
 
-        # v4.0.8 working-leg protection.
-        # 1) Before the first +15% compound harvest, keep the emergency hard stop.
-        # 2) Once price has proved momentum by reaching +5% from entry, arm a +2% floor:
-        #    if it fades back to +2% or lower, exit the working leg instead of trading noise.
-        # 3) After a compound harvest, the existing peak trailing rule takes over.
+        # v4.0.9 CAPITAL PROTECT working-leg protection.
+        # We trade momentum, not sideways oscillation:
+        #   before +5% peak -> hard loss cap at -5% from effective entry;
+        #   after +5% peak  -> protect +3% from entry;
+        #   after +10% peak -> protect +6% from entry;
+        #   after first +15% compound harvest -> existing peak trailing takes over.
+        # A fast memecoin gap can still execute below these trigger levels; TRUE-NET sell quote
+        # records the executable result rather than pretending the stop price was guaranteed.
         first_hit = hcount >= 1
-        arm_pct = float(CFG.get("momentum_protect_arm_pct", 5))
-        floor_pct = float(CFG.get("momentum_protect_floor_pct", 2))
-        momentum_armed = peak >= entry * (1 + arm_pct / 100)
-        hard_stop = active > 0 and (not first_hit) and price <= entry * (1 - float(CFG["pre_tp_stop_pct"]) / 100)
-        momentum_fade = active > 0 and (not first_hit) and momentum_armed and price <= entry * (1 + floor_pct / 100)
+        hard_stop_pct = float(CFG.get("capital_protect_hard_stop_pct", 5))
+        arm1_pct = float(CFG.get("capital_protect_arm1_pct", 5))
+        floor1_pct = float(CFG.get("capital_protect_floor1_pct", 3))
+        arm2_pct = float(CFG.get("capital_protect_arm2_pct", 10))
+        floor2_pct = float(CFG.get("capital_protect_floor2_pct", 6))
+
+        peak_gain_pct = ((peak / entry) - 1) * 100 if entry > 0 else 0.0
+        hard_stop = active > 0 and (not first_hit) and price <= entry * (1 - hard_stop_pct / 100)
+        protect_floor = None
+        if not first_hit:
+            if peak_gain_pct >= arm2_pct:
+                protect_floor = floor2_pct
+            elif peak_gain_pct >= arm1_pct:
+                protect_floor = floor1_pct
+        momentum_fade = active > 0 and protect_floor is not None and price <= entry * (1 + protect_floor / 100)
         trailing_stop = active > 0 and first_hit and price <= peak * (1 - float(CFG["trailing_drawdown_after_first_milestone_pct"]) / 100)
         stop_hit = hard_stop or momentum_fade or trailing_stop
         if stop_hit:
             if momentum_fade:
-                exit_note, reason = "momentum fade after +5% arm / +2% floor", "MOMENTUM_FADE"
+                exit_note = f"capital protect after peak +{peak_gain_pct:.1f}% / floor +{protect_floor:g}%"
+                reason = "MOMENTUM_FADE"
             elif hard_stop:
-                exit_note, reason = "pre-harvest stop", "STOP"
+                exit_note, reason = f"capital protect hard stop -{hard_stop_pct:g}%", "STOP"
             else:
                 exit_note, reason = "working-leg trailing stop", "TRAILING"
             sell_qty = active
@@ -570,9 +616,120 @@ class PositionManager:
         return True
 
 
+class TrendAnalyzer:
+    """v4.1.0 PRE-ENTRY TREND ANALYZER.
+    Uses 5h of closed 5m OHLCV candles plus a live confirmation window.
+    It rejects one-candle pumps and late/chasing entries before PAPER BUY.
+    """
+    def __init__(self, db: DBStore, md: MarketData):
+        self.db, self.md = db, md
+
+    @staticmethod
+    def _pct(a, b):
+        return ((b / a) - 1.0) * 100.0 if a and a > 0 else 0.0
+
+    def history(self, mint: str) -> Dict[str, Any]:
+        hours = float(CFG.get("trend_history_hours", 5))
+        res = self.md.birdeye_ohlcv(mint, hours=hours, interval="5m")
+        if not res.get("ok"):
+            return {"ok": False, "score": 0.0, "reason": res.get("reason", "OHLCV unavailable"), "metrics": {}}
+        c = res.get("items") or []
+        min_candles = int(CFG.get("trend_min_candles", 24))
+        if len(c) < min_candles:
+            return {"ok": False, "score": 0.0, "reason": f"only {len(c)} closed candles", "metrics": {"candles": len(c)}}
+        closes=[float(x.get("c") or 0) for x in c]
+        opens=[float(x.get("o") or x.get("c") or 0) for x in c]
+        highs=[float(x.get("h") or x.get("c") or 0) for x in c]
+        lows=[float(x.get("l") or x.get("c") or 0) for x in c]
+        vols=[float(x.get("v_usd") or x.get("v") or 0) for x in c]
+        n=len(closes)
+        ret5=self._pct(closes[max(0,n-2)], closes[-1])
+        ret30=self._pct(closes[max(0,n-7)], closes[-1])
+        ret1h=self._pct(closes[max(0,n-13)], closes[-1])
+        ret3h=self._pct(closes[max(0,n-37)], closes[-1])
+        ret5h=self._pct(closes[0], closes[-1])
+        green=sum(1 for o,cl in zip(opens,closes) if cl>=o)/n
+        # Higher-high / higher-low persistence over adjacent candles.
+        hh=sum(1 for i in range(1,n) if highs[i]>=highs[i-1])/(n-1)
+        hl=sum(1 for i in range(1,n) if lows[i]>=lows[i-1])/(n-1)
+        peak=closes[0]; max_dd=0.0
+        for px in closes:
+            peak=max(peak,px); max_dd=min(max_dd, self._pct(peak,px))
+        candle_moves=[abs(self._pct(opens[i],closes[i])) for i in range(n)]
+        max_body=max(candle_moves) if candle_moves else 0.0
+        total_abs=sum(candle_moves) or 1.0
+        concentration=max_body/total_abs
+        recent_vol=sum(vols[-6:])/max(1,min(6,n))
+        prev_slice=vols[-18:-6] if n>=18 else vols[:-6]
+        prev_vol=sum(prev_slice)/max(1,len(prev_slice)) if prev_slice else recent_vol
+        vol_ratio=recent_vol/(prev_vol+1e-9) if prev_vol else (2.0 if recent_vol>0 else 1.0)
+        # How far current price is above the 5h median: catches very late entries.
+        med=sorted(closes)[n//2]
+        extension=self._pct(med,closes[-1])
+
+        score=0.0
+        score += clamp((green-0.48)/0.22*20,0,20)
+        score += clamp((hh-0.45)/0.25*12,0,12)
+        score += clamp((hl-0.45)/0.25*12,0,12)
+        score += clamp(ret1h/15*16,0,16)
+        score += clamp(ret3h/30*12,0,12)
+        score += clamp((vol_ratio-1)/2*12,0,12)
+        score += clamp((10-abs(ret30-5))/10*8,0,8)
+        score += 8 if 0 < ret5h < 80 else 0
+        # Pump/chase penalties.
+        if max_body > float(CFG.get("trend_max_single_candle_pct", 18)): score -= 25
+        if concentration > float(CFG.get("trend_max_move_concentration", 0.35)): score -= 20
+        if extension > float(CFG.get("trend_max_extension_pct", 45)): score -= 25
+        if max_dd < -float(CFG.get("trend_max_drawdown_pct", 22)): score -= 15
+        if ret5 > float(CFG.get("trend_max_last5m_pct", 12)): score -= 20
+        score=clamp(score,0,100)
+        metrics={"candles":n,"ret5m":round(ret5,2),"ret30m":round(ret30,2),"ret1h":round(ret1h,2),
+                 "ret3h":round(ret3h,2),"ret5h":round(ret5h,2),"green_ratio":round(green,3),
+                 "higher_high_ratio":round(hh,3),"higher_low_ratio":round(hl,3),
+                 "max_drawdown_pct":round(max_dd,2),"max_candle_body_pct":round(max_body,2),
+                 "move_concentration":round(concentration,3),"volume_accel":round(vol_ratio,2),
+                 "extension_vs_median_pct":round(extension,2)}
+        min_score=float(CFG.get("trend_min_history_score", 60))
+        ok=(score>=min_score and ret1h>float(CFG.get("trend_min_1h_return_pct",1.0)) and
+            ret3h>float(CFG.get("trend_min_3h_return_pct",0.0)) and
+            max_dd>=-float(CFG.get("trend_max_drawdown_pct",22)) and
+            max_body<=float(CFG.get("trend_max_single_candle_pct",18)) and
+            extension<=float(CFG.get("trend_max_extension_pct",45)))
+        reason="TREND_OK" if ok else "TREND_REJECT"
+        return {"ok":ok,"score":round(score,1),"reason":reason,"metrics":metrics}
+
+    def gate(self, mint: str, symbol: str, price: float) -> Dict[str, Any]:
+        """History must pass, then candidate must stay healthy for ~10 minutes before entry."""
+        hist=self.history(mint)
+        now=now_ms()
+        if not hist.get("ok"):
+            self.db.execute("INSERT INTO trend_watch(mint,symbol,first_qualified_ms,last_check_ms,history_score,history_ok,confirm_count,last_price,metrics,reason) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(mint) DO UPDATE SET last_check_ms=excluded.last_check_ms,history_score=excluded.history_score,history_ok=0,confirm_count=0,last_price=excluded.last_price,metrics=excluded.metrics,reason=excluded.reason",
+                (mint,symbol,0,now,float(hist.get("score") or 0),0,0,price,json.dumps(hist.get("metrics") or {}),hist.get("reason")))
+            return {"ok":False,"stage":"HISTORY","reason":hist.get("reason"),"score":hist.get("score",0),"metrics":hist.get("metrics",{})}
+        rows=self.db.q("SELECT * FROM trend_watch WHERE mint=?",(mint,))
+        watch_ms=int(float(CFG.get("trend_confirmation_minutes",10))*60*1000)
+        if not rows or not int(rows[0].get("history_ok") or 0):
+            self.db.execute("INSERT INTO trend_watch(mint,symbol,first_qualified_ms,last_check_ms,history_score,history_ok,confirm_count,last_price,metrics,reason) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(mint) DO UPDATE SET symbol=excluded.symbol,first_qualified_ms=excluded.first_qualified_ms,last_check_ms=excluded.last_check_ms,history_score=excluded.history_score,history_ok=1,confirm_count=1,last_price=excluded.last_price,metrics=excluded.metrics,reason='WATCHING'",
+                (mint,symbol,now,now,float(hist['score']),1,1,price,json.dumps(hist['metrics']),"WATCHING"))
+            return {"ok":False,"stage":"WATCH","reason":"confirmation started","score":hist['score'],"metrics":hist['metrics']}
+        w=rows[0]; first=int(w.get("first_qualified_ms") or now); last_price=float(w.get("last_price") or price)
+        live_change=self._pct(last_price,price)
+        # During confirmation, reject a fresh vertical spike or a material fade.
+        if live_change > float(CFG.get("trend_watch_max_jump_pct",12)) or live_change < -float(CFG.get("trend_watch_max_fade_pct",5)):
+            self.db.execute("UPDATE trend_watch SET first_qualified_ms=?,last_check_ms=?,confirm_count=0,last_price=?,history_score=?,metrics=?,reason=? WHERE mint=?",
+                (now,now,price,float(hist['score']),json.dumps(hist['metrics']),"WATCH_RESET",mint))
+            return {"ok":False,"stage":"WATCH","reason":f"watch reset {live_change:+.1f}%","score":hist['score'],"metrics":hist['metrics']}
+        count=int(w.get("confirm_count") or 0)+1
+        self.db.execute("UPDATE trend_watch SET last_check_ms=?,confirm_count=?,last_price=?,history_score=?,metrics=?,reason=? WHERE mint=?",
+            (now,count,price,float(hist['score']),json.dumps(hist['metrics']),"CONFIRMED" if now-first>=watch_ms else "WATCHING",mint))
+        if now-first < watch_ms:
+            return {"ok":False,"stage":"WATCH","reason":f"{int((now-first)/60000)}m/{int(watch_ms/60000)}m","score":hist['score'],"metrics":hist['metrics']}
+        return {"ok":True,"stage":"CONFIRMED","reason":"history + live confirmation passed","score":hist['score'],"metrics":hist['metrics']}
+
+
 class V4Engine:
     def __init__(self):
-        self.db = DBStore(); self.md = MarketData(); self.sc = Scorer(); self.pm = PositionManager(self.db, self.md)
+        self.db = DBStore(); self.md = MarketData(); self.sc = Scorer(); self.pm = PositionManager(self.db, self.md); self.ta = TrendAnalyzer(self.db, self.md)
         self.last_error = ""; self.last_scan = 0; self.scan_lock = threading.Lock(); self.exitability_alerted=set()
         self.scan_diag = {"status": "NOT RUN", "ts_ms": 0}
 
@@ -599,7 +756,8 @@ class V4Engine:
         started = now_ms()
         d = {"status": "RUNNING", "trigger": trigger, "ts_ms": started, "discovered": 0, "pairs_found": 0,
              "no_pair": 0, "candidates_saved": 0, "low_liquidity": 0, "low_score": 0, "high_risk": 0,
-             "eligible": 0, "paper_opened": 0, "open_positions_updated": 0, "exitability_failed": 0, "open_exitability_bad": 0}
+             "eligible": 0, "paper_opened": 0, "open_positions_updated": 0, "exitability_failed": 0, "open_exitability_bad": 0,
+             "trend_history_reject": 0, "trend_watching": 0, "trend_confirmed": 0}
         try:
             listings, src = self.md.discovery(); d.update(src); d["discovered"] = len(listings)
             # Always update open PAPER positions even if they are no longer in the discovery feed.
@@ -638,10 +796,20 @@ class V4Engine:
                 self.db.execute("INSERT INTO snapshots(ts_ms,mint,price,liquidity,volume_m5,buys_m5,sells_m5,score,risk) VALUES(?,?,?,?,?,?,?,?,?)",
                     (now_ms(), mint, m["price"], m["liquidity"], m["v5"], m["buys"], m["sells"], score, risk))
                 d["candidates_saved"] += 1
-                if m["liquidity"] < CFG["min_liquidity_usd"]: d["low_liquidity"] += 1
+                # v4.0.9 CAPITAL PROTECT: never open into a pool below $75k liquidity,
+                # even if an older config.json still contains a lower threshold.
+                entry_min_liquidity = max(float(CFG.get("min_liquidity_usd", 0)),
+                                          float(CFG.get("capital_protect_min_liquidity_usd", 75000)))
+                if m["liquidity"] < entry_min_liquidity: d["low_liquidity"] += 1
                 if score < CFG["min_momentum_score"]: d["low_score"] += 1
                 if risk > CFG["max_risk_score"]: d["high_risk"] += 1
-                if score >= CFG["min_momentum_score"] and risk <= CFG["max_risk_score"] and m["liquidity"] >= CFG["min_liquidity_usd"]:
+                if score >= CFG["min_momentum_score"] and risk <= CFG["max_risk_score"] and m["liquidity"] >= entry_min_liquidity:
+                    tg = self.ta.gate(mint, symbol, m["price"])
+                    if not tg.get("ok"):
+                        if tg.get("stage") == "HISTORY": d["trend_history_reject"] += 1
+                        else: d["trend_watching"] += 1
+                        continue
+                    d["trend_confirmed"] += 1
                     exit_ok, eq = self.exitability_for_entry(mint,m["price"]) if CFG.get("require_exitability_quote",True) else (True,{})
                     if not exit_ok:
                         d["exitability_failed"] += 1
@@ -649,7 +817,7 @@ class V4Engine:
                         d["eligible"] += 1
                         if self.pm.open_paper(mint, symbol, m["price"]):
                             d["paper_opened"] += 1
-                            notify(f"🛟 EXIT ROUTE OK\n{symbol}\nJupiter sell quote: ${eq.get('out_usdc',0):.2f}\nImpact: {eq.get('impact_pct',0):.2f}%")
+                            notify(f"📈 TREND CONFIRMED → PAPER BUY\n{symbol}\n5h history score: {tg.get('score',0):.1f}/100\nJupiter sell quote: ${eq.get('out_usdc',0):.2f}\nImpact: {eq.get('impact_pct',0):.2f}%")
             d["status"] = "OK"; self.last_error = ""
         except Exception as exc:
             self.last_error = repr(exc); d["status"] = "ERROR"; d["error"] = repr(exc)[:300]
