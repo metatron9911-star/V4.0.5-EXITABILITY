@@ -50,6 +50,11 @@ class DBStore:
               mint TEXT, symbol TEXT, usd REAL, qty REAL, price REAL, fee_usd REAL,
               tx_sig TEXT, note TEXT
             );
+            CREATE TABLE IF NOT EXISTS stop_events(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER, mint TEXT, symbol TEXT,
+              position_id INTEGER, reason TEXT, price REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_stop_events_mint_ts ON stop_events(mint, ts_ms);
             """)
             # v4.0.7 additive migration: preserve the existing Railway SQLite database.
             cols = {r[1] for r in self.cx.execute("PRAGMA table_info(positions)").fetchall()}
@@ -237,7 +242,7 @@ class Scorer:
 
 
 class PositionManager:
-    """PAPER position manager for v4.0.7 COMPOUND HARVEST + MOONBAG.
+    """PAPER position manager for v4.0.8 COMPOUND HARVEST + MOONBAG + REENTRY GUARD.
 
     Compound rule: every +15% from the current cycle anchor, harvest 10% of the
     current working base to cash; the remaining +5% becomes the next working base.
@@ -255,9 +260,34 @@ class PositionManager:
         proceeds = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action IN ('HARVEST','MOONBAG_HARVEST','EXIT')")[0]["n"] or 0)
         return capital - buys + proceeds
 
+    def _reentry_guard(self, mint):
+        """v4.0.8: stop/fade cooldown. First failed exit = 2h; second within 24h = 24h."""
+        now = now_ms()
+        day_ms = 24 * 3600 * 1000
+        rows = self.db.q("SELECT ts_ms,reason FROM stop_events WHERE mint=? AND ts_ms>=? ORDER BY ts_ms DESC",
+                         (mint, now - day_ms))
+        if not rows:
+            return True, ""
+        last_ts = int(rows[0]["ts_ms"] or 0)
+        if len(rows) >= 2:
+            until = last_ts + int(CFG.get("reentry_second_stop_lock_hours", 24)) * 3600 * 1000
+            if now < until:
+                return False, f"second failed exit lock • {age_text(last_ts)}"
+        until = last_ts + int(CFG.get("reentry_stop_cooldown_hours", 2)) * 3600 * 1000
+        if now < until:
+            return False, f"stop/fade cooldown • {age_text(last_ts)}"
+        return True, ""
+
+    def _record_failed_exit(self, p, reason, price):
+        self.db.execute("INSERT INTO stop_events(ts_ms,mint,symbol,position_id,reason,price) VALUES(?,?,?,?,?,?)",
+                        (now_ms(), p["mint"], p["symbol"], p["id"], reason, price))
+
     def open_paper(self, mint, symbol, price):
         if price <= 0: return False
         with self.lock:
+            allowed, guard_reason = self._reentry_guard(mint)
+            if not allowed:
+                return False
             if self.db.q("SELECT id FROM positions WHERE status IN ('OPEN','MOONBAG') AND mint=? LIMIT 1", (mint,)):
                 return False
             n_open = self.db.q("SELECT COUNT(*) n FROM positions WHERE status IN ('OPEN','MOONBAG')")[0]["n"]
@@ -358,29 +388,47 @@ class PositionManager:
                             (remaining, moonbag, realized, mb_idx, peak, p["id"]))
             notify(f"🌙💰 V4 MOONBAG HARVEST\n{p['symbol']}\nLevel: x{level['multiple']:g}\nCash NET: ${net:.2f}\nMoonbag remaining: {moonbag:.6g} tokens")
 
-        # Working-leg protection. Before any compound harvest use the hard stop.
-        # Afterwards trail from the local peak. The protected moonbag is NOT sold by this stop.
+        # v4.0.8 working-leg protection.
+        # 1) Before the first +15% compound harvest, keep the emergency hard stop.
+        # 2) Once price has proved momentum by reaching +5% from entry, arm a +2% floor:
+        #    if it fades back to +2% or lower, exit the working leg instead of trading noise.
+        # 3) After a compound harvest, the existing peak trailing rule takes over.
         first_hit = hcount >= 1
-        stop_hit = active > 0 and ((not first_hit and price <= entry * (1 - float(CFG["pre_tp_stop_pct"]) / 100)) or
-                    (first_hit and price <= peak * (1 - float(CFG["trailing_drawdown_after_first_milestone_pct"]) / 100)))
+        arm_pct = float(CFG.get("momentum_protect_arm_pct", 5))
+        floor_pct = float(CFG.get("momentum_protect_floor_pct", 2))
+        momentum_armed = peak >= entry * (1 + arm_pct / 100)
+        hard_stop = active > 0 and (not first_hit) and price <= entry * (1 - float(CFG["pre_tp_stop_pct"]) / 100)
+        momentum_fade = active > 0 and (not first_hit) and momentum_armed and price <= entry * (1 + floor_pct / 100)
+        trailing_stop = active > 0 and first_hit and price <= peak * (1 - float(CFG["trailing_drawdown_after_first_milestone_pct"]) / 100)
+        stop_hit = hard_stop or momentum_fade or trailing_stop
         if stop_hit:
+            if momentum_fade:
+                exit_note, reason = "momentum fade after +5% arm / +2% floor", "MOMENTUM_FADE"
+            elif hard_stop:
+                exit_note, reason = "pre-harvest stop", "STOP"
+            else:
+                exit_note, reason = "working-leg trailing stop", "TRAILING"
             sell_qty = active
-            net, friction = self._sale(p, "EXIT", sell_qty, price,
-                                       "pre-harvest stop" if not first_hit else "working-leg trailing stop")
+            net, friction = self._sale(p, "EXIT", sell_qty, price, exit_note)
             realized += net
             active = 0.0
             remaining = moonbag
             if moonbag > 0:
-                status, reason = "MOONBAG", "WORKING_STOP_MOONBAG_REMAINS"
+                status = "MOONBAG"
+                db_reason = f"{reason}_MOONBAG_REMAINS"
             else:
-                status, reason = "CLOSED", ("STOP" if not first_hit else "TRAILING")
+                status = "CLOSED"
+                db_reason = reason
             with self.db.lock:
                 self.db.cx.execute("""UPDATE positions SET status=?,remaining_qty=?,active_qty=0,moonbag_qty=?,realized_usd=?,
                     exit_ms=?,exit_price=?,reason=?,peak_price=? WHERE id=?""",
-                    (status, remaining, moonbag, realized, now_ms(), price, reason, peak, p["id"]))
+                    (status, remaining, moonbag, realized, now_ms(), price, db_reason, peak, p["id"]))
                 self.db.cx.commit()
+            # Failed pre-harvest momentum exits are re-entry guarded to prevent churn.
+            if reason in ("STOP", "MOMENTUM_FADE"):
+                self._record_failed_exit(p, reason, price)
             pnl_so_far = realized + moonbag * price - float(p["initial_usd"])
-            notify(f"🔴 V4 WORKING LEG EXIT\n{p['symbol']}\nExit: ${price:.10g}\nCash proceeds total: ${realized:.2f}\nMoonbag remains: {'YES' if moonbag>0 else 'NO'}\nMarked P&L: ${pnl_so_far:+.2f}")
+            notify(f"🔴 V4 WORKING LEG EXIT\n{p['symbol']}\nReason: {reason}\nExit: ${price:.10g}\nCash proceeds total: ${realized:.2f}\nMoonbag remains: {'YES' if moonbag>0 else 'NO'}\nMarked P&L: ${pnl_so_far:+.2f}")
             return True
 
         # Fully close after the final moonbag sale if no working leg remains.
