@@ -33,6 +33,45 @@ class TestV6(unittest.TestCase):
         self.assertEqual(p['remaining_raw'],'0')
         self.assertLessEqual(p['cost']-p['received'],4.5)
         self.assertEqual(self.db.snapshot()['positions'][1]['remaining_raw'],'4350000')
+    def test_scan_queue_cross_connection_no_duplicates(self):
+        other=Store(self.path)
+        try:
+            cmd,status=self.db.request_scan()
+            self.assertEqual(status,'QUEUED')
+            self.assertEqual(other.request_scan(),(cmd,'QUEUED'))
+            self.assertEqual(other.claim_scan(),cmd)
+            self.assertEqual(self.db.request_scan(),(cmd,'RUNNING'))
+            self.assertIsNone(self.db.claim_scan())
+            other.finish_scan(cmd,'DONE')
+            self.assertGreater(self.db.request_scan()[0],cmd)
+        finally:other.cx.close()
+    def test_period_export_filters_events_and_keeps_carried_position(self):
+        from openpyxl import load_workbook
+        self.opened()
+        old=now_ms()-3*3600000
+        with self.db.lock,self.db.cx:
+            for p in self.db.s['positions']:p['entry_ms']=old
+            self.db.save()
+            self.db.cx.execute("INSERT INTO events(ts_ms,mint,stage,reason,payload) VALUES(?,'OLD','MARKET','OLD','{}')",(old,))
+        book=load_workbook(io.BytesIO(export_excel(self.db,1)))
+        rows=list(book['Events'].values)
+        self.assertFalse(any('OLD' in r for r in rows[1:]))
+        self.assertEqual(book['Positions'].max_row,3)
+        self.assertEqual(book['Report']['A2'].value,1)
+        with self.assertRaises(ValueError):export_excel(self.db,-1)
+    def test_telegram_response_and_unknown(self):
+        from unittest.mock import patch
+        from telegram_status import status_text,send
+        p=self.opened(); self.md.available=False; self.exp.exit_one(p['id'])
+        self.assertIn('Equity UNKNOWN',status_text(self.db,self.db.snapshot()))
+        class Response:
+            ok=True; status_code=200
+            def json(self):return {'ok':True}
+        with patch.dict('os.environ',{'TELEGRAM_BOT_TOKEN':'test-secret','TELEGRAM_CHAT_ID':'1'}):
+            self.assertTrue(send('test',post=lambda *a,**k:Response())[0])
+            def failed(*a,**k):raise RuntimeError('test-secret')
+            ok,msg=send('test',post=failed)
+            self.assertFalse(ok);self.assertNotIn('test-secret',msg)
     def test_half_at_two_x_not_enough(self):
         p=self.opened(); self.md.multiple=2
         self.exp.exit_one(p['id'])

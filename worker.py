@@ -92,7 +92,11 @@ def heartbeat(db, name, status):
 
 def scanner(db, stop):
     md=MarketData(); exp=Experiment(db,md); cursor=0
+    with db.lock,db.cx:
+        db.cx.execute("UPDATE commands SET status='INTERRUPTED',detail='worker restarted' WHERE status='RUNNING'")
     while not stop.is_set():
+        command_id=db.claim_scan()
+        scan_status='DONE'
         heartbeat(db,'scanner','RUNNING')
         try:
             listings,counts=md.discovery(); db.event('','DISCOVERY','RESULT',counts)
@@ -122,9 +126,16 @@ def scanner(db, stop):
                 db.event(mint,'DECISION',outcome)
             heartbeat(db,'scanner','IDLE')
         except Exception as exc:
+            scan_status='ERROR'
             db.event('','SCANNER','ERROR',dict(error=type(exc).__name__))
             heartbeat(db,'scanner','ERROR')
-        stop.wait(db.cfg['scan_seconds'])
+        db.finish_scan(command_id,scan_status)
+        deadline=time.monotonic()+db.cfg['scan_seconds']
+        while not stop.is_set() and time.monotonic()<deadline:
+            with db.lock:
+                pending=db.cx.execute("SELECT 1 FROM commands WHERE status='QUEUED' LIMIT 1").fetchone()
+            if pending:break
+            stop.wait(min(1,max(0,deadline-time.monotonic())))
 
 
 def exit_monitor(db, stop):

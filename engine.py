@@ -40,6 +40,8 @@ class Store:
              mint TEXT, stage TEXT, reason TEXT, payload TEXT);
           CREATE TABLE IF NOT EXISTS equity(id INTEGER PRIMARY KEY, ts_ms INTEGER,
              policy TEXT, cash REAL, equity REAL, unknown INTEGER);
+          CREATE TABLE IF NOT EXISTS commands(id INTEGER PRIMARY KEY, ts_ms INTEGER,
+             action TEXT, status TEXT, detail TEXT);
         ''')
         digest = hashlib.sha256(encode(c).encode()).hexdigest()
         row = self.cx.execute('SELECT payload FROM state WHERE id=1').fetchone()
@@ -65,6 +67,27 @@ class Store:
 
     def snapshot(self):
         with self.lock: return copy.deepcopy(self.s)
+
+    def request_scan(self):
+        with self.lock, self.cx:
+            self.cx.execute('BEGIN IMMEDIATE')
+            row=self.cx.execute("SELECT id,status FROM commands WHERE action='SCAN' AND status IN ('QUEUED','RUNNING') ORDER BY id DESC LIMIT 1").fetchone()
+            if row: return row[0],row[1]
+            cur=self.cx.execute("INSERT INTO commands(ts_ms,action,status,detail) VALUES(?,'SCAN','QUEUED','')",(now_ms(),))
+            return cur.lastrowid,'QUEUED'
+
+    def claim_scan(self):
+        with self.lock, self.cx:
+            self.cx.execute('BEGIN IMMEDIATE')
+            row=self.cx.execute("SELECT id FROM commands WHERE action='SCAN' AND status='QUEUED' ORDER BY id LIMIT 1").fetchone()
+            if not row:return None
+            self.cx.execute("UPDATE commands SET status='RUNNING' WHERE id=?",(row[0],))
+            return row[0]
+
+    def finish_scan(self, command_id, status):
+        if command_id is not None:
+            with self.lock,self.cx:
+                self.cx.execute('UPDATE commands SET status=?,detail=? WHERE id=?',(status,str(now_ms()),command_id))
 
     def stats(self, s=None):
         s = s or self.snapshot()
@@ -219,18 +242,24 @@ class Experiment:
             self.db.save()
 
 
-def export_excel(db):
+def export_excel(db, hours=None):
     """Consistent snapshot; raw token amounts remain text; no formula injection."""
     from openpyxl import Workbook
+    if hours is not None and (not isinstance(hours,(int,float)) or not math.isfinite(hours) or hours<=0):
+        raise ValueError('Period must be positive hours')
+    end=now_ms(); start=0 if hours is None else end-int(hours*3600000)
     with db.lock:
         db.cx.execute('BEGIN')
         try:
             s = json.loads(db.cx.execute('SELECT payload FROM state WHERE id=1').fetchone()[0])
-            events = db.cx.execute('SELECT ts_ms,mint,stage,reason,payload FROM events ORDER BY id').fetchall()
-            eq = db.cx.execute('SELECT ts_ms,policy,cash,equity,unknown FROM equity ORDER BY id').fetchall()
+            events = db.cx.execute('SELECT ts_ms,mint,stage,reason,payload FROM events WHERE ts_ms BETWEEN ? AND ? ORDER BY id',(start,end)).fetchall()
+            eq = db.cx.execute('SELECT ts_ms,policy,cash,equity,unknown FROM equity WHERE ts_ms BETWEEN ? AND ? ORDER BY id',(start,end)).fetchall()
         finally:
             db.cx.rollback()
-        tables = {'Summary': db.stats(s), 'Positions': s['positions'],
+        tables = {'Report': [dict(period_hours=hours or 'ALL',from_ms=start or s['started_ms'],to_ms=end,
+                timezone='UTC',summary_scope='CURRENT / SINCE EXPERIMENT START; NOT PERIOD PNL',
+                positions_scope='Positions held at any time in selected interval; lifetime totals')],
+            'Summary': db.stats(s), 'Positions': [p for p in s['positions'] if p['entry_ms']<=end and (p['exit_ms'] is None or p['exit_ms']>=start)],
             'Watch': [dict(mint=k,**v) for k,v in s['watch'].items()],
             'Config': [dict(key=k,value=v) for k,v in db.cfg.items()],
             'Events': [dict(zip(('ts_ms','mint','stage','reason','payload'),r)) for r in events],
