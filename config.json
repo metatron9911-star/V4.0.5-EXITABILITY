@@ -1,5 +1,5 @@
 {
-  "version": "4.0.8",
+  "version": "4.0.9",
   "mode": "PAPER",
   "auto_trading_hard_lock": true,
   "chain": "solana",
@@ -12,7 +12,7 @@
   "status_heartbeat_minutes": 60,
   "candidate_ttl_hours": 24,
   "min_liquidity_usd": 10000,
-  "min_volume_m5_usd": 100,
+  "min_volume_m5_usd": 1000,
   "max_price_impact_pct": 5.0,
   "min_momentum_score": 40,
   "max_risk_score": 35,
@@ -22,9 +22,18 @@
   "moonbag_reserve_after_harvests": 3,
   "moonbag_reserve_pct_of_remaining": 20,
   "moonbag_milestones": [
-    {"multiple": 2, "sell_pct": 50},
-    {"multiple": 5, "sell_pct": 50},
-    {"multiple": 10, "sell_pct": 50}
+    {
+      "multiple": 2,
+      "sell_pct": 50
+    },
+    {
+      "multiple": 5,
+      "sell_pct": 50
+    },
+    {
+      "multiple": 10,
+      "sell_pct": 50
+    }
   ],
   "milestones": [
     {
@@ -61,10 +70,10 @@
     "telegram": true
   },
   "require_exitability_quote": true,
-  "paper_allow_dex_fallback": true,
+  "paper_allow_dex_fallback": false,
   "paper_fallback_min_liquidity_usd": 20000,
   "paper_fallback_min_volume_m5_usd": 1000,
-  "exitability_min_value_ratio": 0.82,
+  "exitability_min_value_ratio": 0.97,
   "exitability_emergency_impact_pct": 10.0,
   "exitability_check_sec": 30,
   "replay_gates": {
@@ -72,5 +81,11 @@
     "min_volume_m5_usd": 100,
     "min_momentum_score": 40,
     "max_risk_score": 35
-  }
+  },
+  "max_roundtrip_loss_pct": 3,
+  "quote_slippage_bps": 50,
+  "quote_max_age_ms": 15000,
+  "mark_max_age_ms": 120000,
+  "min_sells_m5": 3,
+  "min_pair_age_sec": 300
 }

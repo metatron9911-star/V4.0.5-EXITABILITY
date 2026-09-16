@@ -1,6 +1,7 @@
 import json, os, sqlite3, time, math, threading
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
+from decimal import Decimal
 import requests
 from telegram_notify import notify
 
@@ -76,13 +77,20 @@ class DBStore:
             self.cx.execute("UPDATE positions SET working_base_usd=active_qty*compound_anchor_price WHERE working_base_usd IS NULL OR working_base_usd<=0")
             self.cx.execute("UPDATE positions SET harvest_count=0 WHERE harvest_count IS NULL")
             self.cx.execute("UPDATE positions SET moonbag_milestone_idx=0 WHERE moonbag_milestone_idx IS NULL")
+            self.cx.executescript("""
+            CREATE TABLE IF NOT EXISTS quote_audit(
+              id INTEGER PRIMARY KEY, ts_ms INTEGER, mint TEXT, purpose TEXT, payload TEXT);
+            CREATE TABLE IF NOT EXISTS position_marks(
+              position_id INTEGER PRIMARY KEY, ts_ms INTEGER, net_usdc REAL, status TEXT);
+            """)
             self.cx.commit()
     def q(self, sql, args=()):
         with self.lock:
             return [dict(r) for r in self.cx.execute(sql, args).fetchall()]
     def execute(self, sql, args=()):
         with self.lock:
-            self.cx.execute(sql, args); self.cx.commit()
+            self.cx.execute(sql, args)
+            if not getattr(self, "in_position_tx", False): self.cx.commit()
     def health(self) -> Tuple[bool, str]:
         try:
             row = self.q("SELECT 1 ok")[0]
@@ -175,28 +183,46 @@ class MarketData:
         except Exception:
             return None
 
-    def exitability_quote(self, mint: str, token_amount: float) -> Dict[str, Any]:
-        """Read-only executable-route test: token -> USDC. Never signs or sends."""
+    def quote(self, input_mint, output_mint, raw):
+        started = now_ms()
         if not self.jupiter_key:
-            return {"ok":False,"reason":"JUPITER_API_KEY missing"}
-        dec=self.token_decimals(mint)
-        if dec is None:
-            return {"ok":False,"reason":"token decimals unavailable"}
-        raw=max(1,int(token_amount*(10**dec)))
+            return {"ok": False, "reason": "JUPITER_API_KEY_MISSING"}
+        if int(raw) <= 0:
+            return {"ok": False, "reason": "INVALID_AMOUNT"}
         try:
-            r=self.s.get("https://api.jup.ag/swap/v1/quote", headers={"x-api-key":self.jupiter_key},
-                params={"inputMint":mint,"outputMint":USDC_MINT,"amount":raw,"slippageBps":300,
-                        "restrictIntermediateTokens":"true","instructionVersion":"V2"}, timeout=10)
+            r = self.s.get("https://api.jup.ag/swap/v1/quote",
+                headers={"x-api-key": self.jupiter_key},
+                params={"inputMint": input_mint, "outputMint": output_mint,
+                        "amount": str(int(raw)), "swapMode": "ExactIn",
+                        "slippageBps": int(CFG["quote_slippage_bps"]),
+                        "restrictIntermediateTokens": "true", "instructionVersion": "V2"}, timeout=8)
             if not r.ok:
-                return {"ok":False,"reason":f"Jupiter HTTP {r.status_code}"}
-            j=r.json()
-            if j.get("error") or not j.get("routePlan"):
-                return {"ok":False,"reason":str(j.get("error") or "no sell route")[:160]}
-            out_usdc=float(j.get("outAmount") or 0)/1_000_000
-            impact=float(j.get("priceImpactPct") or 0)*100
-            return {"ok":True,"out_usdc":out_usdc,"impact_pct":impact,"route_legs":len(j.get("routePlan") or [])}
+                return {"ok": False, "reason": f"JUPITER_HTTP_{r.status_code}"}
+            j = r.json()
+            out = int(j.get("outAmount") or 0)
+            minimum = int(j.get("otherAmountThreshold") or 0)
+            impact = abs(float(j["priceImpactPct"])) * 100
+            if (not j.get("routePlan") or not 0 < minimum <= out
+                or j.get("inputMint") != input_mint or j.get("outputMint") != output_mint
+                or int(j.get("inAmount", 0)) != int(raw) or not math.isfinite(impact)):
+                return {"ok": False, "reason": "INVALID_QUOTE"}
+            if now_ms() - started > CFG["quote_max_age_ms"]:
+                return {"ok": False, "reason": "STALE_QUOTE"}
+            return {"ok": True, "ts_ms": started, "out_raw": out,
+                    "min_raw": minimum, "impact_pct": impact, "response": j}
         except Exception as exc:
-            return {"ok":False,"reason":repr(exc)[:160]}
+            return {"ok": False, "reason": type(exc).__name__}
+
+    def exitability_quote(self, mint, token_amount):
+        dec = self.token_decimals(mint)
+        if dec is None:
+            return {"ok": False, "reason": "DECIMALS_UNAVAILABLE"}
+        raw = int(Decimal(str(token_amount)) * (10 ** dec))
+        q = self.quote(mint, USDC_MINT, raw)
+        if q.get("ok"):
+            q.update(out_usdc=q["out_raw"] / 1e6, min_usdc=q["min_raw"] / 1e6,
+                     qty=raw / (10 ** dec))
+        return q
 
     def helius_health(self) -> Dict[str, Any]:
         if not self.helius_key:
@@ -242,6 +268,10 @@ class Scorer:
         }
 
 
+class QuoteUnavailable(RuntimeError):
+    pass
+
+
 class PositionManager:
     """PAPER position manager for v4.0.7 COMPOUND HARVEST + MOONBAG.
 
@@ -251,7 +281,8 @@ class PositionManager:
     The working leg can later stop/trail independently; the moonbag is kept for
     configured x10/x100-style milestones.
     """
-    def __init__(self, db: DBStore):
+    def __init__(self, db: DBStore, md):
+        self.md = md
         self.db = db
         self.lock = threading.RLock()
 
@@ -261,54 +292,84 @@ class PositionManager:
         proceeds = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action IN ('HARVEST','MOONBAG_HARVEST','EXIT')")[0]["n"] or 0)
         return capital - buys + proceeds
 
-    def open_paper(self, mint, symbol, price):
-        if price <= 0: return False
-        with self.lock:
-            if self.db.q("SELECT id FROM positions WHERE status IN ('OPEN','MOONBAG') AND mint=? LIMIT 1", (mint,)):
-                return False
-            n_open = self.db.q("SELECT COUNT(*) n FROM positions WHERE status IN ('OPEN','MOONBAG')")[0]["n"]
-            if n_open >= int(CFG.get("max_open_positions", 1)):
-                return False
-            usd = float(CFG["position_size_usd"])
-            # Never create PAPER leverage accidentally: a new stake must be funded by PAPER cash.
-            if self._available_cash() + 1e-9 < usd:
-                return False
-            qty = usd / price
-            self.db.execute("""INSERT INTO positions(
-                mint,symbol,status,entry_ms,entry_price,initial_usd,token_qty,remaining_qty,peak_price,
-                active_qty,moonbag_qty,compound_anchor_price,working_base_usd,harvest_count,moonbag_milestone_idx
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (mint, symbol, "OPEN", now_ms(), price, usd, qty, qty, price,
-                 qty, 0.0, price, usd, 0, 0))
-            self.db.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                            (now_ms(), "PAPER", "BUY", mint, symbol, usd, qty, price, 0, "paper fill"))
-        notify(f"🟢 V4 PAPER BUY\n{symbol}\nEntry: ${price:.10g}\nPosition: ${usd:.2f}\nMode: PAPER")
-        return True
+    def audit(self, mint, purpose, q):
+        self.db.execute("INSERT INTO quote_audit(ts_ms,mint,purpose,payload) VALUES(?,?,?,?)",
+                        (now_ms(), mint, purpose, json.dumps(q)))
 
-    def open_paper_with_reason(self, mint, symbol, price):
-        """Open a simulated position and expose the exact non-open reason."""
-        if price <= 0:
-            return False, "INVALID_PRICE"
-        with self.lock:
-            if self.db.q("SELECT id FROM positions WHERE status IN ('OPEN','MOONBAG') AND mint=? LIMIT 1", (mint,)):
+    def open_paper_with_reason(self, mint, symbol, price, bundle=None):
+        if not bundle:
+            return False, "QUOTE_REQUIRED"
+        buy, sell = bundle["buy"], bundle["sell"]
+        if now_ms() - buy["ts_ms"] > CFG["quote_max_age_ms"]:
+            return False, "STALE_QUOTE"
+        usd = float(CFG["position_size_usd"])
+        fee = float(CFG["paper_network_cost_usd_per_tx"])
+        qty = bundle["qty"]
+        with self.lock, self.db.lock, self.db.cx:
+            if self.db.q("SELECT id FROM positions WHERE status IN ('OPEN','MOONBAG') AND mint=?", (mint,)):
                 return False, "DUPLICATE_OPEN_MINT"
-            n_open = self.db.q("SELECT COUNT(*) n FROM positions WHERE status IN ('OPEN','MOONBAG')")[0]["n"]
-            if n_open >= int(CFG.get("max_open_positions", 1)):
+            if self.db.q("SELECT COUNT(*) n FROM positions WHERE status IN ('OPEN','MOONBAG')")[0]["n"] >= CFG["max_open_positions"]:
                 return False, "MAX_OPEN_POSITIONS"
-            if self._available_cash() + 1e-9 < float(CFG["position_size_usd"]):
+            if self._available_cash() < usd:
                 return False, "INSUFFICIENT_PAPER_CASH"
-        return (True, "OPENED") if self.open_paper(mint, symbol, price) else (False, "OPEN_FAILED")
+            # The fixed $50 budget includes the modelled network expense.
+            fill = usd / qty
+            cur = self.db.cx.execute("""INSERT INTO positions(
+                mint,symbol,status,entry_ms,entry_price,initial_usd,token_qty,remaining_qty,peak_price,
+                active_qty,moonbag_qty,compound_anchor_price,working_base_usd,harvest_count,moonbag_milestone_idx)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (mint,symbol,'OPEN',now_ms(),fill,usd,qty,qty,fill,qty,0,fill,usd,0,0))
+            self.db.cx.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (now_ms(),'PAPER','BUY',mint,symbol,usd,qty,fill,fee,'v4.0.9 Jupiter minimum-output model; not executed'))
+            self.db.cx.execute("INSERT OR REPLACE INTO position_marks VALUES(?,?,?,?)",
+                (cur.lastrowid, sell['ts_ms'], max(0,sell['min_usdc']-fee),'QUOTED'))
+        return True, "OPENED"
 
     def _sale(self, p, action, qty, price, note):
-        if qty <= 0: return 0.0, 0.0
-        gross = qty * price
-        friction = gross * float(CFG["paper_friction_pct_per_sale"]) / 100 + float(CFG["paper_network_cost_usd_per_tx"])
-        net = max(0.0, gross - friction)
+        q = self.md.exitability_quote(p['mint'], qty)
+        self.audit(p['mint'], action, q)
+        if not q.get('ok'):
+            raise QuoteUnavailable(q.get('reason', 'NO_SELL_QUOTE'))
+        fee = float(CFG['paper_network_cost_usd_per_tx'])
+        net = max(0, q['min_usdc'] - fee)
+        # Jupiter output already includes pool fees; do not add another 1.5%.
+        fill = q['min_usdc'] / qty
         self.db.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (now_ms(), "PAPER", action, p["mint"], p["symbol"], net, qty, price, friction, note))
-        return net, friction
+            (now_ms(),'PAPER',action,p['mint'],p['symbol'],net,qty,fill,fee,
+             'v4.0.9 minimum-output model: '+note))
+        return net, fee
 
-    def update(self, mint, price, position_id=None):
+    def update(self, mint, price=None, position_id=None):
+        with self.lock, self.db.lock:
+            rows=self.db.q("SELECT * FROM positions WHERE status IN ('OPEN','MOONBAG') AND mint=?", (mint,))
+            if position_id is not None: rows=[r for r in rows if r['id']==position_id]
+            if not rows: return False
+            p=rows[0]
+            q=self.md.exitability_quote(mint,p['remaining_qty'])
+            self.audit(mint,'MARK',q)
+            if not q.get('ok'):
+                self.db.execute("INSERT OR REPLACE INTO position_marks VALUES(?,?,NULL,'UNAVAILABLE')",(p['id'],now_ms()))
+                return False
+            net=max(0,q['min_usdc']-float(CFG['paper_network_cost_usd_per_tx']))
+            self.db.execute("INSERT OR REPLACE INTO position_marks VALUES(?,?,?,'QUOTED')",(p['id'],q['ts_ms'],net))
+            # Lock the ledger and position together: an unavailable partial-sale
+            # quote rolls the whole update back instead of consuming quantities.
+            self.db.in_position_tx=True
+            try:
+                with self.db.cx:
+                    result=self._update_quoted(mint,net/p['remaining_qty'],p['id'])
+                    current=self.db.q('SELECT remaining_qty FROM positions WHERE id=?',(p['id'],))[0]
+                    if current['remaining_qty'] != p['remaining_qty']:
+                        self.db.cx.execute("INSERT OR REPLACE INTO position_marks VALUES(?,?,NULL,'UNAVAILABLE')",(p['id'],now_ms()))
+                return result
+            except QuoteUnavailable as exc:
+                self.audit(mint,'EXIT_DEFERRED',{'ok':False,'reason':str(exc)})
+                return False
+            finally:
+                self.db.in_position_tx=False
+                self.db.cx.commit()
+
+    def _update_quoted(self, mint, price, position_id=None):
         if price <= 0: return False
         with self.lock:
             if position_id is None:
@@ -398,7 +459,7 @@ class PositionManager:
                 self.db.cx.execute("""UPDATE positions SET status=?,remaining_qty=?,active_qty=0,moonbag_qty=?,realized_usd=?,
                     exit_ms=?,exit_price=?,reason=?,peak_price=? WHERE id=?""",
                     (status, remaining, moonbag, realized, now_ms(), price, reason, peak, p["id"]))
-                self.db.cx.commit()
+                # Commit is owned by update().
             pnl_so_far = realized + moonbag * price - float(p["initial_usd"])
             notify(f"🔴 V4 WORKING LEG EXIT\n{p['symbol']}\nExit: ${price:.10g}\nCash proceeds total: ${realized:.2f}\nMoonbag remains: {'YES' if moonbag>0 else 'NO'}\nMarked P&L: ${pnl_so_far:+.2f}")
             return True
@@ -416,7 +477,7 @@ class PositionManager:
 
 class V4Engine:
     def __init__(self):
-        self.db = DBStore(); self.md = MarketData(); self.sc = Scorer(); self.pm = PositionManager(self.db)
+        self.db = DBStore(); self.md = MarketData(); self.sc = Scorer(); self.pm = PositionManager(self.db, self.md)
         self.last_error = ""; self.last_scan = 0; self.scan_lock = threading.Lock(); self.exitability_alerted=set()
         self.scan_diag = {"status": "NOT RUN", "ts_ms": 0}
 
@@ -426,16 +487,27 @@ class V4Engine:
                 "auto_hard_lock": CFG.get("auto_trading_hard_lock", True), "execution": "DISABLED_IN_CODE"}
 
     def exitability_for_entry(self, mint, price):
-        usd=float(CFG.get("position_size_usd",50))
-        qty=usd/price if price>0 else 0
-        q=self.md.exitability_quote(mint,qty)
-        if not q.get("ok"):
-            return False,q
-        ratio=float(q.get("out_usdc") or 0)/usd if usd else 0
-        q["value_ratio"]=ratio
-        ok=(ratio>=float(CFG.get("exitability_min_value_ratio",0.82)) and
-            float(q.get("impact_pct") or 999)<=float(CFG.get("max_price_impact_pct",5)))
-        return ok,q
+        self.entry_bundle = None
+        usd=float(CFG['position_size_usd'])
+        fee=float(CFG['paper_network_cost_usd_per_tx'])
+        dec=self.md.token_decimals(mint)
+        if dec is None: return False, {'reason':'DECIMALS_UNAVAILABLE'}
+        buy=self.md.quote(USDC_MINT,mint,int(Decimal(str(usd-fee))*1000000))
+        self.pm.audit(mint,'ENTRY_BUY',buy)
+        if not buy.get('ok'): return False,buy
+        qty=buy['min_raw']/(10**dec)
+        sell=self.md.exitability_quote(mint,qty)
+        self.pm.audit(mint,'ENTRY_SELL',sell)
+        if not sell.get('ok'): return False,sell
+        loss=100*(1-(sell['min_usdc']-fee)/usd)
+        reason='ENTRY_OK'
+        if now_ms()-buy['ts_ms']>CFG['quote_max_age_ms']: reason='STALE_QUOTE'
+        elif max(buy['impact_pct'],sell['impact_pct'])>CFG['max_price_impact_pct']: reason='HIGH_PRICE_IMPACT'
+        elif loss>CFG['max_roundtrip_loss_pct']: reason='ROUNDTRIP_LOSS_TOO_HIGH'
+        elif price<=0 or abs((usd-fee)/qty/price-1)*100>CFG['max_entry_chase_pct']: reason='DEX_QUOTE_DIVERGENCE'
+        if reason=='ENTRY_OK': self.entry_bundle={'buy':buy,'sell':sell,'qty':qty}
+        return reason=='ENTRY_OK', {'reason':reason,'roundtrip_loss_pct':loss,
+            'buy_min_qty':qty,'sell_min_usdc':sell['min_usdc'],'buy_ts_ms':buy['ts_ms'],'sell_ts_ms':sell['ts_ms']}
 
     def _record_entry_decision(self, mint, symbol, decision, reason, score, risk, m,
                                route_status="NOT_CHECKED", route_detail=""):
@@ -461,24 +533,14 @@ class V4Engine:
         if risk > float(CFG["max_risk_score"]):
             return False, "HIGH_RISK", "NOT_CHECKED", ""
 
-        if not CFG.get("require_exitability_quote", True):
-            return True, "ENTRY_OK", "DISABLED", "quote not required"
-        exit_ok, quote = self.exitability_for_entry(mint, m["price"])
-        if exit_ok:
-            return True, "ENTRY_OK", "JUPITER_OK", json.dumps(quote, ensure_ascii=False)
-
-        # This never authorizes a real order. It only prevents a transient Jupiter
-        # outage from making the PAPER experiment record zero positions.
-        fallback_ok = (
-            CFG.get("paper_allow_dex_fallback", True)
-            and str(os.getenv("V4_MODE", "PAPER")).upper() == "PAPER"
-            and float(m.get("liquidity") or 0) >= float(CFG.get("paper_fallback_min_liquidity_usd", 20000))
-            and float(m.get("v5") or 0) >= float(CFG.get("paper_fallback_min_volume_m5_usd", 1000))
-        )
-        detail = str(quote.get("reason") or quote)[:300]
-        if fallback_ok:
-            return True, "ENTRY_OK_DEX_FALLBACK", "DEX_PROXY", detail
-        return False, "NO_EXECUTABLE_EXIT_ROUTE", "JUPITER_FAILED", detail
+        if m.get('sells',0) < CFG['min_sells_m5']:
+            return False, 'INSUFFICIENT_SELL_ACTIVITY', 'NOT_CHECKED', ''
+        if m.get('pair_age_sec',-1)<CFG['min_pair_age_sec']:
+            return False, 'PAIR_TOO_NEW_OR_UNKNOWN', 'NOT_CHECKED', ''
+        if self.db.q("SELECT id FROM positions WHERE status IN ('OPEN','MOONBAG') AND mint=?",(mint,)):
+            return False,'DUPLICATE_OPEN_MINT','NOT_CHECKED',''
+        ok,q=self.exitability_for_entry(mint,m['price'])
+        return ok,q.get('reason','QUOTE_FAILED'),'JUPITER_ROUNDTRIP' if ok else 'JUPITER_FAILED',json.dumps(q)
 
     def scan_once(self, trigger="manual"):
         if not self.scan_lock.acquire(blocking=False):
@@ -490,28 +552,11 @@ class V4Engine:
              "open_exitability_bad": 0, "low_volume_m5": 0, "buy_flow_not_positive": 0,
              "paper_open_blocked": 0, "dex_fallback_entries": 0}
         try:
-            listings, src = self.md.discovery(); d.update(src); d["discovered"] = len(listings)
-            # Always update open PAPER positions even if they are no longer in the discovery feed.
-            for p in self.db.q("SELECT id,mint,symbol,remaining_qty FROM positions WHERE status IN ('OPEN','MOONBAG')"):
-                pair = self.md.dex_pair(p["mint"])
-                if pair:
-                    price = float(pair.get("priceUsd") or 0)
-                    if price > 0:
-                        self.pm.update(p["mint"], price, position_id=p["id"]); d["open_positions_updated"] += 1
-                        q=self.md.exitability_quote(p["mint"],float(p.get("remaining_qty") or 0))
-                        bad=(not q.get("ok")) or float(q.get("impact_pct") or 999)>float(CFG.get("exitability_emergency_impact_pct",10))
-                        if bad:
-                            d["open_exitability_bad"] += 1
-                            if p["mint"] not in self.exitability_alerted:
-                                
-                                if not q.get("ok"):
-                                    detail = f"SELL ROUTE LOST — NO VALID QUOTE\nReason: {q.get('reason') or 'unknown'}"
-                                else:
-                                    detail = f"SELL ROUTE DEGRADED\nImpact: {float(q.get('impact_pct')):.2f}%"
-                                notify(f"🚨 V4 EXITABILITY ALERT\n{p.get('symbol')}\n{detail}\nPAPER only — inspect immediately")
-                                self.exitability_alerted.add(p["mint"])
-                        else:
-                            self.exitability_alerted.discard(p["mint"])
+            # Protect existing positions before slower discovery requests.
+            for p in self.db.q("SELECT id,mint FROM positions WHERE status IN ('OPEN','MOONBAG')"):
+                if self.pm.update(p['mint'],position_id=p['id']): d['open_positions_updated']+=1
+                else: d['open_exitability_bad']+=1
+            listings,src=self.md.discovery(); d.update(src); d['discovered']=len(listings)
             for x in listings[:80]:
                 mint = x.get("address") or x.get("mint") or x.get("tokenAddress")
                 if not mint: continue
@@ -520,6 +565,8 @@ class V4Engine:
                     d["no_pair"] += 1; continue
                 d["pairs_found"] += 1
                 score, risk, m = self.sc.score(pair)
+                created=pair.get('pairCreatedAt')
+                m['pair_age_sec']=(now_ms()-float(created))/1000 if created else -1
                 symbol = (pair.get("baseToken") or {}).get("symbol") or x.get("symbol") or mint[:6]
                 name = (pair.get("baseToken") or {}).get("name") or x.get("name") or symbol
                 self.db.execute("INSERT INTO candidates(mint,symbol,name,first_seen_ms,liquidity,price,score,risk,raw) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(mint) DO UPDATE SET liquidity=excluded.liquidity,price=excluded.price,score=excluded.score,risk=excluded.risk,raw=excluded.raw",
@@ -541,13 +588,13 @@ class V4Engine:
 
                 d["eligible"] += 1
                 if route_status == "DEX_PROXY": d["dex_fallback_entries"] += 1
-                opened, open_reason = self.pm.open_paper_with_reason(mint, symbol, m["price"])
+                opened, open_reason = self.pm.open_paper_with_reason(mint, symbol, m["price"], self.entry_bundle)
                 self._record_entry_decision(mint, symbol, "OPEN" if opened else "BLOCK",
                                             reason if opened else open_reason, score, risk, m,
                                             route_status, route_detail)
                 if opened:
                     d["paper_opened"] += 1
-                    notify(f"🟢 V4.0.8 PAPER ENTRY\n{symbol}\nRoute: {route_status}\nReason: {reason}\nNo real order was sent")
+                    notify(f"🟢 V4.0.9 PAPER ENTRY\n{symbol}\nRoute: {route_status}\nReason: {reason}\nNo real order was sent")
                 else:
                     d["paper_open_blocked"] += 1
             d["status"] = "OK"; self.last_error = ""
@@ -564,13 +611,10 @@ class V4Engine:
         buys = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action='BUY'")[0]["n"] or 0)
         proceeds = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action IN ('HARVEST','MOONBAG_HARVEST','EXIT')")[0]["n"] or 0)
         cash = capital - buys + proceeds
-        open_rows = self.db.q("SELECT mint,remaining_qty FROM positions WHERE status IN ('OPEN','MOONBAG')")
-        open_value = 0.0
-        for p in open_rows:
-            row = self.db.q("SELECT price FROM candidates WHERE mint=?", (p["mint"],))
-            px = float(row[0]["price"] or 0) if row else 0.0
-            open_value += float(p["remaining_qty"] or 0) * px
-        equity = cash + open_value
+        open_rows=self.db.q("SELECT p.id,m.net_usdc,m.ts_ms,m.status FROM positions p LEFT JOIN position_marks m ON m.position_id=p.id WHERE p.status IN ('OPEN','MOONBAG')")
+        unknown=sum(1 for p in open_rows if p['status']!='QUOTED' or not p['ts_ms'] or now_ms()-p['ts_ms']>CFG['mark_max_age_ms'])
+        open_value=float('nan') if unknown else sum(float(p['net_usdc']) for p in open_rows)
+        equity=cash+open_value
         realized_pnl = float(self.db.q("SELECT COALESCE(SUM(realized_usd-initial_usd),0) n FROM positions WHERE status='CLOSED'")[0]["n"] or 0)
         harvested = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action IN ('HARVEST','MOONBAG_HARVEST')")[0]["n"] or 0)
         return {
@@ -578,6 +622,6 @@ class V4Engine:
             "open": len(open_rows),
             "closed": self.db.q("SELECT COUNT(*) n FROM positions WHERE status='CLOSED'")[0]["n"],
             "realized": realized_pnl,
-            "paper_capital": capital, "cash": cash, "open_value": open_value,
+            "unpriced_positions": unknown, "paper_capital": capital, "cash": cash, "open_value": open_value,
             "equity": equity, "total_pnl": equity-capital, "harvested_proceeds": harvested
         }

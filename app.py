@@ -111,6 +111,7 @@ def candidate_table(engine: V4Engine) -> pd.DataFrame:
         x["mint"] for x in engine.db.q("SELECT mint FROM positions WHERE status='OPEN'")
     }
     open_count = len(open_positions)
+    latest = {x['mint']: x for x in engine.db.q('SELECT d.* FROM entry_decisions d JOIN (SELECT mint, MAX(id) id FROM entry_decisions GROUP BY mint) t ON d.id=t.id')}
     min_liq = float(CFG["min_liquidity_usd"])
     min_score = float(CFG["min_momentum_score"])
     max_risk = float(CFG["max_risk_score"])
@@ -153,6 +154,9 @@ def candidate_table(engine: V4Engine) -> pd.DataFrame:
             f"vol {bd['pts_vol']}/20 + flow {bd['pts_flow']}/18 + "
             f"liq {bd['pts_liq']}/12 + buys {bd['pts_buys']}/12"
         )
+        if mint not in open_positions and mint in latest:
+            entry = latest[mint]['decision']
+            reason = latest[mint]['reason']
 
         out.append(
             {
@@ -192,7 +196,10 @@ def _protocol_excel(engine, hours):
         "SELECT * FROM candidates WHERE first_seen_ms>=? ORDER BY first_seen_ms DESC", (cutoff,)))
     decisions = pd.DataFrame(engine.db.q(
         "SELECT * FROM entry_decisions WHERE ts_ms>=? ORDER BY ts_ms DESC", (cutoff,)))
-    summary_rows=[]
+    quotes=pd.DataFrame(engine.db.q("SELECT * FROM quote_audit WHERE ts_ms>=? ORDER BY id DESC",(cutoff,)))
+    summary_rows=[["version",CFG["version"]],["valuation","Jupiter minimum-output PAPER model; legacy trades retained"]]
+    stats = engine.stats()
+    summary_rows.extend([[k,stats[k]] for k in ('cash','open_value','equity','total_pnl','unpriced_positions')])
     if not positions.empty:
         closed=positions[positions.status.eq("CLOSED")].copy()
         if not closed.empty:
@@ -214,12 +221,13 @@ def _protocol_excel(engine, hours):
         snapshots.to_excel(w,index=False,sheet_name="SNAPSHOTS")
         candidates.to_excel(w,index=False,sheet_name="CANDIDATES")
         decisions.to_excel(w,index=False,sheet_name="ENTRY_DECISIONS")
+        quotes.to_excel(w,index=False,sheet_name="QUOTES")
     return out.getvalue()
 
 e = get_engine()
 sup = get_supervisor(e)
 
-st.title(f"🚀 V4 Momentum Hunter — PAPER v{CFG.get('version','4.0.8')}")
+st.title(f"🚀 V4 Momentum Hunter — PAPER v{CFG.get('version','4.0.9')}")
 st.caption(
     "Solana momentum scanner • Moonbag Ladder • background PAPER scanner • "
     "transparent score/risk diagnostics • AUTO execution physically disabled"
@@ -262,21 +270,24 @@ with b4:
         ok, detail = test_message()
         st.success("Telegram test sent ✅") if ok else st.error(detail)
 
+st.info("v4.0.9: PAPER quotes only. No route = no entry or simulated sale. Historical v4.0.8 trades are preserved.")
 stats = e.stats()
+if stats.get('unpriced_positions'):
+    st.warning(f"Fresh sale quote unavailable for {stats['unpriced_positions']} positions. Equity is unknown, not zero.")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Candidates", stats["candidates"])
 c2.metric("Open PAPER", stats["open"])
 c3.metric("Closed", stats["closed"])
 c4.metric("Realized P&L", f"${stats['realized']:.2f}")
 
-st.subheader(f"🧾 PAPER accounting — v{CFG.get('version','4.0.8')}")
+st.subheader(f"🧾 PAPER accounting — v{CFG.get('version','4.0.9')}")
 a1,a2,a3,a4,a5 = st.columns(5)
 a1.metric("Starting capital", f"${stats['paper_capital']:.2f}")
 a2.metric("Cash", f"${stats['cash']:.2f}")
 a3.metric("Open marked value", f"${stats['open_value']:.2f}")
 a4.metric("Total equity", f"${stats['equity']:.2f}")
 a5.metric("Total P&L", f"${stats['total_pnl']:+.2f}")
-st.caption(f"Harvested proceeds (not profit by themselves): ${stats['harvested_proceeds']:.2f}. Realized P&L counts only fully CLOSED positions. Open value uses latest stored candidate price.")
+st.caption(f"Harvested proceeds (not profit by themselves): ${stats['harvested_proceeds']:.2f}. Realized P&L counts only fully CLOSED positions. Open value uses recent Jupiter minimum-output quotes. NaN means valuation unavailable.")
 
 st.subheader("🔬 Last scan diagnostics")
 d = dict(e.scan_diag or {})
@@ -376,7 +387,7 @@ try:
     xbytes=_protocol_excel(e, periods[label])
     stamp=datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     st.download_button("⬇️ Download protocol .xlsx", data=xbytes, file_name=f"V4_protocol_{label.replace(' ','_')}_{stamp}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.caption("Workbook sheets: SUMMARY, POSITIONS, LEDGER, SNAPSHOTS, CANDIDATES, ENTRY_DECISIONS. Export is read-only and does not change strategy or PAPER positions.")
+    st.caption("Workbook sheets: SUMMARY, POSITIONS, LEDGER, SNAPSHOTS, CANDIDATES, ENTRY_DECISIONS, QUOTES. Export is read-only and does not change strategy or PAPER positions.")
 except Exception as exc:
     st.warning(f"Excel protocol unavailable: {exc!r}")
 
