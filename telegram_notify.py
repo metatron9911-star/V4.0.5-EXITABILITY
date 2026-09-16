@@ -68,7 +68,7 @@ def get_updates(offset: int = 0, timeout: int = 0) -> List[Dict[str, Any]]:
 def test_message():
     mode = os.getenv("V4_MODE", "PAPER").strip() or "PAPER"
     return notify(
-        "🚀 V4 Momentum Hunter v4.0.2\n"
+        "🚀 V4 Momentum Hunter v4.0.8\n"
         "Telegram connection OK ✅\n"
         f"Mode: {mode}\n"
         "AUTO trading: HARD LOCKED",

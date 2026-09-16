@@ -50,15 +50,11 @@ class DBStore:
               mint TEXT, symbol TEXT, usd REAL, qty REAL, price REAL, fee_usd REAL,
               tx_sig TEXT, note TEXT
             );
-            CREATE TABLE IF NOT EXISTS stop_events(
-              id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER, mint TEXT, symbol TEXT,
-              position_id INTEGER, reason TEXT, price REAL
-            );
-            CREATE INDEX IF NOT EXISTS idx_stop_events_mint_ts ON stop_events(mint, ts_ms);
-            CREATE TABLE IF NOT EXISTS trend_watch(
-              mint TEXT PRIMARY KEY, symbol TEXT, first_qualified_ms INTEGER, last_check_ms INTEGER,
-              history_score REAL, history_ok INTEGER, confirm_count INTEGER DEFAULT 0,
-              last_price REAL, metrics TEXT, reason TEXT
+            CREATE TABLE IF NOT EXISTS entry_decisions(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER, mint TEXT,
+              symbol TEXT, decision TEXT, reason TEXT, score REAL, risk REAL,
+              liquidity REAL, volume_m5 REAL, buys_m5 REAL, sells_m5 REAL,
+              route_status TEXT, route_detail TEXT
             );
             """)
             # v4.0.7 additive migration: preserve the existing Railway SQLite database.
@@ -104,8 +100,6 @@ class MarketData:
         self.last_birdeye = {"ok": False, "status": "NOT TESTED", "ts_ms": 0, "items": 0, "detail": ""}
         self.last_dex = {"ok": False, "status": "NOT TESTED", "ts_ms": 0, "items": 0, "detail": ""}
         self._last_birdeye_poll_ms = 0
-        self._sol_price_cache = (0, 0.0)
-        self._priority_fee_cache = (0, 0)
 
     def birdeye_new_listings(self, force=False) -> List[Dict[str, Any]]:
         interval = int(os.getenv("BIRDEYE_POLL_INTERVAL_SEC", CFG.get("birdeye_poll_interval_sec", 1800)))
@@ -168,33 +162,6 @@ class MarketData:
         except Exception:
             return None
 
-    def birdeye_ohlcv(self, mint: str, hours: float = 5.0, interval: str = "5m") -> Dict[str, Any]:
-        """Historical token candles from Birdeye V3. Read-only.
-        Returns closed candles only where possible; no trading action.
-        """
-        if not self.birdeye_key:
-            return {"ok": False, "reason": "BIRDEYE_API_KEY missing", "items": []}
-        end = int(time.time())
-        start = end - int(hours * 3600)
-        try:
-            r = self.s.get("https://public-api.birdeye.so/defi/v3/ohlcv",
-                headers={"X-API-KEY": self.birdeye_key, "x-chain": "solana", "accept": "application/json"},
-                params={"address": mint, "type": interval, "currency": "usd",
-                        "time_from": start, "time_to": end, "mode": "range",
-                        "padding": "false", "outlier": "true"}, timeout=10)
-            if not r.ok:
-                return {"ok": False, "reason": f"Birdeye OHLCV HTTP {r.status_code}", "items": []}
-            j = r.json() if r.content else {}
-            items = ((j.get("data") or {}).get("items") or [])
-            items = [x for x in items if float(x.get("c") or 0) > 0 and int(x.get("unix_time") or 0) > 0]
-            items.sort(key=lambda x: int(x.get("unix_time") or 0))
-            # Ignore the current still-forming 5m candle.
-            sec = 300 if interval == "5m" else 60
-            closed = [x for x in items if int(x.get("unix_time") or 0) + sec <= end]
-            return {"ok": True, "items": closed, "reason": "", "source": "Birdeye V3 OHLCV"}
-        except Exception as exc:
-            return {"ok": False, "reason": repr(exc)[:180], "items": []}
-
     def token_decimals(self, mint: str) -> Optional[int]:
         if not self.helius_key:
             return None
@@ -230,100 +197,6 @@ class MarketData:
             return {"ok":True,"out_usdc":out_usdc,"impact_pct":impact,"route_legs":len(j.get("routePlan") or [])}
         except Exception as exc:
             return {"ok":False,"reason":repr(exc)[:160]}
-
-    def swap_v2_order_quote(self, input_mint: str, output_mint: str, raw_amount: int) -> Dict[str, Any]:
-        """Read-only Jupiter Swap V2 order quote. No taker => no transaction/signing."""
-        if not self.jupiter_key:
-            return {"ok": False, "reason": "JUPITER_API_KEY missing"}
-        try:
-            r = self.s.get("https://api.jup.ag/swap/v2/order",
-                           headers={"x-api-key": self.jupiter_key},
-                           params={"inputMint": input_mint, "outputMint": output_mint, "amount": int(raw_amount)},
-                           timeout=10)
-            if not r.ok:
-                return {"ok": False, "reason": f"Jupiter V2 HTTP {r.status_code}"}
-            j = r.json()
-            if j.get("error") or not j.get("outAmount"):
-                return {"ok": False, "reason": str(j.get("error") or "no V2 quote")[:160]}
-            pf = j.get("platformFee") or {}
-            return {
-                "ok": True, "out_amount_raw": int(j.get("outAmount") or 0),
-                "price_impact_pct": float(j.get("priceImpact") or j.get("priceImpactPct") or 0),
-                "fee_bps": float(j.get("feeBps") or 0),
-                "platform_fee_bps": float(pf.get("feeBps") or 0),
-                "platform_fee_amount_raw": int(pf.get("amount") or 0),
-                "fee_mint": pf.get("feeMint") or j.get("feeMint") or "",
-                "router": j.get("router") or "", "mode": j.get("mode") or ""
-            }
-        except Exception as exc:
-            return {"ok": False, "reason": repr(exc)[:160]}
-
-    def entry_quote(self, mint: str, usd_amount: float) -> Dict[str, Any]:
-        q = self.swap_v2_order_quote(USDC_MINT, mint, max(1, int(usd_amount * 1_000_000)))
-        if not q.get("ok"):
-            return q
-        dec = self.token_decimals(mint)
-        if dec is None:
-            return {"ok": False, "reason": "token decimals unavailable"}
-        q["out_qty"] = float(q["out_amount_raw"]) / (10 ** dec)
-        return q
-
-    def sell_quote(self, mint: str, token_amount: float) -> Dict[str, Any]:
-        dec = self.token_decimals(mint)
-        if dec is None:
-            return {"ok": False, "reason": "token decimals unavailable"}
-        raw = max(1, int(token_amount * (10 ** dec)))
-        q = self.swap_v2_order_quote(mint, USDC_MINT, raw)
-        if q.get("ok"):
-            q["out_usdc"] = float(q["out_amount_raw"]) / 1_000_000
-        return q
-
-    def sol_price_usd(self) -> float:
-        ts, cached = self._sol_price_cache
-        if cached > 0 and now_ms() - ts < 60_000:
-            return cached
-        try:
-            sol_mint = "So11111111111111111111111111111111111111112"
-            r = self.s.get(f"https://api.dexscreener.com/latest/dex/tokens/{sol_mint}", timeout=6)
-            r.raise_for_status()
-            pairs = r.json().get("pairs") or []
-            pairs = [x for x in pairs if (x.get("chainId") or "").lower() == "solana"]
-            best = max(pairs, key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0))
-            px = float(best.get("priceUsd") or 0)
-            if px > 0:
-                self._sol_price_cache = (now_ms(), px)
-                return px
-        except Exception:
-            pass
-        return 0.0
-
-    def network_fee_estimate_usd(self) -> Tuple[float, Dict[str, Any]]:
-        """Estimate base + recent priority fee. Falls back to configured PAPER network cost."""
-        fallback = float(CFG.get("paper_network_cost_usd_per_tx", 0.01))
-        priority_lamports = 0
-        ts, cached = self._priority_fee_cache
-        if now_ms() - ts < 30_000:
-            priority_lamports = int(cached)
-        elif self.helius_key:
-            try:
-                r = self.s.post(f"https://mainnet.helius-rpc.com/?api-key={self.helius_key}",
-                    json={"jsonrpc":"2.0","id":1,"method":"getRecentPrioritizationFees","params":[]}, timeout=6)
-                vals = sorted(int(x.get("prioritizationFee") or 0) for x in (r.json().get("result") or []))
-                if vals:
-                    priority_lamports = vals[min(len(vals)-1, int(0.75*(len(vals)-1)))]
-                    self._priority_fee_cache = (now_ms(), priority_lamports)
-            except Exception:
-                pass
-        sol_px = self.sol_price_usd()
-        if sol_px <= 0:
-            return fallback, {"source": "config_fallback", "usd": fallback}
-        base_lamports = 5000
-        usd = (base_lamports + priority_lamports) / 1_000_000_000 * sol_px
-        # Keep a conservative floor because swaps may include tips/extra landing cost not visible in a quote-only request.
-        floor = float(CFG.get("paper_network_cost_floor_usd", fallback))
-        usd = max(usd, floor)
-        return usd, {"source": "solana+helius", "base_lamports": base_lamports,
-                     "priority_lamports_p75": priority_lamports, "sol_usd": sol_px, "usd": usd}
 
     def helius_health(self) -> Dict[str, Any]:
         if not self.helius_key:
@@ -370,7 +243,7 @@ class Scorer:
 
 
 class PositionManager:
-    """PAPER position manager for v4.0.9 CAPITAL PROTECT + TRUE-NET + COMPOUND HARVEST + MOONBAG.
+    """PAPER position manager for v4.0.7 COMPOUND HARVEST + MOONBAG.
 
     Compound rule: every +15% from the current cycle anchor, harvest 10% of the
     current working base to cash; the remaining +5% becomes the next working base.
@@ -378,9 +251,8 @@ class PositionManager:
     The working leg can later stop/trail independently; the moonbag is kept for
     configured x10/x100-style milestones.
     """
-    def __init__(self, db: DBStore, md: MarketData):
+    def __init__(self, db: DBStore):
         self.db = db
-        self.md = md
         self.lock = threading.RLock()
 
     def _available_cash(self):
@@ -389,94 +261,52 @@ class PositionManager:
         proceeds = float(self.db.q("SELECT COALESCE(SUM(usd),0) n FROM ledger WHERE mode='PAPER' AND action IN ('HARVEST','MOONBAG_HARVEST','EXIT')")[0]["n"] or 0)
         return capital - buys + proceeds
 
-    def _reentry_guard(self, mint):
-        """v4.0.8: stop/fade cooldown. First failed exit = 2h; second within 24h = 24h."""
-        now = now_ms()
-        day_ms = 24 * 3600 * 1000
-        rows = self.db.q("SELECT ts_ms,reason FROM stop_events WHERE mint=? AND ts_ms>=? ORDER BY ts_ms DESC",
-                         (mint, now - day_ms))
-        if not rows:
-            return True, ""
-        last_ts = int(rows[0]["ts_ms"] or 0)
-        if len(rows) >= 2:
-            until = last_ts + int(CFG.get("reentry_second_stop_lock_hours", 24)) * 3600 * 1000
-            if now < until:
-                return False, f"second failed exit lock • {age_text(last_ts)}"
-        until = last_ts + int(CFG.get("reentry_stop_cooldown_hours", 2)) * 3600 * 1000
-        if now < until:
-            return False, f"stop/fade cooldown • {age_text(last_ts)}"
-        return True, ""
-
-    def _record_failed_exit(self, p, reason, price):
-        self.db.execute("INSERT INTO stop_events(ts_ms,mint,symbol,position_id,reason,price) VALUES(?,?,?,?,?,?)",
-                        (now_ms(), p["mint"], p["symbol"], p["id"], reason, price))
-
     def open_paper(self, mint, symbol, price):
         if price <= 0: return False
         with self.lock:
-            allowed, guard_reason = self._reentry_guard(mint)
-            if not allowed:
-                return False
             if self.db.q("SELECT id FROM positions WHERE status IN ('OPEN','MOONBAG') AND mint=? LIMIT 1", (mint,)):
                 return False
             n_open = self.db.q("SELECT COUNT(*) n FROM positions WHERE status IN ('OPEN','MOONBAG')")[0]["n"]
             if n_open >= int(CFG.get("max_open_positions", 1)):
                 return False
-            stake_usd = float(CFG["position_size_usd"])
-            network_usd, net_meta = self.md.network_fee_estimate_usd()
-            q = self.md.entry_quote(mint, stake_usd)
-            if q.get("ok") and float(q.get("out_qty") or 0) > 0:
-                qty = float(q["out_qty"])
-                effective_entry = stake_usd / qty
-                mark_value = qty * price
-                execution_cost = max(0.0, stake_usd - mark_value)
-                qnote = (f"Jupiter V2 router={q.get('router') or '?'} fee={q.get('fee_bps',0):g}bps "
-                         f"platform={q.get('platform_fee_bps',0):g}bps impact={q.get('price_impact_pct',0):.4g}%")
-            else:
-                # Conservative fallback only if the quote service is temporarily unavailable.
-                fallback_pct = float(CFG.get("paper_friction_pct_per_buy", CFG.get("paper_friction_pct_per_sale", 0)))
-                execution_cost = stake_usd * fallback_pct / 100
-                qty = max(0.0, stake_usd - execution_cost) / price
-                effective_entry = stake_usd / qty if qty > 0 else price
-                qnote = f"quote fallback: {q.get('reason','unavailable')} / model {fallback_pct:g}%"
-            total_cash_cost = stake_usd + network_usd
-            total_cost_for_pnl = total_cash_cost
-            if self._available_cash() + 1e-9 < total_cash_cost:
+            usd = float(CFG["position_size_usd"])
+            # Never create PAPER leverage accidentally: a new stake must be funded by PAPER cash.
+            if self._available_cash() + 1e-9 < usd:
                 return False
+            qty = usd / price
             self.db.execute("""INSERT INTO positions(
                 mint,symbol,status,entry_ms,entry_price,initial_usd,token_qty,remaining_qty,peak_price,
                 active_qty,moonbag_qty,compound_anchor_price,working_base_usd,harvest_count,moonbag_milestone_idx
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (mint, symbol, "OPEN", now_ms(), effective_entry, total_cost_for_pnl, qty, qty, max(price,effective_entry),
-                 qty, 0.0, effective_entry, qty*effective_entry, 0, 0))
-            total_fee = execution_cost + network_usd
-            note = f"TRUE-NET paper BUY • {qnote} • network=${network_usd:.5f} ({net_meta.get('source')})"
+                (mint, symbol, "OPEN", now_ms(), price, usd, qty, qty, price,
+                 qty, 0.0, price, usd, 0, 0))
             self.db.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                            (now_ms(), "PAPER", "BUY", mint, symbol, total_cash_cost, qty, effective_entry, total_fee, note))
-        notify(f"🟢 V4 PAPER BUY TRUE-NET\n{symbol}\nMark: ${price:.10g}\nEffective entry: ${effective_entry:.10g}\nStake: ${stake_usd:.2f}\nEstimated costs: ${total_fee:.4f}\nMode: PAPER")
+                            (now_ms(), "PAPER", "BUY", mint, symbol, usd, qty, price, 0, "paper fill"))
+        notify(f"🟢 V4 PAPER BUY\n{symbol}\nEntry: ${price:.10g}\nPosition: ${usd:.2f}\nMode: PAPER")
         return True
+
+    def open_paper_with_reason(self, mint, symbol, price):
+        """Open a simulated position and expose the exact non-open reason."""
+        if price <= 0:
+            return False, "INVALID_PRICE"
+        with self.lock:
+            if self.db.q("SELECT id FROM positions WHERE status IN ('OPEN','MOONBAG') AND mint=? LIMIT 1", (mint,)):
+                return False, "DUPLICATE_OPEN_MINT"
+            n_open = self.db.q("SELECT COUNT(*) n FROM positions WHERE status IN ('OPEN','MOONBAG')")[0]["n"]
+            if n_open >= int(CFG.get("max_open_positions", 1)):
+                return False, "MAX_OPEN_POSITIONS"
+            if self._available_cash() + 1e-9 < float(CFG["position_size_usd"]):
+                return False, "INSUFFICIENT_PAPER_CASH"
+        return (True, "OPENED") if self.open_paper(mint, symbol, price) else (False, "OPEN_FAILED")
 
     def _sale(self, p, action, qty, price, note):
         if qty <= 0: return 0.0, 0.0
-        mark_gross = qty * price
-        network_usd, net_meta = self.md.network_fee_estimate_usd()
-        q = self.md.sell_quote(p["mint"], qty)
-        if q.get("ok"):
-            quoted_usdc = float(q.get("out_usdc") or 0)
-            execution_cost = max(0.0, mark_gross - quoted_usdc)
-            net = max(0.0, quoted_usdc - network_usd)
-            qnote = (f"Jupiter V2 router={q.get('router') or '?'} fee={q.get('fee_bps',0):g}bps "
-                     f"platform={q.get('platform_fee_bps',0):g}bps impact={q.get('price_impact_pct',0):.4g}%")
-        else:
-            fallback_pct = float(CFG.get("paper_friction_pct_per_sale", 0))
-            execution_cost = mark_gross * fallback_pct / 100
-            net = max(0.0, mark_gross - execution_cost - network_usd)
-            qnote = f"quote fallback: {q.get('reason','unavailable')} / model {fallback_pct:g}%"
-        total_cost = execution_cost + network_usd
-        full_note = f"{note} • TRUE-NET • {qnote} • network=${network_usd:.5f} ({net_meta.get('source')})"
+        gross = qty * price
+        friction = gross * float(CFG["paper_friction_pct_per_sale"]) / 100 + float(CFG["paper_network_cost_usd_per_tx"])
+        net = max(0.0, gross - friction)
         self.db.execute("INSERT INTO ledger(ts_ms,mode,action,mint,symbol,usd,qty,price,fee_usd,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (now_ms(), "PAPER", action, p["mint"], p["symbol"], net, qty, price, total_cost, full_note))
-        return net, total_cost
+                        (now_ms(), "PAPER", action, p["mint"], p["symbol"], net, qty, price, friction, note))
+        return net, friction
 
     def update(self, mint, price, position_id=None):
         if price <= 0: return False
@@ -548,61 +378,29 @@ class PositionManager:
                             (remaining, moonbag, realized, mb_idx, peak, p["id"]))
             notify(f"🌙💰 V4 MOONBAG HARVEST\n{p['symbol']}\nLevel: x{level['multiple']:g}\nCash NET: ${net:.2f}\nMoonbag remaining: {moonbag:.6g} tokens")
 
-        # v4.0.9 CAPITAL PROTECT working-leg protection.
-        # We trade momentum, not sideways oscillation:
-        #   before +5% peak -> hard loss cap at -5% from effective entry;
-        #   after +5% peak  -> protect +3% from entry;
-        #   after +10% peak -> protect +6% from entry;
-        #   after first +15% compound harvest -> existing peak trailing takes over.
-        # A fast memecoin gap can still execute below these trigger levels; TRUE-NET sell quote
-        # records the executable result rather than pretending the stop price was guaranteed.
+        # Working-leg protection. Before any compound harvest use the hard stop.
+        # Afterwards trail from the local peak. The protected moonbag is NOT sold by this stop.
         first_hit = hcount >= 1
-        hard_stop_pct = float(CFG.get("capital_protect_hard_stop_pct", 5))
-        arm1_pct = float(CFG.get("capital_protect_arm1_pct", 5))
-        floor1_pct = float(CFG.get("capital_protect_floor1_pct", 3))
-        arm2_pct = float(CFG.get("capital_protect_arm2_pct", 10))
-        floor2_pct = float(CFG.get("capital_protect_floor2_pct", 6))
-
-        peak_gain_pct = ((peak / entry) - 1) * 100 if entry > 0 else 0.0
-        hard_stop = active > 0 and (not first_hit) and price <= entry * (1 - hard_stop_pct / 100)
-        protect_floor = None
-        if not first_hit:
-            if peak_gain_pct >= arm2_pct:
-                protect_floor = floor2_pct
-            elif peak_gain_pct >= arm1_pct:
-                protect_floor = floor1_pct
-        momentum_fade = active > 0 and protect_floor is not None and price <= entry * (1 + protect_floor / 100)
-        trailing_stop = active > 0 and first_hit and price <= peak * (1 - float(CFG["trailing_drawdown_after_first_milestone_pct"]) / 100)
-        stop_hit = hard_stop or momentum_fade or trailing_stop
+        stop_hit = active > 0 and ((not first_hit and price <= entry * (1 - float(CFG["pre_tp_stop_pct"]) / 100)) or
+                    (first_hit and price <= peak * (1 - float(CFG["trailing_drawdown_after_first_milestone_pct"]) / 100)))
         if stop_hit:
-            if momentum_fade:
-                exit_note = f"capital protect after peak +{peak_gain_pct:.1f}% / floor +{protect_floor:g}%"
-                reason = "MOMENTUM_FADE"
-            elif hard_stop:
-                exit_note, reason = f"capital protect hard stop -{hard_stop_pct:g}%", "STOP"
-            else:
-                exit_note, reason = "working-leg trailing stop", "TRAILING"
             sell_qty = active
-            net, friction = self._sale(p, "EXIT", sell_qty, price, exit_note)
+            net, friction = self._sale(p, "EXIT", sell_qty, price,
+                                       "pre-harvest stop" if not first_hit else "working-leg trailing stop")
             realized += net
             active = 0.0
             remaining = moonbag
             if moonbag > 0:
-                status = "MOONBAG"
-                db_reason = f"{reason}_MOONBAG_REMAINS"
+                status, reason = "MOONBAG", "WORKING_STOP_MOONBAG_REMAINS"
             else:
-                status = "CLOSED"
-                db_reason = reason
+                status, reason = "CLOSED", ("STOP" if not first_hit else "TRAILING")
             with self.db.lock:
                 self.db.cx.execute("""UPDATE positions SET status=?,remaining_qty=?,active_qty=0,moonbag_qty=?,realized_usd=?,
                     exit_ms=?,exit_price=?,reason=?,peak_price=? WHERE id=?""",
-                    (status, remaining, moonbag, realized, now_ms(), price, db_reason, peak, p["id"]))
+                    (status, remaining, moonbag, realized, now_ms(), price, reason, peak, p["id"]))
                 self.db.cx.commit()
-            # Failed pre-harvest momentum exits are re-entry guarded to prevent churn.
-            if reason in ("STOP", "MOMENTUM_FADE"):
-                self._record_failed_exit(p, reason, price)
             pnl_so_far = realized + moonbag * price - float(p["initial_usd"])
-            notify(f"🔴 V4 WORKING LEG EXIT\n{p['symbol']}\nReason: {reason}\nExit: ${price:.10g}\nCash proceeds total: ${realized:.2f}\nMoonbag remains: {'YES' if moonbag>0 else 'NO'}\nMarked P&L: ${pnl_so_far:+.2f}")
+            notify(f"🔴 V4 WORKING LEG EXIT\n{p['symbol']}\nExit: ${price:.10g}\nCash proceeds total: ${realized:.2f}\nMoonbag remains: {'YES' if moonbag>0 else 'NO'}\nMarked P&L: ${pnl_so_far:+.2f}")
             return True
 
         # Fully close after the final moonbag sale if no working leg remains.
@@ -616,120 +414,9 @@ class PositionManager:
         return True
 
 
-class TrendAnalyzer:
-    """v4.1.0 PRE-ENTRY TREND ANALYZER.
-    Uses 5h of closed 5m OHLCV candles plus a live confirmation window.
-    It rejects one-candle pumps and late/chasing entries before PAPER BUY.
-    """
-    def __init__(self, db: DBStore, md: MarketData):
-        self.db, self.md = db, md
-
-    @staticmethod
-    def _pct(a, b):
-        return ((b / a) - 1.0) * 100.0 if a and a > 0 else 0.0
-
-    def history(self, mint: str) -> Dict[str, Any]:
-        hours = float(CFG.get("trend_history_hours", 5))
-        res = self.md.birdeye_ohlcv(mint, hours=hours, interval="5m")
-        if not res.get("ok"):
-            return {"ok": False, "score": 0.0, "reason": res.get("reason", "OHLCV unavailable"), "metrics": {}}
-        c = res.get("items") or []
-        min_candles = int(CFG.get("trend_min_candles", 24))
-        if len(c) < min_candles:
-            return {"ok": False, "score": 0.0, "reason": f"only {len(c)} closed candles", "metrics": {"candles": len(c)}}
-        closes=[float(x.get("c") or 0) for x in c]
-        opens=[float(x.get("o") or x.get("c") or 0) for x in c]
-        highs=[float(x.get("h") or x.get("c") or 0) for x in c]
-        lows=[float(x.get("l") or x.get("c") or 0) for x in c]
-        vols=[float(x.get("v_usd") or x.get("v") or 0) for x in c]
-        n=len(closes)
-        ret5=self._pct(closes[max(0,n-2)], closes[-1])
-        ret30=self._pct(closes[max(0,n-7)], closes[-1])
-        ret1h=self._pct(closes[max(0,n-13)], closes[-1])
-        ret3h=self._pct(closes[max(0,n-37)], closes[-1])
-        ret5h=self._pct(closes[0], closes[-1])
-        green=sum(1 for o,cl in zip(opens,closes) if cl>=o)/n
-        # Higher-high / higher-low persistence over adjacent candles.
-        hh=sum(1 for i in range(1,n) if highs[i]>=highs[i-1])/(n-1)
-        hl=sum(1 for i in range(1,n) if lows[i]>=lows[i-1])/(n-1)
-        peak=closes[0]; max_dd=0.0
-        for px in closes:
-            peak=max(peak,px); max_dd=min(max_dd, self._pct(peak,px))
-        candle_moves=[abs(self._pct(opens[i],closes[i])) for i in range(n)]
-        max_body=max(candle_moves) if candle_moves else 0.0
-        total_abs=sum(candle_moves) or 1.0
-        concentration=max_body/total_abs
-        recent_vol=sum(vols[-6:])/max(1,min(6,n))
-        prev_slice=vols[-18:-6] if n>=18 else vols[:-6]
-        prev_vol=sum(prev_slice)/max(1,len(prev_slice)) if prev_slice else recent_vol
-        vol_ratio=recent_vol/(prev_vol+1e-9) if prev_vol else (2.0 if recent_vol>0 else 1.0)
-        # How far current price is above the 5h median: catches very late entries.
-        med=sorted(closes)[n//2]
-        extension=self._pct(med,closes[-1])
-
-        score=0.0
-        score += clamp((green-0.48)/0.22*20,0,20)
-        score += clamp((hh-0.45)/0.25*12,0,12)
-        score += clamp((hl-0.45)/0.25*12,0,12)
-        score += clamp(ret1h/15*16,0,16)
-        score += clamp(ret3h/30*12,0,12)
-        score += clamp((vol_ratio-1)/2*12,0,12)
-        score += clamp((10-abs(ret30-5))/10*8,0,8)
-        score += 8 if 0 < ret5h < 80 else 0
-        # Pump/chase penalties.
-        if max_body > float(CFG.get("trend_max_single_candle_pct", 18)): score -= 25
-        if concentration > float(CFG.get("trend_max_move_concentration", 0.35)): score -= 20
-        if extension > float(CFG.get("trend_max_extension_pct", 45)): score -= 25
-        if max_dd < -float(CFG.get("trend_max_drawdown_pct", 22)): score -= 15
-        if ret5 > float(CFG.get("trend_max_last5m_pct", 12)): score -= 20
-        score=clamp(score,0,100)
-        metrics={"candles":n,"ret5m":round(ret5,2),"ret30m":round(ret30,2),"ret1h":round(ret1h,2),
-                 "ret3h":round(ret3h,2),"ret5h":round(ret5h,2),"green_ratio":round(green,3),
-                 "higher_high_ratio":round(hh,3),"higher_low_ratio":round(hl,3),
-                 "max_drawdown_pct":round(max_dd,2),"max_candle_body_pct":round(max_body,2),
-                 "move_concentration":round(concentration,3),"volume_accel":round(vol_ratio,2),
-                 "extension_vs_median_pct":round(extension,2)}
-        min_score=float(CFG.get("trend_min_history_score", 60))
-        ok=(score>=min_score and ret1h>float(CFG.get("trend_min_1h_return_pct",1.0)) and
-            ret3h>float(CFG.get("trend_min_3h_return_pct",0.0)) and
-            max_dd>=-float(CFG.get("trend_max_drawdown_pct",22)) and
-            max_body<=float(CFG.get("trend_max_single_candle_pct",18)) and
-            extension<=float(CFG.get("trend_max_extension_pct",45)))
-        reason="TREND_OK" if ok else "TREND_REJECT"
-        return {"ok":ok,"score":round(score,1),"reason":reason,"metrics":metrics}
-
-    def gate(self, mint: str, symbol: str, price: float) -> Dict[str, Any]:
-        """History must pass, then candidate must stay healthy for ~10 minutes before entry."""
-        hist=self.history(mint)
-        now=now_ms()
-        if not hist.get("ok"):
-            self.db.execute("INSERT INTO trend_watch(mint,symbol,first_qualified_ms,last_check_ms,history_score,history_ok,confirm_count,last_price,metrics,reason) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(mint) DO UPDATE SET last_check_ms=excluded.last_check_ms,history_score=excluded.history_score,history_ok=0,confirm_count=0,last_price=excluded.last_price,metrics=excluded.metrics,reason=excluded.reason",
-                (mint,symbol,0,now,float(hist.get("score") or 0),0,0,price,json.dumps(hist.get("metrics") or {}),hist.get("reason")))
-            return {"ok":False,"stage":"HISTORY","reason":hist.get("reason"),"score":hist.get("score",0),"metrics":hist.get("metrics",{})}
-        rows=self.db.q("SELECT * FROM trend_watch WHERE mint=?",(mint,))
-        watch_ms=int(float(CFG.get("trend_confirmation_minutes",10))*60*1000)
-        if not rows or not int(rows[0].get("history_ok") or 0):
-            self.db.execute("INSERT INTO trend_watch(mint,symbol,first_qualified_ms,last_check_ms,history_score,history_ok,confirm_count,last_price,metrics,reason) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(mint) DO UPDATE SET symbol=excluded.symbol,first_qualified_ms=excluded.first_qualified_ms,last_check_ms=excluded.last_check_ms,history_score=excluded.history_score,history_ok=1,confirm_count=1,last_price=excluded.last_price,metrics=excluded.metrics,reason='WATCHING'",
-                (mint,symbol,now,now,float(hist['score']),1,1,price,json.dumps(hist['metrics']),"WATCHING"))
-            return {"ok":False,"stage":"WATCH","reason":"confirmation started","score":hist['score'],"metrics":hist['metrics']}
-        w=rows[0]; first=int(w.get("first_qualified_ms") or now); last_price=float(w.get("last_price") or price)
-        live_change=self._pct(last_price,price)
-        # During confirmation, reject a fresh vertical spike or a material fade.
-        if live_change > float(CFG.get("trend_watch_max_jump_pct",12)) or live_change < -float(CFG.get("trend_watch_max_fade_pct",5)):
-            self.db.execute("UPDATE trend_watch SET first_qualified_ms=?,last_check_ms=?,confirm_count=0,last_price=?,history_score=?,metrics=?,reason=? WHERE mint=?",
-                (now,now,price,float(hist['score']),json.dumps(hist['metrics']),"WATCH_RESET",mint))
-            return {"ok":False,"stage":"WATCH","reason":f"watch reset {live_change:+.1f}%","score":hist['score'],"metrics":hist['metrics']}
-        count=int(w.get("confirm_count") or 0)+1
-        self.db.execute("UPDATE trend_watch SET last_check_ms=?,confirm_count=?,last_price=?,history_score=?,metrics=?,reason=? WHERE mint=?",
-            (now,count,price,float(hist['score']),json.dumps(hist['metrics']),"CONFIRMED" if now-first>=watch_ms else "WATCHING",mint))
-        if now-first < watch_ms:
-            return {"ok":False,"stage":"WATCH","reason":f"{int((now-first)/60000)}m/{int(watch_ms/60000)}m","score":hist['score'],"metrics":hist['metrics']}
-        return {"ok":True,"stage":"CONFIRMED","reason":"history + live confirmation passed","score":hist['score'],"metrics":hist['metrics']}
-
-
 class V4Engine:
     def __init__(self):
-        self.db = DBStore(); self.md = MarketData(); self.sc = Scorer(); self.pm = PositionManager(self.db, self.md); self.ta = TrendAnalyzer(self.db, self.md)
+        self.db = DBStore(); self.md = MarketData(); self.sc = Scorer(); self.pm = PositionManager(self.db)
         self.last_error = ""; self.last_scan = 0; self.scan_lock = threading.Lock(); self.exitability_alerted=set()
         self.scan_diag = {"status": "NOT RUN", "ts_ms": 0}
 
@@ -750,14 +437,58 @@ class V4Engine:
             float(q.get("impact_pct") or 999)<=float(CFG.get("max_price_impact_pct",5)))
         return ok,q
 
+    def _record_entry_decision(self, mint, symbol, decision, reason, score, risk, m,
+                               route_status="NOT_CHECKED", route_detail=""):
+        self.db.execute("""INSERT INTO entry_decisions(
+            ts_ms,mint,symbol,decision,reason,score,risk,liquidity,volume_m5,
+            buys_m5,sells_m5,route_status,route_detail
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (now_ms(), mint, symbol, decision, reason, score, risk,
+             float(m.get("liquidity") or 0), float(m.get("v5") or 0),
+             float(m.get("buys") or 0), float(m.get("sells") or 0),
+             route_status, str(route_detail or "")[:300]))
+
+    def _entry_gate(self, mint, symbol, score, risk, m):
+        """Transparent PAPER gate. Jupiter is preferred; DEX fallback is PAPER-only."""
+        if float(m.get("liquidity") or 0) < float(CFG["min_liquidity_usd"]):
+            return False, "LOW_LIQUIDITY", "NOT_CHECKED", ""
+        if float(m.get("v5") or 0) < float(CFG.get("min_volume_m5_usd", 100)):
+            return False, "LOW_VOLUME_M5", "NOT_CHECKED", ""
+        if float(m.get("buys") or 0) <= float(m.get("sells") or 0):
+            return False, "BUY_FLOW_NOT_POSITIVE", "NOT_CHECKED", ""
+        if score < float(CFG["min_momentum_score"]):
+            return False, "LOW_SCORE", "NOT_CHECKED", ""
+        if risk > float(CFG["max_risk_score"]):
+            return False, "HIGH_RISK", "NOT_CHECKED", ""
+
+        if not CFG.get("require_exitability_quote", True):
+            return True, "ENTRY_OK", "DISABLED", "quote not required"
+        exit_ok, quote = self.exitability_for_entry(mint, m["price"])
+        if exit_ok:
+            return True, "ENTRY_OK", "JUPITER_OK", json.dumps(quote, ensure_ascii=False)
+
+        # This never authorizes a real order. It only prevents a transient Jupiter
+        # outage from making the PAPER experiment record zero positions.
+        fallback_ok = (
+            CFG.get("paper_allow_dex_fallback", True)
+            and str(os.getenv("V4_MODE", "PAPER")).upper() == "PAPER"
+            and float(m.get("liquidity") or 0) >= float(CFG.get("paper_fallback_min_liquidity_usd", 20000))
+            and float(m.get("v5") or 0) >= float(CFG.get("paper_fallback_min_volume_m5_usd", 1000))
+        )
+        detail = str(quote.get("reason") or quote)[:300]
+        if fallback_ok:
+            return True, "ENTRY_OK_DEX_FALLBACK", "DEX_PROXY", detail
+        return False, "NO_EXECUTABLE_EXIT_ROUTE", "JUPITER_FAILED", detail
+
     def scan_once(self, trigger="manual"):
         if not self.scan_lock.acquire(blocking=False):
             return {"status": "BUSY", "trigger": trigger}
         started = now_ms()
         d = {"status": "RUNNING", "trigger": trigger, "ts_ms": started, "discovered": 0, "pairs_found": 0,
              "no_pair": 0, "candidates_saved": 0, "low_liquidity": 0, "low_score": 0, "high_risk": 0,
-             "eligible": 0, "paper_opened": 0, "open_positions_updated": 0, "exitability_failed": 0, "open_exitability_bad": 0,
-             "trend_history_reject": 0, "trend_watching": 0, "trend_confirmed": 0}
+             "eligible": 0, "paper_opened": 0, "open_positions_updated": 0, "exitability_failed": 0,
+             "open_exitability_bad": 0, "low_volume_m5": 0, "buy_flow_not_positive": 0,
+             "paper_open_blocked": 0, "dex_fallback_entries": 0}
         try:
             listings, src = self.md.discovery(); d.update(src); d["discovered"] = len(listings)
             # Always update open PAPER positions even if they are no longer in the discovery feed.
@@ -796,28 +527,29 @@ class V4Engine:
                 self.db.execute("INSERT INTO snapshots(ts_ms,mint,price,liquidity,volume_m5,buys_m5,sells_m5,score,risk) VALUES(?,?,?,?,?,?,?,?,?)",
                     (now_ms(), mint, m["price"], m["liquidity"], m["v5"], m["buys"], m["sells"], score, risk))
                 d["candidates_saved"] += 1
-                # v4.0.9 CAPITAL PROTECT: never open into a pool below $75k liquidity,
-                # even if an older config.json still contains a lower threshold.
-                entry_min_liquidity = max(float(CFG.get("min_liquidity_usd", 0)),
-                                          float(CFG.get("capital_protect_min_liquidity_usd", 75000)))
-                if m["liquidity"] < entry_min_liquidity: d["low_liquidity"] += 1
-                if score < CFG["min_momentum_score"]: d["low_score"] += 1
-                if risk > CFG["max_risk_score"]: d["high_risk"] += 1
-                if score >= CFG["min_momentum_score"] and risk <= CFG["max_risk_score"] and m["liquidity"] >= entry_min_liquidity:
-                    tg = self.ta.gate(mint, symbol, m["price"])
-                    if not tg.get("ok"):
-                        if tg.get("stage") == "HISTORY": d["trend_history_reject"] += 1
-                        else: d["trend_watching"] += 1
-                        continue
-                    d["trend_confirmed"] += 1
-                    exit_ok, eq = self.exitability_for_entry(mint,m["price"]) if CFG.get("require_exitability_quote",True) else (True,{})
-                    if not exit_ok:
-                        d["exitability_failed"] += 1
-                    else:
-                        d["eligible"] += 1
-                        if self.pm.open_paper(mint, symbol, m["price"]):
-                            d["paper_opened"] += 1
-                            notify(f"📈 TREND CONFIRMED → PAPER BUY\n{symbol}\n5h history score: {tg.get('score',0):.1f}/100\nJupiter sell quote: ${eq.get('out_usdc',0):.2f}\nImpact: {eq.get('impact_pct',0):.2f}%")
+                allowed, reason, route_status, route_detail = self._entry_gate(mint, symbol, score, risk, m)
+                if not allowed:
+                    if reason == "LOW_LIQUIDITY": d["low_liquidity"] += 1
+                    elif reason == "LOW_VOLUME_M5": d["low_volume_m5"] += 1
+                    elif reason == "BUY_FLOW_NOT_POSITIVE": d["buy_flow_not_positive"] += 1
+                    elif reason == "LOW_SCORE": d["low_score"] += 1
+                    elif reason == "HIGH_RISK": d["high_risk"] += 1
+                    elif reason == "NO_EXECUTABLE_EXIT_ROUTE": d["exitability_failed"] += 1
+                    self._record_entry_decision(mint, symbol, "REJECT", reason, score, risk, m,
+                                                route_status, route_detail)
+                    continue
+
+                d["eligible"] += 1
+                if route_status == "DEX_PROXY": d["dex_fallback_entries"] += 1
+                opened, open_reason = self.pm.open_paper_with_reason(mint, symbol, m["price"])
+                self._record_entry_decision(mint, symbol, "OPEN" if opened else "BLOCK",
+                                            reason if opened else open_reason, score, risk, m,
+                                            route_status, route_detail)
+                if opened:
+                    d["paper_opened"] += 1
+                    notify(f"🟢 V4.0.8 PAPER ENTRY\n{symbol}\nRoute: {route_status}\nReason: {reason}\nNo real order was sent")
+                else:
+                    d["paper_open_blocked"] += 1
             d["status"] = "OK"; self.last_error = ""
         except Exception as exc:
             self.last_error = repr(exc); d["status"] = "ERROR"; d["error"] = repr(exc)[:300]

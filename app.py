@@ -76,6 +76,7 @@ def _score_breakdown_from_raw(raw_text):
         "m5_%": m5,
         "h1_%": h1,
         "vol_acc": vol_acc,
+        "vol_5m": v5,
         "buy/sell": imbalance,
         "buys_5m": buys,
         "sells_5m": sells,
@@ -109,7 +110,7 @@ def candidate_table(engine: V4Engine) -> pd.DataFrame:
     open_positions = {
         x["mint"] for x in engine.db.q("SELECT mint FROM positions WHERE status='OPEN'")
     }
-    any_open = bool(open_positions)
+    open_count = len(open_positions)
     min_liq = float(CFG["min_liquidity_usd"])
     min_score = float(CFG["min_momentum_score"])
     max_risk = float(CFG["max_risk_score"])
@@ -129,6 +130,10 @@ def candidate_table(engine: V4Engine) -> pd.DataFrame:
             reasons.append(f"SCORE {score:.1f} < {min_score:.0f}")
         if risk > max_risk:
             reasons.append(f"RISK {risk:.1f} > {max_risk:.0f}")
+        if float(bd["vol_5m"]) < float(CFG.get("min_volume_m5_usd", 100)):
+            reasons.append(f"VOL5 ${bd['vol_5m']:,.0f} < ${CFG.get('min_volume_m5_usd',100):,.0f}")
+        if float(bd["buys_5m"]) <= float(bd["sells_5m"]):
+            reasons.append("BUY FLOW NOT POSITIVE")
 
         if mint in open_positions:
             entry = "🟢 OPEN PAPER"
@@ -136,7 +141,7 @@ def candidate_table(engine: V4Engine) -> pd.DataFrame:
         elif reasons:
             entry = "❌ NO ENTRY"
             reason = " • ".join(reasons)
-        elif any_open:
+        elif open_count >= int(CFG.get("max_open_positions", 1)):
             entry = "🟡 WAIT"
             reason = f"MAX OPEN POSITIONS = {CFG.get('max_open_positions', 1)}"
         else:
@@ -174,6 +179,7 @@ def candidate_table(engine: V4Engine) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+
 def _protocol_excel(engine, hours):
     cutoff = int((__import__("time").time() - hours * 3600) * 1000)
     positions = pd.DataFrame(engine.db.q(
@@ -184,43 +190,36 @@ def _protocol_excel(engine, hours):
         "SELECT * FROM snapshots WHERE ts_ms>=? ORDER BY ts_ms DESC", (cutoff,)))
     candidates = pd.DataFrame(engine.db.q(
         "SELECT * FROM candidates WHERE first_seen_ms>=? ORDER BY first_seen_ms DESC", (cutoff,)))
-
-    stats = engine.stats()
-    summary_rows = [
-        ["version", "v4.0.7"],
-        ["period_hours", hours],
-        ["starting_capital_usd", stats.get("paper_capital", 0)],
-        ["cash_usd", stats.get("cash", 0)],
-        ["open_marked_value_usd", stats.get("open_value", 0)],
-        ["total_equity_usd", stats.get("equity", 0)],
-        ["total_pnl_usd", stats.get("total_pnl", 0)],
-        ["realized_pnl_usd", stats.get("realized", 0)],
-        ["positions_in_period", len(positions)],
-        ["ledger_rows_in_period", len(ledger)],
-        ["snapshots_in_period", len(snapshots)],
-        ["candidates_in_period", len(candidates)],
-    ]
-    if not positions.empty and "status" in positions.columns:
-        closed = positions[positions["status"].eq("CLOSED")].copy()
-        summary_rows += [["closed_positions_in_period", len(closed)]]
+    decisions = pd.DataFrame(engine.db.q(
+        "SELECT * FROM entry_decisions WHERE ts_ms>=? ORDER BY ts_ms DESC", (cutoff,)))
+    summary_rows=[]
+    if not positions.empty:
+        closed=positions[positions.status.eq("CLOSED")].copy()
+        if not closed.empty:
+            closed["pnl_usd"]=closed["realized_usd"].fillna(0)-closed["initial_usd"].fillna(0)
+        summary_rows += [
+            ["period_hours", hours], ["positions", len(positions)],
+            ["closed", len(closed)], ["winners", int((closed.get("pnl_usd",pd.Series(dtype=float))>0).sum())],
+            ["losers", int((closed.get("pnl_usd",pd.Series(dtype=float))<0).sum())],
+            ["closed_pnl_usd", float(closed.get("pnl_usd",pd.Series(dtype=float)).sum())]
+        ]
     else:
-        summary_rows += [["closed_positions_in_period", 0]]
-
-    summary = pd.DataFrame(summary_rows, columns=["metric", "value"])
-    out = io.BytesIO()
+        summary_rows += [["period_hours",hours],["positions",0],["closed",0],["winners",0],["losers",0],["closed_pnl_usd",0]]
+    summary=pd.DataFrame(summary_rows,columns=["metric","value"])
+    out=io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as w:
-        summary.to_excel(w, index=False, sheet_name="SUMMARY")
-        positions.to_excel(w, index=False, sheet_name="POSITIONS")
-        ledger.to_excel(w, index=False, sheet_name="LEDGER")
-        snapshots.to_excel(w, index=False, sheet_name="SNAPSHOTS")
-        candidates.to_excel(w, index=False, sheet_name="CANDIDATES")
+        summary.to_excel(w,index=False,sheet_name="SUMMARY")
+        positions.to_excel(w,index=False,sheet_name="POSITIONS")
+        ledger.to_excel(w,index=False,sheet_name="LEDGER")
+        snapshots.to_excel(w,index=False,sheet_name="SNAPSHOTS")
+        candidates.to_excel(w,index=False,sheet_name="CANDIDATES")
+        decisions.to_excel(w,index=False,sheet_name="ENTRY_DECISIONS")
     return out.getvalue()
-
 
 e = get_engine()
 sup = get_supervisor(e)
 
-st.title("🚀 V4 Momentum Hunter — PAPER v4.0.7")
+st.title(f"🚀 V4 Momentum Hunter — PAPER v{CFG.get('version','4.0.8')}")
 st.caption(
     "Solana momentum scanner • Moonbag Ladder • background PAPER scanner • "
     "transparent score/risk diagnostics • AUTO execution physically disabled"
@@ -270,15 +269,14 @@ c2.metric("Open PAPER", stats["open"])
 c3.metric("Closed", stats["closed"])
 c4.metric("Realized P&L", f"${stats['realized']:.2f}")
 
-st.subheader("🧾 PAPER accounting — v4.0.7")
+st.subheader(f"🧾 PAPER accounting — v{CFG.get('version','4.0.8')}")
 a1,a2,a3,a4,a5 = st.columns(5)
 a1.metric("Starting capital", f"${stats['paper_capital']:.2f}")
 a2.metric("Cash", f"${stats['cash']:.2f}")
 a3.metric("Open marked value", f"${stats['open_value']:.2f}")
 a4.metric("Total equity", f"${stats['equity']:.2f}")
 a5.metric("Total P&L", f"${stats['total_pnl']:+.2f}")
-st.caption(f"Harvested cash proceeds: ${stats['harvested_proceeds']:.2f}. Realized P&L counts only fully CLOSED positions. Open value uses latest stored candidate price.")
-st.caption("v4.0.7 COMPOUND HARVEST: each +15% cycle banks 10% of the working base to CASH and compounds the remaining +5%. After 3 harvests, 10% of remaining tokens are ring-fenced as MOONBAG; 50% of that moonbag is harvested at x10 and x100.")
+st.caption(f"Harvested proceeds (not profit by themselves): ${stats['harvested_proceeds']:.2f}. Realized P&L counts only fully CLOSED positions. Open value uses latest stored candidate price.")
 
 st.subheader("🔬 Last scan diagnostics")
 d = dict(e.scan_diag or {})
@@ -301,9 +299,13 @@ else:
         ["No DEX pair", d.get("no_pair", 0)],
         ["Saved candidates", d.get("candidates_saved", 0)],
         ["Low liquidity", d.get("low_liquidity", 0)],
+        ["Low 5m volume", d.get("low_volume_m5", 0)],
+        ["Buy flow not positive", d.get("buy_flow_not_positive", 0)],
         ["Low momentum score", d.get("low_score", 0)],
         ["High risk", d.get("high_risk", 0)],
         ["Exitability failed", d.get("exitability_failed", 0)],
+        ["DEX fallback entries", d.get("dex_fallback_entries", 0)],
+        ["Eligible but open blocked", d.get("paper_open_blocked", 0)],
         ["Open positions updated", d.get("open_positions_updated", 0)],
     ]
     st.dataframe(
@@ -345,7 +347,7 @@ st.subheader("📦 Positions")
 pos = pd.DataFrame(
     e.db.q(
         "SELECT id,symbol,status,entry_price,initial_usd,remaining_qty,peak_price,"
-        "realized_usd,working_base_usd,harvest_count,active_qty,moonbag_qty,moonbag_milestone_idx,reason FROM positions ORDER BY id DESC LIMIT 100"
+        "realized_usd,milestone_idx,reason FROM positions ORDER BY id DESC LIMIT 100"
     )
 )
 st.dataframe(pos, width="stretch", hide_index=True)
@@ -359,33 +361,22 @@ led = pd.DataFrame(
 )
 st.dataframe(led, width="stretch", hide_index=True)
 
+st.subheader("🚦 Entry decisions")
+decisions = pd.DataFrame(e.db.q(
+    "SELECT ts_ms,symbol,decision,reason,score,risk,liquidity,volume_m5,buys_m5,sells_m5,route_status,route_detail "
+    "FROM entry_decisions ORDER BY id DESC LIMIT 500"
+))
+st.dataframe(decisions, width="stretch", hide_index=True)
+
 
 st.subheader("📤 Export work protocol to Excel")
-periods = {
-    "1 hour": 1,
-    "4 hours": 4,
-    "12 hours": 12,
-    "24 hours": 24,
-    "7 days": 24 * 7,
-    "14 days": 24 * 14,
-    "1 month": 24 * 30,
-    "6 months": 24 * 183,
-    "1 year": 24 * 365,
-}
-label = st.selectbox("Protocol period", list(periods.keys()), index=3)
+periods={"1 hour":1,"12 hours":12,"24 hours":24,"7 days":24*7,"14 days":24*14,"1 month":24*30,"6 months":24*183,"1 year":24*365}
+label=st.selectbox("Protocol period", list(periods.keys()), index=2)
 try:
-    xbytes = _protocol_excel(e, periods[label])
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    st.download_button(
-        "⬇️ Download protocol .xlsx",
-        data=xbytes,
-        file_name=f"V4_protocol_{label.replace(' ', '_')}_{stamp}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.caption(
-        "Workbook sheets: SUMMARY, POSITIONS, LEDGER, SNAPSHOTS, CANDIDATES. "
-        "Export is read-only and does not change strategy or PAPER positions."
-    )
+    xbytes=_protocol_excel(e, periods[label])
+    stamp=datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    st.download_button("⬇️ Download protocol .xlsx", data=xbytes, file_name=f"V4_protocol_{label.replace(' ','_')}_{stamp}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.caption("Workbook sheets: SUMMARY, POSITIONS, LEDGER, SNAPSHOTS, CANDIDATES, ENTRY_DECISIONS. Export is read-only and does not change strategy or PAPER positions.")
 except Exception as exc:
     st.warning(f"Excel protocol unavailable: {exc!r}")
 
