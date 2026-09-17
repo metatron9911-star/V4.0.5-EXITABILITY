@@ -118,12 +118,12 @@ def scanner(db, stop):
                     continue
                 ready,evidence=observe(db,mint,pair)
                 if not ready: continue
-                budget,reason=db.allocation(); db.event(mint,'RISK',reason,dict(budget=budget))
+                strength=max(0.5,min(2.0, (evidence.get('buys',0)/max(1,evidence.get('sells',1)))/2 + min(1,evidence.get('volume_m5',0)/max(1,db.cfg['min_volume_m5_usd'])*0.25))); budget,reason=db.allocation(strength); db.event(mint,'RISK',reason,dict(budget=budget,strength=strength))
                 if not budget: continue
                 safe,reason,proof=security(md,mint,db.cfg); db.event(mint,'SECURITY',reason,proof)
                 if not safe: continue
                 symbol=(pair.get('baseToken') or {}).get('symbol') or mint[:8]
-                outcome=exp.open_cohort(mint,symbol,evidence['price'],proof['decimals'])
+                outcome=exp.open_cohort(mint,symbol,evidence['price'],proof['decimals'],strength)
                 db.event(mint,'DECISION',outcome)
             heartbeat(db,'scanner','IDLE')
         except Exception as exc:
@@ -148,7 +148,7 @@ def exit_monitor(db, stop):
             managers[p['id']].exit_one(p['id'])
         except Exception as exc:
             db.event(p['mint'],'EXIT','ERROR',dict(error=type(exc).__name__,policy=p['policy']))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
         while not stop.is_set():
             started=time.monotonic(); heartbeat(db,'exits','RUNNING')
             opened=[p for p in db.snapshot()['positions'] if int(p['remaining_raw'])]

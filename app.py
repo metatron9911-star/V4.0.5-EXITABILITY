@@ -4,9 +4,9 @@ import streamlit as st
 from engine import Store, export_excel, now_ms
 from telegram_status import configured, status_text, send
 
-st.set_page_config(page_title='V7.1 PAPER Machine', layout='wide')
-st.title('V7.1 — DIVERSIFIED 30 PAPER')
-st.info('Реальные сделки отключены в коде. До 30 одновременных PAPER-позиций; свободный банк распределяется по свободным слотам (при $150 и 30 пустых слотах — около $5 на монету). Освободившийся капитал возвращается в оборот.')
+st.set_page_config(page_title='V7.2 PAPER Machine', layout='wide')
+st.title('V7.2 — FREQUENT / ADAPTIVE PAPER')
+st.info('PAPER: реальные сделки отключены. До 50 небольших позиций; размер ставки адаптивный, а не равный. Выход по прибыли считается по исполнимой котировке после расходов маршрута.')
 
 @st.cache_resource
 def connect(): return Store()
@@ -16,7 +16,7 @@ except Exception as exc:
     st.error(str(exc)); st.stop()
 
 REASON_RU={
- 'PASS':'Рыночные фильтры пройдены','COHORT_OPENED':'ВХОД ОТКРЫТ','DIVERSIFIED_30_RISK_OK':'Есть свободный слот и бюджет',
+ 'PASS':'Рыночные фильтры пройдены','COHORT_OPENED':'ВХОД ОТКРЫТ','ADAPTIVE_RISK_OK':'Есть свободный слот; адаптивный размер ставки',
  'LOW_LIQUIDITY':'Недостаточная ликвидность','LOW_VOLUME':'Недостаточный объём за 5 мин','LOW_SELL_ACTIVITY':'Мало продаж за 5 мин',
  'BUY_FLOW_WEAK':'Покупок не больше, чем продаж','PAIR_TOO_NEW':'Пара ещё слишком новая','MOMENTUM_OUTSIDE_RANGE':'Импульс вне заданного диапазона',
  'PAIR_UNAVAILABLE':'Пара DEX не найдена','INVALID_PAIR':'Некорректные данные пары','RESET_UNSTABLE':'Подтверждение сброшено: движение нестабильно',
@@ -29,7 +29,7 @@ REASON_RU={
  'BUY_QUOTE_UNAVAILABLE':'Нет свежей котировки на вход','QUANTITY_TOO_SMALL':'Слишком маленькое количество токенов','ROUNDTRIP_QUOTE_UNAVAILABLE':'Нет проверяемого маршрута вход→выход',
  'ROUNDTRIP_COST_HIGH':'Слишком большие потери round-trip','IMPACT_HIGH':'Слишком высокий price impact','SOURCE_DIVERGENCE':'Цена источника слишком отличается от исполнимой котировки',
  'RISK_CHANGED':'Бюджет/риск изменился во время проверки','ALREADY_TRADED':'Эта монета уже торговалась','QUOTE_EXPIRED':'Котировка устарела до фиксации входа',
- 'STOP_2PCT_FROM_ENTRY':'Закрытие: ниже −2% от стартовой стоимости','PRINCIPAL_RECOVERED_2X':'При +100% возвращено тело ставки','QUOTE_UNAVAILABLE':'Нет свежей котировки на выход'
+ 'STOP_2PCT_FROM_ENTRY':'Закрытие: ниже −2% от стартовой стоимости','NET_TAKE_PROFIT':'Фиксация чистой PAPER-прибыли по исполнимой котировке','PRINCIPAL_RECOVERED_2X':'При +100% возвращено тело ставки','QUOTE_UNAVAILABLE':'Нет свежей котировки на выход'
 }
 
 def ru(reason):
@@ -52,7 +52,7 @@ if cols[1].button('Scan now',use_container_width=True):
 if cols[2].button('Telegram status',use_container_width=True):
     s=db.snapshot(); ok,detail=send(status_text(db,s)); (st.success if ok else st.error)(detail)
 if cols[3].button('Test Telegram',use_container_width=True):
-    ok,detail=send('V7.1 — PAPER\nПроверка Telegram. Реальная торговля отключена.'); (st.success if ok else st.error)(detail)
+    ok,detail=send('V7.2 — PAPER\nПроверка Telegram. Реальная торговля отключена.'); (st.success if ok else st.error)(detail)
 
 @st.fragment(run_every='10s')
 def dashboard():
@@ -72,7 +72,7 @@ def dashboard():
     with cards[1]: indicator('Exit monitor', bool(exits and now-exits['ts_ms']<30000), f"{exits.get('status','NO HEARTBEAT') if exits else 'NO HEARTBEAT'}")
     with cards[2]: indicator('Discovery', bool(last_discovery and now-last_discovery[0]<120000), 'свежий проход' if last_discovery and now-last_discovery[0]<120000 else 'нет свежего прохода')
     with cards[3]: indicator('Telegram', configured(), ('настроен; отчёт каждый час' + (f" · последний {fmt_time(last_report[0])} {last_report[1]}" if last_report else '')) if configured() else 'не заданы token/chat ID')
-    with cards[4]: indicator('PAPER / 30 slots', s['config']['max_open_positions']==30, f"лимит {s['config']['max_open_positions']} · REAL execution OFF")
+    with cards[4]: indicator('PAPER / adaptive', s['config']['max_open_positions']>=30, f"до {s['config']['max_open_positions']} позиций · REAL execution OFF")
 
     stats=db.stats(s)
     st.subheader('Банк и результат')
@@ -97,7 +97,7 @@ def dashboard():
         if not mint:continue
         cur=latest.get(mint)
         if cur is None or priority.get(stage,0)>cur['_p']:
-            status='ВХОД' if reason=='COHORT_OPENED' else ('ПРОШЁЛ' if reason in ('PASS','CONFIRMED','SECURITY_SCREEN_PASSED','DIVERSIFIED_30_RISK_OK') else 'ОТКАЗ/ОЖИДАНИЕ')
+            status='ВХОД' if reason=='COHORT_OPENED' else ('ПРОШЁЛ' if reason in ('PASS','CONFIRMED','SECURITY_SCREEN_PASSED','ADAPTIVE_RISK_OK') else 'ОТКАЗ/ОЖИДАНИЕ')
             latest[mint]={'время':fmt_time(ts),'mint':mint,'этап':stage,'статус':status,'причина':ru(reason),'_p':priority.get(stage,0)}
     decision_rows=[]
     for x in latest.values():
@@ -106,17 +106,17 @@ def dashboard():
 
     st.subheader('Сводка причин отказов')
     with db.lock:
-        rows=db.cx.execute("SELECT stage,reason,COUNT(*) FROM events WHERE stage IN ('MARKET','WATCH','RISK','SECURITY','DECISION') AND reason NOT IN ('PASS','WAIT','CONFIRMED','DIVERSIFIED_30_RISK_OK','SECURITY_SCREEN_PASSED','COHORT_OPENED') GROUP BY stage,reason ORDER BY COUNT(*) DESC").fetchall()
+        rows=db.cx.execute("SELECT stage,reason,COUNT(*) FROM events WHERE stage IN ('MARKET','WATCH','RISK','SECURITY','DECISION') AND reason NOT IN ('PASS','WAIT','CONFIRMED','ADAPTIVE_RISK_OK','SECURITY_SCREEN_PASSED','COHORT_OPENED') GROUP BY stage,reason ORDER BY COUNT(*) DESC").fetchall()
     st.dataframe([{'этап':a,'причина':ru(b),'код':b,'сколько':c} for a,b,c in rows],use_container_width=True,hide_index=True)
 
 dashboard()
 periods={'1 час':1,'3 часа':3,'6 часов':6,'12 часов':12,'24 часа':24,'48 часов':48,'7 дней':168,'Весь эксперимент':None}
-period=st.selectbox('Период протокола',list(periods),index=0)
-st.caption('Excel содержит Summary, Positions, Watch, Config, Events и Equity. Для оперативной проверки по умолчанию выбран 1 час.')
-if st.button('Подготовить Excel'):
-    with db.lock:
-        db.s=json.loads(db.cx.execute('SELECT payload FROM state WHERE id=1').fetchone()[0])
-        st.session_state['xlsx']=export_excel(db,periods[period]); st.session_state['xlsx_period']=period
-        st.session_state['xlsx_name']=f'V7_1_protocol_{periods[period] or "all"}h_{now_ms()}.xlsx'
-if 'xlsx' in st.session_state and st.session_state.get('xlsx_period')==period:
-    st.download_button('Скачать Excel',st.session_state['xlsx'],st.session_state['xlsx_name'],mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+period=st.selectbox('Период Excel-отчёта',list(periods),index=0)
+st.caption('Excel формируется прямо при обновлении страницы: Summary, Positions, Watch, Config, Events и Equity.')
+try:
+    xlsx_bytes=export_excel(db,periods[period])
+    st.download_button('📥 Скачать Excel сейчас',xlsx_bytes,
+        f'V7_2_protocol_{periods[period] or "all"}h_{now_ms()}.xlsx',
+        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
+except Exception as exc:
+    st.error('Excel не сформирован: '+type(exc).__name__+' — '+str(exc))

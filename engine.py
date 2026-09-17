@@ -13,21 +13,21 @@ import time
 ROOT = Path(__file__).resolve().parent
 CFG = json.loads((ROOT / 'config.json').read_text())
 USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-POLICIES = ('V7_DIVERSIFIED_30',)
+POLICIES = ('V7_FREQUENT_ADAPTIVE',)
 TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
 def now_ms(): return int(time.time() * 1000)
 def encode(value): return json.dumps(value, ensure_ascii=False, allow_nan=False)
 def db_path():
     d = Path(os.getenv('DATA_DIR', str(ROOT / 'data')))
     d.mkdir(parents=True, exist_ok=True)
-    return d / 'v7_1.sqlite3'
+    return d / 'v7_2.sqlite3'
 
 
 class Store:
     def __init__(self, path=None, cfg=None):
         self.cfg = copy.deepcopy(cfg or CFG)
         c = self.cfg
-        if not (0 < c['risk_fraction'] <= 1 and 1 <= c['max_open_positions'] <= 30):
+        if not (0 < c['risk_fraction'] <= 1 and 1 <= c['max_open_positions'] <= 100):
             raise ValueError('Invalid risk limits')
         if c['network_fee_usd'] < 0 or c['quote_slippage_bps'] < 0:
             raise ValueError('Invalid expenses')
@@ -120,22 +120,27 @@ class Store:
                         self.s['paused'] = True  # Persistent stop on NEW entries only.
             self.save()
 
-    def allocation(self):
-        """Diversify deployable PAPER capital evenly across the remaining slots, up to 30 positions."""
+    def allocation(self, strength=1.0):
+        """Adaptive PAPER sizing: many small positions, larger only for stronger validated signals."""
         s = self.snapshot()
         if s['paused']: return 0, 'EXPERIMENT_LOSS_PAUSE'
-        budgets=[]
-        for r in self.stats(s):
-            if r['unknown']: return 0, 'UNPRICED_POSITION'
-            if r['open'] >= self.cfg['max_open_positions']: return 0, 'POSITION_LIMIT'
-            reserved=sum(p['reserve'] for p in s['positions'] if p['policy']==r['policy'] and int(p['remaining_raw']))
-            free=max(0,r['cash']-reserved)
-            slots=max(1,self.cfg['max_open_positions']-r['open'])
-            # Keep turnover diversified: with $150 and 30 empty slots the nominal budget is about $5 per mint.
-            budgets.append(free/slots)
-        budget=math.floor(min(budgets)*1e6)/1e6
+        r=self.stats(s)[0]
+        if r['unknown']: return 0, 'UNPRICED_POSITION'
+        if r['open'] >= self.cfg['max_open_positions']: return 0, 'POSITION_LIMIT'
+        reserved=sum(p['reserve'] for p in s['positions'] if int(p['remaining_raw']))
+        free=max(0,r['cash']-reserved)
+        equity=r['equity'] if r['equity'] is not None else self.cfg['paper_capital_usd']
+        frac=self.cfg['base_position_fraction']
+        if strength>=1.5: frac=self.cfg['strong_position_fraction']
+        frac=min(frac,self.cfg['max_position_fraction'])
+        target=min(free, max(self.cfg['min_position_usd'], equity*frac))
+        # Never consume cash needed for several future entries when the account is still mostly idle.
+        reserve_slots=max(0,min(5,self.cfg['max_open_positions']-r['open']-1))
+        keep=reserve_slots*self.cfg['min_position_usd']
+        budget=min(target,max(0,free-keep))
+        budget=math.floor(budget*1e6)/1e6
         if budget <= 3*self.cfg['network_fee_usd']: return 0, 'COST_EXCEEDS_BUDGET'
-        return budget, 'DIVERSIFIED_30_RISK_OK'
+        return budget, 'ADAPTIVE_RISK_OK'
 
 
 
@@ -152,8 +157,8 @@ class Experiment:
         self.db.event(mint, 'QUOTE', purpose, q)
         return q
 
-    def open_cohort(self, mint, symbol, price, decimals):
-        budget, reason = self.db.allocation()
+    def open_cohort(self, mint, symbol, price, decimals, strength=1.0):
+        budget, reason = self.db.allocation(strength)
         if not budget: return reason
         fee = self.c['network_fee_usd']
         cost = round(budget-2*fee, 6)  # Reserve fees for half sale and final exit.
@@ -172,7 +177,7 @@ class Experiment:
         if price <= 0 or abs(execution_price/price-1)*100 > self.c['max_entry_chase_pct']: return 'SOURCE_DIVERGENCE'
         with self.db.lock, self.db.cx:
             # Recheck after network requests; no HTTP under the database lock.
-            allowed, reason = self.db.allocation()
+            allowed, reason = self.db.allocation(strength)
             if allowed+1e-8 < budget: return reason if not allowed else 'RISK_CHANGED'
             if mint in self.db.s['seen']: return 'ALREADY_TRADED'
             if not fresh(buy,self.c) or not fresh(sell,self.c): return 'QUOTE_EXPIRED'
@@ -216,6 +221,12 @@ class Experiment:
         sale, qty = None, raw
         if reason:
             sale = mark  # Actual current minimum, never the nominal stop price.
+        elif not p['half_done'] and total >= p['cost']*(1+self.c.get('take_profit_net_pct',3)/100):
+            # Frequent mode: close the whole position only after the executable SELL quote is net profitable.
+            # This uses Jupiter minOut, so pool/route fees and slippage embedded in the quote are already reflected.
+            reason='NET_TAKE_PROFIT'
+            sale=mark
+            qty=raw
         elif not p['half_done'] and total >= p['cost']*(1+self.c['principal_take_growth_pct']/100):
             # At +100% executable growth, sell only enough tokens to recover the original body + final fee.
             # Start from half; if fees/slippage make half insufficient, increase proportionally but never sell all.
@@ -230,7 +241,7 @@ class Experiment:
             dest = next(x for x in self.db.s['positions'] if x['id']==p['id'])
             if dest['remaining_raw'] != p['remaining_raw']: return
             dest.update(mark_net=net,mark_ms=mark['ts_ms'],peak_total=peak)
-            if reason in ('STOP_2PCT_FROM_ENTRY','TRAIL','TIME_EXIT'): dest['pending']=reason
+            if reason in ('STOP_2PCT_FROM_ENTRY','TRAIL','TIME_EXIT','NET_TAKE_PROFIT'): dest['pending']=reason
             if sale and fresh(sale,self.c):
                 proceeds = sale['min_raw']/1e6-fee  # Can be negative: fee is still an expense.
                 dest['received'] += proceeds
