@@ -1,4 +1,4 @@
-"""Railway supervisor: worker runs even with no browser connected."""
+"""Railway supervisor: V7.5 worker runs even with no browser connected."""
 import os
 import signal
 import subprocess
@@ -13,7 +13,7 @@ def main():
     signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
     try:
         children.append(subprocess.Popen([sys.executable,'worker.py']))
-        children.append(subprocess.Popen([sys.executable,'-m','streamlit','run','app.py',
+        children.append(subprocess.Popen([sys.executable,'-m','streamlit','run','app75.py',
             '--server.address=0.0.0.0','--server.port='+os.getenv('PORT','8501'),
             '--server.headless=true']))
         while not stopping:
