@@ -3,9 +3,9 @@ import streamlit as st
 from engine import Store, export_excel, now_ms
 from telegram_status import configured, status_text, send
 
-st.set_page_config(page_title='V6 PAPER Experiment',layout='wide')
-st.title('V6 — PAPER experiment')
-st.info('Реальные сделки отключены в коде. Два отдельных виртуальных счёта: их балансы не складываются.')
+st.set_page_config(page_title='V7 PAPER Machine',layout='wide')
+st.title('V7 — CONCENTRATED PAPER')
+st.info('Реальные сделки отключены в коде. До 3 позиций; свободный PAPER-банк концентрируется в 1–3 монетах.')
 @st.cache_resource
 def connect(): return Store()
 try: db=connect()
@@ -23,7 +23,7 @@ if cols[2].button('Telegram status',use_container_width=True):
     ok,detail=send(status_text(db,s))
     (st.success if ok else st.error)(detail)
 if cols[3].button('Test Telegram',use_container_width=True):
-    ok,detail=send('V6 — PAPER\nПроверка Telegram. Реальная торговля отключена.')
+    ok,detail=send('V7 — PAPER\nПроверка Telegram. Реальная торговля отключена.')
     (st.success if ok else st.error)(detail)
 st.caption('Telegram: '+('ключ и chat ID заданы; проверка — кнопкой Test Telegram' if configured() else 'не настроен: TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID'))
 
@@ -63,7 +63,7 @@ if st.button('Подготовить Excel'):
         db.s=json.loads(db.cx.execute('SELECT payload FROM state WHERE id=1').fetchone()[0])
         st.session_state['xlsx']=export_excel(db,periods[period])
         st.session_state['xlsx_period']=period
-        st.session_state['xlsx_name']=f'V6_protocol_{periods[period] or "all"}h_{now_ms()}.xlsx'
+        st.session_state['xlsx_name']=f'V7_protocol_{periods[period] or "all"}h_{now_ms()}.xlsx'
 if 'xlsx' in st.session_state and st.session_state.get('xlsx_period')==period:
     st.download_button('Скачать Excel',st.session_state['xlsx'],st.session_state['xlsx_name'],
         mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')

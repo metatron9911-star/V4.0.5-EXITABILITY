@@ -7,7 +7,7 @@ def configured():
 
 def status_text(db,s):
     def money(x):return 'UNKNOWN' if x is None else f'${x:.2f}'
-    lines=['V6 — PAPER status','Real execution: DISABLED',
+    lines=['V7 — PAPER status','Real execution: DISABLED',
         'Experiment: '+s['config']['experiment'],
         'New entries: '+('PAUSED' if s['paused'] else 'ENABLED')]
     for r in db.stats(s):
@@ -16,7 +16,7 @@ def status_text(db,s):
     for name in ('scanner','exits'):
         h=s['heartbeat'].get(name)
         lines.append(f"{name}: "+(f"{h['status']}, {(now_ms()-h['ts_ms'])//1000}s ago" if h else 'NO HEARTBEAT'))
-    lines.append('Two alternative virtual accounts; do not sum balances.')
+    lines.append('Diversified PAPER account: up to 30 simultaneous positions; capital is split across remaining slots.')
     return '\n'.join(lines)
 
 def send(text, post=None):

@@ -7,6 +7,7 @@ import threading
 import time
 from engine import Store, Experiment, CFG, TOKEN_PROGRAM, now_ms, db_path
 from market import MarketData
+from telegram_status import configured as telegram_configured, status_text, send
 
 
 def security(md, mint, cfg):
@@ -139,7 +140,7 @@ def scanner(db, stop):
 
 
 def exit_monitor(db, stop):
-    # Separate HTTP sessions per position; at most six concurrent workers.
+    # Separate HTTP sessions per position; concurrency sized for up to 30 open positions.
     managers={}
     def tick(p):
         try:
@@ -147,7 +148,7 @@ def exit_monitor(db, stop):
             managers[p['id']].exit_one(p['id'])
         except Exception as exc:
             db.event(p['mint'],'EXIT','ERROR',dict(error=type(exc).__name__,policy=p['policy']))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
         while not stop.is_set():
             started=time.monotonic(); heartbeat(db,'exits','RUNNING')
             opened=[p for p in db.snapshot()['positions'] if int(p['remaining_raw'])]
@@ -156,13 +157,32 @@ def exit_monitor(db, stop):
             stop.wait(max(0,db.cfg['exit_seconds']-(time.monotonic()-started)))
 
 
+
+def hourly_telegram_report(db, stop):
+    """Send one PAPER status report every configured hour; failures are logged and retried next hour."""
+    interval=max(60,int(db.cfg.get('telegram_report_interval_sec',3600)))
+    while not stop.wait(interval):
+        heartbeat(db,'telegram_report','RUNNING')
+        if not telegram_configured():
+            db.event('','TELEGRAM_REPORT','NOT_CONFIGURED')
+            heartbeat(db,'telegram_report','NOT_CONFIGURED')
+            continue
+        try:
+            ok,detail=send(status_text(db,db.snapshot()))
+            db.event('','TELEGRAM_REPORT','SENT' if ok else 'FAILED',dict(detail=detail))
+            heartbeat(db,'telegram_report','IDLE' if ok else 'ERROR')
+        except Exception as exc:
+            db.event('','TELEGRAM_REPORT','ERROR',dict(error=type(exc).__name__))
+            heartbeat(db,'telegram_report','ERROR')
+
+
 def main():
     import signal
     lock_file=open(db_path().with_suffix('.worker.lock'),'w')
     fcntl.flock(lock_file,fcntl.LOCK_EX|fcntl.LOCK_NB)  # One writer deployment per volume.
     db=Store(); stop=threading.Event()
     for sig in (signal.SIGTERM,signal.SIGINT): signal.signal(sig,lambda *_:stop.set())
-    threads=[threading.Thread(target=f,args=(db,stop),daemon=True) for f in (scanner,exit_monitor)]
+    threads=[threading.Thread(target=f,args=(db,stop),daemon=True) for f in (scanner,exit_monitor,hourly_telegram_report)]
     for t in threads:t.start()
     while not stop.wait(1):
         if not all(t.is_alive() for t in threads): raise RuntimeError('Worker thread stopped')

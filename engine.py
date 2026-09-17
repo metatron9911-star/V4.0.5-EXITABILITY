@@ -1,4 +1,4 @@
-"""V6 forward-only PAPER experiment; deliberately no wallet/execution API."""
+"""V7 diversified PAPER experiment; deliberately no wallet/execution API."""
 import copy
 import hashlib
 import io
@@ -13,21 +13,21 @@ import time
 ROOT = Path(__file__).resolve().parent
 CFG = json.loads((ROOT / 'config.json').read_text())
 USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-POLICIES = ('PRINCIPAL_HALF', 'EARLY_HALF')
+POLICIES = ('V7_DIVERSIFIED_30',)
 TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
 def now_ms(): return int(time.time() * 1000)
 def encode(value): return json.dumps(value, ensure_ascii=False, allow_nan=False)
 def db_path():
     d = Path(os.getenv('DATA_DIR', str(ROOT / 'data')))
     d.mkdir(parents=True, exist_ok=True)
-    return d / 'v6.sqlite3'
+    return d / 'v7_1.sqlite3'
 
 
 class Store:
     def __init__(self, path=None, cfg=None):
         self.cfg = copy.deepcopy(cfg or CFG)
         c = self.cfg
-        if not (0 < c['risk_fraction'] <= .05 and 1 <= c['max_open_positions'] <= 3):
+        if not (0 < c['risk_fraction'] <= 1 and 1 <= c['max_open_positions'] <= 30):
             raise ValueError('Invalid risk limits')
         if c['network_fee_usd'] < 0 or c['quote_slippage_bps'] < 0:
             raise ValueError('Invalid expenses')
@@ -121,18 +121,22 @@ class Store:
             self.save()
 
     def allocation(self):
+        """Diversify deployable PAPER capital evenly across the remaining slots, up to 30 positions."""
         s = self.snapshot()
         if s['paused']: return 0, 'EXPERIMENT_LOSS_PAUSE'
-        sizes = []
+        budgets=[]
         for r in self.stats(s):
             if r['unknown']: return 0, 'UNPRICED_POSITION'
             if r['open'] >= self.cfg['max_open_positions']: return 0, 'POSITION_LIMIT'
-            reserved = sum(p['reserve'] for p in s['positions'] if p['policy']==r['policy'] and int(p['remaining_raw']))
-            sizes.append(min(self.cfg['paper_capital_usd'], r['equity'])*self.cfg['risk_fraction'])
-            sizes.append(max(0, r['cash']-reserved))
-        budget = math.floor(min(sizes)*1e6)/1e6
+            reserved=sum(p['reserve'] for p in s['positions'] if p['policy']==r['policy'] and int(p['remaining_raw']))
+            free=max(0,r['cash']-reserved)
+            slots=max(1,self.cfg['max_open_positions']-r['open'])
+            # Keep turnover diversified: with $150 and 30 empty slots the nominal budget is about $5 per mint.
+            budgets.append(free/slots)
+        budget=math.floor(min(budgets)*1e6)/1e6
         if budget <= 3*self.cfg['network_fee_usd']: return 0, 'COST_EXCEEDS_BUDGET'
-        return budget, 'RISK_OK'
+        return budget, 'DIVERSIFIED_30_RISK_OK'
+
 
 
 def fresh(q, cfg):
@@ -176,7 +180,7 @@ class Experiment:
                 self.db.s['positions'].append(dict(id=f'{mint}:{policy}',mint=mint,symbol=symbol,
                     policy=policy,entry_ms=now_ms(),initial_raw=str(raw),remaining_raw=str(raw),
                     decimals=decimals,cost=cost,reserve=2*fee,received=0,fees=fee,
-                    half_done=False,peak_total=cost,mark_net=net,mark_ms=sell['ts_ms'],
+                    half_done=False,peak_total=cost,entry_mark_gross=sell['min_raw']/1e6,mark_net=net,mark_ms=sell['ts_ms'],
                     pending='',exit_ms=None))
                 self.db.s['accounts'][policy]['cash'] -= cost
             self.db.s['seen'].append(mint)
@@ -202,27 +206,31 @@ class Experiment:
         total = p['received']+net
         peak = max(p['peak_total'], total)
         reason = p['pending']
-        if not reason and total <= p['cost']*(1-self.c['stop_loss_pct']/100): reason='STOP'
-        if not reason and peak > p['cost'] and total <= peak*(1-self.c['trail_pct']/100): reason='TRAIL'
-        if not reason and now_ms()-p['entry_ms'] >= self.c['max_hold_sec']*1000: reason='TIME_EXIT'
+        # V7 floor is measured against the entry value of the tokens still held.
+        # Before principal recovery this is the whole position; afterwards it protects the runner too.
+        remaining_start_value = p['entry_mark_gross'] * (raw / int(p['initial_raw']))
+        current_gross = mark['min_raw']/1e6
+        if not reason and current_gross <= remaining_start_value*(1-self.c['stop_loss_pct']/100): reason='STOP_2PCT_FROM_ENTRY'
+        if not reason and self.c.get('trail_pct',0)>0 and peak > p['cost'] and total <= peak*(1-self.c['trail_pct']/100): reason='TRAIL'
+        if not reason and self.c.get('max_hold_sec',0)>0 and now_ms()-p['entry_ms'] >= self.c['max_hold_sec']*1000: reason='TIME_EXIT'
         sale, qty = None, raw
         if reason:
             sale = mark  # Actual current minimum, never the nominal stop price.
-        elif not p['half_done']:
-            qty = int(p['initial_raw'])//2
-            half = self.quote(p['mint'],'HALF_CHECK_'+p['policy'],qty)
+        elif not p['half_done'] and total >= p['cost']*(1+self.c['principal_take_growth_pct']/100):
+            # At +100% executable growth, sell only enough tokens to recover the original body + final fee.
+            # Start from half; if fees/slippage make half insufficient, increase proportionally but never sell all.
+            qty = max(1, int(p['initial_raw'])//2)
+            half = self.quote(p['mint'],'PRINCIPAL_CHECK_'+p['policy'],qty)
             if fresh(half,self.c):
+                target = p['cost'] + fee
                 half_net = half['min_raw']/1e6-fee
-                # Also reserve the final exit fee so a worthless tail cannot
-                # consume the principal already recovered by this half sale.
-                target = p['cost']+fee if p['policy']=='PRINCIPAL_HALF' else p['cost']*.5*self.c['early_half_multiple']
                 if half_net >= target:
-                    sale, reason = half, 'PRINCIPAL_RECOVERED' if p['policy']=='PRINCIPAL_HALF' else 'EARLY_HALF'
+                    sale, reason = half, 'PRINCIPAL_RECOVERED_2X'
         with self.db.lock, self.db.cx:
             dest = next(x for x in self.db.s['positions'] if x['id']==p['id'])
             if dest['remaining_raw'] != p['remaining_raw']: return
             dest.update(mark_net=net,mark_ms=mark['ts_ms'],peak_total=peak)
-            if reason in ('STOP','TRAIL','TIME_EXIT'): dest['pending']=reason
+            if reason in ('STOP_2PCT_FROM_ENTRY','TRAIL','TIME_EXIT'): dest['pending']=reason
             if sale and fresh(sale,self.c):
                 proceeds = sale['min_raw']/1e6-fee  # Can be negative: fee is still an expense.
                 dest['received'] += proceeds
