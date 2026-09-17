@@ -4,8 +4,8 @@ import streamlit as st
 from engine import Store, export_excel, now_ms
 from telegram_status import configured, status_text, send
 
-st.set_page_config(page_title='V7.2 PAPER Machine', layout='wide')
-st.title('V7.2 — FREQUENT / ADAPTIVE PAPER')
+st.set_page_config(page_title='V7.3 PAPER Machine', layout='wide')
+st.title('V7.3 — CORE PAPER')
 st.info('PAPER: реальные сделки отключены. До 50 небольших позиций; размер ставки адаптивный, а не равный. Выход по прибыли считается по исполнимой котировке после расходов маршрута.')
 
 @st.cache_resource
@@ -20,8 +20,9 @@ REASON_RU={
  'LOW_LIQUIDITY':'Недостаточная ликвидность','LOW_VOLUME':'Недостаточный объём за 5 мин','LOW_SELL_ACTIVITY':'Мало продаж за 5 мин',
  'BUY_FLOW_WEAK':'Покупок не больше, чем продаж','PAIR_TOO_NEW':'Пара ещё слишком новая','MOMENTUM_OUTSIDE_RANGE':'Импульс вне заданного диапазона',
  'PAIR_UNAVAILABLE':'Пара DEX не найдена','INVALID_PAIR':'Некорректные данные пары','RESET_UNSTABLE':'Подтверждение сброшено: движение нестабильно',
- 'WAIT':'Ждём подтверждения','CONFIRMED':'Сигнал подтверждён','POSITION_LIMIT':'Все 30 слотов заняты','UNPRICED_POSITION':'Есть позиция без свежей котировки',
+ 'WAIT':'Ждём подтверждения','CONFIRMED':'Сигнал подтверждён','POSITION_LIMIT':'Все доступные слоты заняты','UNPRICED_POSITION':'Есть позиция без свежей котировки',
  'EXPERIMENT_LOSS_PAUSE':'Достигнут лимит потерь эксперимента','COST_EXCEEDS_BUDGET':'Бюджет слишком мал относительно расходов',
+ 'TOKEN_PROGRAM_UNSUPPORTED':'Неподдерживаемая token program','MINT_ACCOUNT_MISSING':'Mint account не найден',
  'ACTIVE_AUTHORITY':'Mint/freeze authority не отозвана','AUTHORITY_UNKNOWN':'Не удалось подтвердить authority','INVALID_SUPPLY':'Некорректный supply',
  'HOLDERS_UNKNOWN':'Не удалось проверить крупнейшие token accounts','LARGE_TOKEN_ACCOUNT_INCLUDING_POOLS':'Слишком крупный token account (включая пулы)',
  'LP_UNKNOWN':'Не удалось подтвердить LP','LP_LOCK_LOW':'Недостаточная блокировка LP','RISKS_UNKNOWN':'RugCheck не вернул список рисков',
@@ -29,7 +30,7 @@ REASON_RU={
  'BUY_QUOTE_UNAVAILABLE':'Нет свежей котировки на вход','QUANTITY_TOO_SMALL':'Слишком маленькое количество токенов','ROUNDTRIP_QUOTE_UNAVAILABLE':'Нет проверяемого маршрута вход→выход',
  'ROUNDTRIP_COST_HIGH':'Слишком большие потери round-trip','IMPACT_HIGH':'Слишком высокий price impact','SOURCE_DIVERGENCE':'Цена источника слишком отличается от исполнимой котировки',
  'RISK_CHANGED':'Бюджет/риск изменился во время проверки','ALREADY_TRADED':'Эта монета уже торговалась','QUOTE_EXPIRED':'Котировка устарела до фиксации входа',
- 'STOP_2PCT_FROM_ENTRY':'Закрытие: ниже −2% от стартовой стоимости','NET_TAKE_PROFIT':'Фиксация чистой PAPER-прибыли по исполнимой котировке','PRINCIPAL_RECOVERED_2X':'При +100% возвращено тело ставки','QUOTE_UNAVAILABLE':'Нет свежей котировки на выход'
+ 'NET_STOP_LOSS':'Закрытие: исполнимый чистый результат ≤ −2%','NET_TAKE_PROFIT':'Фиксация чистой PAPER-прибыли по исполнимой котировке','PRINCIPAL_RECOVERED_2X':'При +100% возвращено тело ставки','QUOTE_UNAVAILABLE':'Нет свежей котировки на выход'
 }
 
 def ru(reason):
@@ -52,7 +53,7 @@ if cols[1].button('Scan now',use_container_width=True):
 if cols[2].button('Telegram status',use_container_width=True):
     s=db.snapshot(); ok,detail=send(status_text(db,s)); (st.success if ok else st.error)(detail)
 if cols[3].button('Test Telegram',use_container_width=True):
-    ok,detail=send('V7.2 — PAPER\nПроверка Telegram. Реальная торговля отключена.'); (st.success if ok else st.error)(detail)
+    ok,detail=send('V7.3 — PAPER\nПроверка Telegram. Реальная торговля отключена.'); (st.success if ok else st.error)(detail)
 
 @st.fragment(run_every='10s')
 def dashboard():
@@ -89,9 +90,9 @@ def dashboard():
 
     st.subheader('Входы и причины отказов — последние решения')
     with db.lock:
-        ev=db.cx.execute("SELECT ts_ms,mint,stage,reason,payload FROM events WHERE stage IN ('ENTRY','DECISION','RISK','SECURITY','MARKET','WATCH') ORDER BY id DESC LIMIT 300").fetchall()
+        ev=db.cx.execute("SELECT ts_ms,mint,stage,reason,payload FROM events WHERE stage IN ('ENTRY','DECISION','RISK','SECURITY','SECURITY_CACHE','MARKET','WATCH') ORDER BY id DESC LIMIT 300").fetchall()
     # One readable latest meaningful state per mint; ENTRY/DECISION have priority over intermediate stages.
-    priority={'ENTRY':6,'DECISION':5,'SECURITY':4,'RISK':3,'WATCH':2,'MARKET':1}
+    priority={'ENTRY':7,'DECISION':6,'SECURITY':5,'SECURITY_CACHE':5,'RISK':3,'WATCH':2,'MARKET':1}
     latest={}
     for ts,mint,stage,reason,payload in ev:
         if not mint:continue
@@ -106,7 +107,7 @@ def dashboard():
 
     st.subheader('Сводка причин отказов')
     with db.lock:
-        rows=db.cx.execute("SELECT stage,reason,COUNT(*) FROM events WHERE stage IN ('MARKET','WATCH','RISK','SECURITY','DECISION') AND reason NOT IN ('PASS','WAIT','CONFIRMED','ADAPTIVE_RISK_OK','SECURITY_SCREEN_PASSED','COHORT_OPENED') GROUP BY stage,reason ORDER BY COUNT(*) DESC").fetchall()
+        rows=db.cx.execute("SELECT stage,reason,COUNT(*) FROM events WHERE stage IN ('MARKET','WATCH','RISK','SECURITY','SECURITY_CACHE','DECISION') AND reason NOT IN ('PASS','WAIT','CONFIRMED','ADAPTIVE_RISK_OK','SECURITY_SCREEN_PASSED','COHORT_OPENED') GROUP BY stage,reason ORDER BY COUNT(*) DESC").fetchall()
     st.dataframe([{'этап':a,'причина':ru(b),'код':b,'сколько':c} for a,b,c in rows],use_container_width=True,hide_index=True)
 
 dashboard()
@@ -116,7 +117,7 @@ st.caption('Excel формируется прямо при обновлении 
 try:
     xlsx_bytes=export_excel(db,periods[period])
     st.download_button('📥 Скачать Excel сейчас',xlsx_bytes,
-        f'V7_2_protocol_{periods[period] or "all"}h_{now_ms()}.xlsx',
+        f'V7_3_protocol_{periods[period] or "all"}h_{now_ms()}.xlsx',
         mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
 except Exception as exc:
     st.error('Excel не сформирован: '+type(exc).__name__+' — '+str(exc))

@@ -72,7 +72,10 @@ class MarketData:
             r.raise_for_status(); pairs = r.json().get("pairs") or []
             sol = [p for p in pairs if (p.get("chainId") or "").lower() == "solana" and (p.get("baseToken") or {}).get("address") == mint]
             if not sol: return None
-            return max(sol, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+            # Prefer a liquid pair with a usable USD price; missing 5m stats are handled as filter failures, not parser errors.
+            usable=[p for p in sol if float((p.get('liquidity') or {}).get('usd') or 0)>0 and float(p.get('priceUsd') or 0)>0]
+            pool=usable or sol
+            return max(pool, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
         except Exception:
             return None
 

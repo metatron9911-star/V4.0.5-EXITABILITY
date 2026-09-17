@@ -1,10 +1,10 @@
 {
-  "version": "7.2.0",
-  "experiment": "v7-frequent-adaptive-paper-001",
+  "version": "7.3.0",
+  "experiment": "v7-3-core-paper-001",
   "paper_capital_usd": 150,
   "risk_fraction": 1.0,
   "max_open_positions": 50,
-  "experiment_loss_limit_fraction": 0.5,
+  "experiment_loss_limit_fraction": 0.25,
   "network_fee_usd": 0.01,
   "scan_seconds": 5,
   "exit_seconds": 1,
@@ -37,10 +37,12 @@
     "dexscreener_boosts": true
   },
   "telegram_report_interval_sec": 3600,
-  "take_profit_net_pct": 3.0,
+  "take_profit_net_pct": 1.5,
   "min_position_usd": 2.0,
   "base_position_fraction": 0.025,
   "strong_position_fraction": 0.05,
   "max_position_fraction": 0.06,
-  "min_trade_edge_over_roundtrip_pct": 1.0
+  "min_trade_edge_over_roundtrip_pct": 1.0,
+  "max_candidates_per_scan": 60,
+  "security_cache_sec": 300
 }

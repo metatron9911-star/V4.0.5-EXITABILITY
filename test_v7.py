@@ -1,4 +1,4 @@
-"""Offline V7.2 PAPER tests; no keys/orders/network."""
+"""Offline V7.3 PAPER tests; no keys/orders/network."""
 import tempfile, unittest
 from pathlib import Path
 from engine import Store, Experiment, now_ms
@@ -10,7 +10,7 @@ class Quotes:
         v=int(int(raw)*self.multiple) if a!='EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' else int(raw)
         return {'ok':True,'ts_ms':now_ms(),'min_raw':v,'out_raw':v,'impact_pct':0}
 
-class V72Tests(unittest.TestCase):
+class V73Tests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.db=Store(Path(self.tmp.name)/'t.db'); self.md=Quotes(); self.exp=Experiment(self.db,self.md)
     def tearDown(self): self.db.cx.close(); self.tmp.cleanup()

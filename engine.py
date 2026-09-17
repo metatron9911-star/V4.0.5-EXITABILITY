@@ -13,14 +13,16 @@ import time
 ROOT = Path(__file__).resolve().parent
 CFG = json.loads((ROOT / 'config.json').read_text())
 USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-POLICIES = ('V7_FREQUENT_ADAPTIVE',)
+POLICIES = ('V7_3_CORE',)
 TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
+TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'
+SUPPORTED_TOKEN_PROGRAMS = {TOKEN_PROGRAM, TOKEN_2022_PROGRAM}
 def now_ms(): return int(time.time() * 1000)
 def encode(value): return json.dumps(value, ensure_ascii=False, allow_nan=False)
 def db_path():
     d = Path(os.getenv('DATA_DIR', str(ROOT / 'data')))
     d.mkdir(parents=True, exist_ok=True)
-    return d / 'v7_2.sqlite3'
+    return d / 'v7_3.sqlite3'
 
 
 class Store:
@@ -125,7 +127,8 @@ class Store:
         s = self.snapshot()
         if s['paused']: return 0, 'EXPERIMENT_LOSS_PAUSE'
         r=self.stats(s)[0]
-        if r['unknown']: return 0, 'UNPRICED_POSITION'
+        # An unavailable mark on one open position must not freeze all new entries.
+        # New sizing is cash-based; unknown positions remain visible in equity as UNKNOWN.
         if r['open'] >= self.cfg['max_open_positions']: return 0, 'POSITION_LIMIT'
         reserved=sum(p['reserve'] for p in s['positions'] if int(p['remaining_raw']))
         free=max(0,r['cash']-reserved)
@@ -215,33 +218,25 @@ class Experiment:
         # Before principal recovery this is the whole position; afterwards it protects the runner too.
         remaining_start_value = p['entry_mark_gross'] * (raw / int(p['initial_raw']))
         current_gross = mark['min_raw']/1e6
-        if not reason and current_gross <= remaining_start_value*(1-self.c['stop_loss_pct']/100): reason='STOP_2PCT_FROM_ENTRY'
-        if not reason and self.c.get('trail_pct',0)>0 and peak > p['cost'] and total <= peak*(1-self.c['trail_pct']/100): reason='TRAIL'
-        if not reason and self.c.get('max_hold_sec',0)>0 and now_ms()-p['entry_ms'] >= self.c['max_hold_sec']*1000: reason='TIME_EXIT'
+        # V7.3 triggers are based on an executable Jupiter SELL quote, not chart price.
+        # Thus TP/SL are measured after route fee/slippage represented by minOut and our network-fee model.
+        pnl_pct = 100*(total/p['cost']-1) if p['cost'] > 0 else -100
+        if not reason and pnl_pct <= -self.c['stop_loss_pct']:
+            reason='NET_STOP_LOSS'
+        if not reason and self.c.get('max_hold_sec',0)>0 and now_ms()-p['entry_ms'] >= self.c['max_hold_sec']*1000:
+            reason='TIME_EXIT'
         sale, qty = None, raw
         if reason:
-            sale = mark  # Actual current minimum, never the nominal stop price.
-        elif not p['half_done'] and total >= p['cost']*(1+self.c.get('take_profit_net_pct',3)/100):
-            # Frequent mode: close the whole position only after the executable SELL quote is net profitable.
-            # This uses Jupiter minOut, so pool/route fees and slippage embedded in the quote are already reflected.
+            sale = mark
+        elif not p['half_done'] and pnl_pct >= self.c.get('take_profit_net_pct',1.5):
             reason='NET_TAKE_PROFIT'
             sale=mark
             qty=raw
-        elif not p['half_done'] and total >= p['cost']*(1+self.c['principal_take_growth_pct']/100):
-            # At +100% executable growth, sell only enough tokens to recover the original body + final fee.
-            # Start from half; if fees/slippage make half insufficient, increase proportionally but never sell all.
-            qty = max(1, int(p['initial_raw'])//2)
-            half = self.quote(p['mint'],'PRINCIPAL_CHECK_'+p['policy'],qty)
-            if fresh(half,self.c):
-                target = p['cost'] + fee
-                half_net = half['min_raw']/1e6-fee
-                if half_net >= target:
-                    sale, reason = half, 'PRINCIPAL_RECOVERED_2X'
         with self.db.lock, self.db.cx:
             dest = next(x for x in self.db.s['positions'] if x['id']==p['id'])
             if dest['remaining_raw'] != p['remaining_raw']: return
             dest.update(mark_net=net,mark_ms=mark['ts_ms'],peak_total=peak)
-            if reason in ('STOP_2PCT_FROM_ENTRY','TRAIL','TIME_EXIT','NET_TAKE_PROFIT'): dest['pending']=reason
+            if reason in ('NET_STOP_LOSS','TIME_EXIT','NET_TAKE_PROFIT'): dest['pending']=reason
             if sale and fresh(sale,self.c):
                 proceeds = sale['min_raw']/1e6-fee  # Can be negative: fee is still an expense.
                 dest['received'] += proceeds

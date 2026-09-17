@@ -5,7 +5,7 @@ import math
 import os
 import threading
 import time
-from engine import Store, Experiment, CFG, TOKEN_PROGRAM, now_ms, db_path
+from engine import Store, Experiment, CFG, SUPPORTED_TOKEN_PROGRAMS, now_ms, db_path
 from market import MarketData
 from telegram_status import configured as telegram_configured, status_text, send
 
@@ -22,7 +22,9 @@ def security(md, mint, cfg):
             if 'error' in j or 'result' not in j: raise ValueError('RPC_UNAVAILABLE')
             return j['result']
         account=rpc('getAccountInfo',[mint,{'encoding':'jsonParsed','commitment':'confirmed'}])['value']
-        if not account or account['owner'] != TOKEN_PROGRAM: return False,'TOKEN_PROGRAM_UNSUPPORTED',{}
+        if not account: return False,'MINT_ACCOUNT_MISSING',{}
+        owner=account.get('owner')
+        if owner not in SUPPORTED_TOKEN_PROGRAMS: return False,'TOKEN_PROGRAM_UNSUPPORTED',{'token_program':owner}
         info=account['data']['parsed']['info']
         if 'mintAuthority' not in info or 'freezeAuthority' not in info: return False,'AUTHORITY_UNKNOWN',{}
         if info['mintAuthority'] or info['freezeAuthority']: return False,'ACTIVE_AUTHORITY',{}
@@ -51,11 +53,13 @@ def security(md, mint, cfg):
 def observe(db, mint, pair):
     c=db.cfg; ts=now_ms()
     try:
-        price=float(pair['priceUsd']); liq=float(pair['liquidity']['usd'])
-        volume=float(pair['volume']['m5']); tx=pair['txns']['m5']
-        rise=float(pair['priceChange']['m5']); created=float(pair['pairCreatedAt'])
+        price=float(pair.get('priceUsd') or 0); liq=float((pair.get('liquidity') or {}).get('usd') or 0)
+        volume=float((pair.get('volume') or {}).get('m5') or 0); tx=(pair.get('txns') or {}).get('m5') or {}
+        buys=int(tx.get('buys') or 0); sells=int(tx.get('sells') or 0)
+        rise=float((pair.get('priceChange') or {}).get('m5') or 0); created=float(pair.get('pairCreatedAt') or ts)
         if not all(math.isfinite(x) for x in (price,liq,volume,rise,created)) or price<=0: raise ValueError()
-        evidence=dict(price=price,liquidity=liq,volume_m5=volume,buys=tx['buys'],sells=tx['sells'],rise_m5=rise)
+        tx={'buys':buys,'sells':sells}
+        evidence=dict(price=price,liquidity=liq,volume_m5=volume,buys=buys,sells=sells,rise_m5=rise,dex=pair.get('dexId'),pair=pair.get('pairAddress'))
     except (KeyError,TypeError,ValueError):
         db.event(mint,'MARKET','INVALID_PAIR')
         with db.lock,db.cx: db.s['watch'].pop(mint,None); db.save()
@@ -92,7 +96,7 @@ def heartbeat(db, name, status):
 
 
 def scanner(db, stop):
-    md=MarketData(); exp=Experiment(db,md); cursor=0
+    md=MarketData(); exp=Experiment(db,md); cursor=0; security_cache={}
     with db.lock,db.cx:
         db.cx.execute("UPDATE commands SET status='INTERRUPTED',detail='worker restarted' WHERE status='RUNNING'")
     while not stop.is_set():
@@ -106,7 +110,7 @@ def scanner(db, stop):
             # Rotate discovery; existing watches remain eligible even if no longer promoted.
             mints=[m for m in mints if m]
             rotated=mints[cursor:]+mints[:cursor]; cursor=(cursor+20)%max(1,len(mints))
-            selected=list(dict.fromkeys(watched+rotated))[:40]
+            selected=list(dict.fromkeys(watched+rotated))[:int(db.cfg.get('max_candidates_per_scan',60))]
             for mint in selected:
                 if stop.is_set(): break
                 if mint in db.snapshot()['seen']: continue
@@ -120,7 +124,15 @@ def scanner(db, stop):
                 if not ready: continue
                 strength=max(0.5,min(2.0, (evidence.get('buys',0)/max(1,evidence.get('sells',1)))/2 + min(1,evidence.get('volume_m5',0)/max(1,db.cfg['min_volume_m5_usd'])*0.25))); budget,reason=db.allocation(strength); db.event(mint,'RISK',reason,dict(budget=budget,strength=strength))
                 if not budget: continue
-                safe,reason,proof=security(md,mint,db.cfg); db.event(mint,'SECURITY',reason,proof)
+                cached=security_cache.get(mint)
+                ttl=int(db.cfg.get('security_cache_sec',300))*1000
+                if cached and now_ms()-cached[0] < ttl:
+                    safe,reason,proof=cached[1:]
+                    db.event(mint,'SECURITY_CACHE',reason,proof)
+                else:
+                    safe,reason,proof=security(md,mint,db.cfg)
+                    security_cache[mint]=(now_ms(),safe,reason,proof)
+                    db.event(mint,'SECURITY',reason,proof)
                 if not safe: continue
                 symbol=(pair.get('baseToken') or {}).get('symbol') or mint[:8]
                 outcome=exp.open_cohort(mint,symbol,evidence['price'],proof['decimals'],strength)
@@ -140,7 +152,7 @@ def scanner(db, stop):
 
 
 def exit_monitor(db, stop):
-    # Separate HTTP sessions per position; concurrency sized for up to 30 open positions.
+    # Separate HTTP sessions per position; concurrency sized for many small open positions.
     managers={}
     def tick(p):
         try:
