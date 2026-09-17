@@ -7,13 +7,13 @@ def configured():
 
 def status_text(db,s):
     def money(x):return 'UNKNOWN' if x is None else f'${x:.2f}'
-    lines=['V7 — PAPER status','Real execution: DISABLED',
+    lines=['V7.1 — PAPER hourly status','Real execution: DISABLED',
         'Experiment: '+s['config']['experiment'],
         'New entries: '+('PAUSED' if s['paused'] else 'ENABLED')]
     for r in db.stats(s):
         lines.extend([r['policy'],f"Cash {money(r['cash'])} | Equity {money(r['equity'])}",
             f"Net PNL {money(r['net_pnl'])} | Open {r['open']} | Closed {r['closed']} | Unknown {r['unknown']}"])
-    for name in ('scanner','exits'):
+    for name in ('scanner','exits','telegram_report'):
         h=s['heartbeat'].get(name)
         lines.append(f"{name}: "+(f"{h['status']}, {(now_ms()-h['ts_ms'])//1000}s ago" if h else 'NO HEARTBEAT'))
     lines.append('Diversified PAPER account: up to 30 simultaneous positions; capital is split across remaining slots.')
