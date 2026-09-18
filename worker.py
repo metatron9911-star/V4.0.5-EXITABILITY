@@ -93,7 +93,7 @@ class HybridExperiment(Experiment):
             if allowed+1e-8<budget:return why if not allowed else 'RISK_CHANGED'
             if mint in self.db.s['seen']:return 'ALREADY_TRADED'
             policy=next(iter(self.db.s['accounts']))
-            self.db.s['positions'].append({'id':f'{mint}:{policy}','mint':mint,'symbol':symbol or mint[:8],'policy':policy,'venue':'PUMP_CURVE','entry_ms':now_ms(),'initial_raw':str(raw),'remaining_raw':str(raw),'decimals':6,'cost':budget,'reserve':network,'received':0,'fees':network,'half_done':False,'peak_total':budget,'entry_mark_gross':float(mark['out_usd']),'mark_net':mark_net,'mark_ms':now_ms(),'pending':'','exit_ms':None})
+            self.db.s['positions'].append({'id':f'{mint}:{policy}','mint':mint,'symbol':symbol or mint[:8],'policy':policy,'venue':'PUMP_CURVE','entry_ms':now_ms(),'initial_raw':str(raw),'remaining_raw':str(raw),'decimals':6,'cost':budget,'reserve':network,'received':0,'fees':network,'half_done':False,'peak_total':budget,'entry_mark_gross':float(mark['out_usd']),'entry_baseline_net':mark_net,'mark_net':mark_net,'mark_ms':now_ms(),'mae_pct':0.0,'mfe_pct':0.0,'mark_count':1,'pending':'','exit_ms':None})
             self.db.s['accounts'][policy]['cash']-=budget;self.db.s['seen'].append(mint);self.db.save()
         self.db.event(mint,'ENTRY','CURVE_OPENED',{'budget':budget,'roundtrip_pct':loss,'fee_bps':CURVE_FEE_BPS,'venue':'PUMP_CURVE'});return 'CURVE_OPENED'
     def exit_one(self,position_id):
@@ -115,7 +115,7 @@ class HybridExperiment(Experiment):
         if pnl<=-float(self.c['stop_loss_pct']):reason='NET_STOP_LOSS'
         elif pnl>=float(self.c.get('take_profit_net_pct',1.5)):reason='NET_TAKE_PROFIT'
         with self.db.lock,self.db.cx:
-            d=next(x for x in self.db.s['positions'] if x['id']==p['id']);d.update(mark_net=net,mark_ms=now_ms(),peak_total=max(p['peak_total'],total))
+            d=next(x for x in self.db.s['positions'] if x['id']==p['id']);d.update(mark_net=net,mark_ms=now_ms(),peak_total=max(p['peak_total'],total),mae_pct=mae,mfe_pct=mfe,mark_count=int(d.get('mark_count',0))+1)
             if reason:
                 d['received']+=net;d['fees']+=network;d['remaining_raw']='0';d['mark_net']=0;d['exit_ms']=now_ms();d['reserve']=0;self.db.s['accounts'][p['policy']]['cash']+=net
                 self.db.cx.execute('INSERT INTO events(ts_ms,mint,stage,reason,payload) VALUES(?,?,?,?,?)',(now_ms(),p['mint'],'SALE',reason,'{}'))
@@ -183,7 +183,7 @@ def hourly_telegram_report(db,stop):
     while not stop.wait(interval):
         heartbeat(db,'telegram_report','RUNNING')
         if not telegram_configured():heartbeat(db,'telegram_report','NOT_CONFIGURED');continue
-        try:ok,detail=send('V7.5 CURVE+DEX PAPER\n'+status_text(db,db.snapshot()));db.event('','TELEGRAM_REPORT','SENT' if ok else 'FAILED',{'detail':detail});heartbeat(db,'telegram_report','IDLE' if ok else 'ERROR')
+        try:ok,detail=send('V7.6 CURVE+DEX BASELINE PAPER\n'+status_text(db,db.snapshot()));db.event('','TELEGRAM_REPORT','SENT' if ok else 'FAILED',{'detail':detail});heartbeat(db,'telegram_report','IDLE' if ok else 'ERROR')
         except Exception as exc:db.event('','TELEGRAM_REPORT','ERROR',{'error':type(exc).__name__});heartbeat(db,'telegram_report','ERROR')
 
 
