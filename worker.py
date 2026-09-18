@@ -1,13 +1,15 @@
-"""V7.6 CURVE+DEX BASELINE PAPER worker. No wallet, no signing, no real execution."""
-import concurrent.futures, fcntl, math, os, threading, time
+"""V7.7 STREAM+CURVE+DEX PAPER worker. No wallet, no signing, no real execution."""
+import concurrent.futures, fcntl, json, math, os, queue, threading, time, websocket
 # Isolate V7.5 experiment in its own persistent subdirectory.
-os.environ['DATA_DIR']=os.path.join(os.getenv('DATA_DIR','/data'),'v76')
+os.environ['DATA_DIR']=os.path.join(os.getenv('DATA_DIR','/data'),'v77')
 from engine import Store, Experiment, CFG, SUPPORTED_TOKEN_PROGRAMS, now_ms, db_path
 from market import MarketData
 from pump_curve import PumpCurve
 from telegram_status import configured as telegram_configured, status_text, send
 
 CURVE_FEE_BPS=125
+STREAM_Q=queue.Queue(maxsize=int(CFG.get('stream_queue_max',120)))
+STREAM_SEEN={}
 
 
 def security_curve(md,mint):
@@ -128,6 +130,87 @@ class HybridExperiment(Experiment):
             self.db.save()
 
 
+def _pump_create(logs):
+    t=' '.join(logs or []).lower()
+    return any(x in t for x in ('instruction: create','instruction: createv2','instruction: create_v2','createevent','create_event'))
+
+def _rpc_tx(md,sig):
+    if not md.helius_key:return None
+    try:
+        r=md.s.post('https://mainnet.helius-rpc.com/?api-key='+md.helius_key,json={'jsonrpc':'2.0','id':1,'method':'getTransaction','params':[sig,{'encoding':'jsonParsed','commitment':'confirmed','maxSupportedTransactionVersion':0}]},timeout=6)
+        return (r.json() or {}).get('result')
+    except Exception:return None
+
+def _mint_from_tx(tx):
+    if not tx:return None
+    meta=tx.get('meta') or {};blocked={USDC_MINT,'So11111111111111111111111111111111111111112'}
+    for group in (meta.get('innerInstructions') or []):
+        for ins in (group.get('instructions') or []):
+            parsed=ins.get('parsed') if isinstance(ins,dict) else None
+            if not isinstance(parsed,dict):continue
+            typ=str(parsed.get('type') or '').lower();info=parsed.get('info') or {};mint=info.get('mint')
+            if mint and mint not in blocked and typ in ('initializemint','initializemint2'):return mint
+    pre={b.get('mint') for b in (meta.get('preTokenBalances') or []) if b.get('mint')}
+    for b in (meta.get('postTokenBalances') or []):
+        mint=b.get('mint')
+        if mint and mint not in blocked and mint not in pre:return mint
+    return None
+
+def pump_stream(db,stop):
+    md=MarketData()
+    while not stop.is_set():
+        try:
+            if not md.helius_key:heartbeat(db,'pump_wss','NO_HELIUS_KEY');stop.wait(10);continue
+            ws=websocket.create_connection('wss://mainnet.helius-rpc.com/?api-key='+md.helius_key,timeout=20)
+            ws.send(json.dumps({'jsonrpc':'2.0','id':1,'method':'logsSubscribe','params':[{'mentions':[db.cfg['pump_program']]},{'commitment':'processed'}]}));heartbeat(db,'pump_wss','CONNECTED')
+            while not stop.is_set():
+                msg=json.loads(ws.recv());v=((msg.get('params') or {}).get('result') or {}).get('value') or {};sig=v.get('signature');logs=v.get('logs') or []
+                if not sig or not _pump_create(logs):continue
+                t=now_ms()
+                if sig in STREAM_SEEN and t-STREAM_SEEN[sig]<3600000:continue
+                STREAM_SEEN[sig]=t;tx=None
+                for delay in (.2,.35,.65,1.0):
+                    if stop.wait(delay):break
+                    tx=_rpc_tx(md,sig)
+                    if tx:break
+                mint=_mint_from_tx(tx)
+                if not mint:db.event('','STREAM','CREATE_WITHOUT_MINT',{'sig':sig});continue
+                try:STREAM_Q.put_nowait(mint)
+                except queue.Full:
+                    try:STREAM_Q.get_nowait()
+                    except queue.Empty:pass
+                    try:STREAM_Q.put_nowait(mint)
+                    except queue.Full:pass
+                db.event(mint,'STREAM','PUMP_CREATE',{'sig':sig,'queue':STREAM_Q.qsize()});heartbeat(db,'pump_wss','CREATE '+mint[:8])
+        except Exception as exc:
+            heartbeat(db,'pump_wss','RECONNECT '+type(exc).__name__);stop.wait(2)
+
+def stream_candidate_loop(db,stop):
+    md=MarketData();exp=HybridExperiment(db,md);pump=PumpCurve();security_cache={}
+    while not stop.is_set():
+        try:mint=STREAM_Q.get(timeout=1)
+        except queue.Empty:continue
+        if mint in db.snapshot()['seen']:continue
+        c1=pump.coin(mint)
+        if not c1 or c1.get('complete') or not pump.is_sol_curve(c1):continue
+        now=int(time.time());created=int((c1.get('created_timestamp') or 0)/1000 if (c1.get('created_timestamp') or 0)>10**12 else (c1.get('created_timestamp') or 0));age=now-created if created else 999999
+        if not int(db.cfg.get('stream_curve_min_age_sec',3))<=age<=int(db.cfg.get('stream_curve_max_age_sec',1800)):db.event(mint,'STREAM','AGE_WAIT',{'age_sec':age});continue
+        mc1=float(c1.get('usd_market_cap') or 0);last=int(c1.get('last_trade_timestamp') or 0)
+        if mc1<float(db.cfg.get('stream_curve_min_mc_usd',4000)):db.event(mint,'STREAM','MC_LOW',{'mc':mc1});continue
+        if last and now-last>int(db.cfg.get('stream_curve_max_trade_age_sec',45)):db.event(mint,'STREAM','TRADE_STALE');continue
+        if stop.wait(float(db.cfg.get('stream_curve_warmup_sec',2))):break
+        c2=pump.coin(mint)
+        if not c2 or c2.get('complete'):continue
+        mc2=float(c2.get('usd_market_cap') or 0);delta=100*(mc2/mc1-1) if mc1>0 else 0
+        lo=float(db.cfg.get('stream_curve_min_momentum_pct',.1));hi=float(db.cfg.get('stream_curve_max_momentum_pct',30))
+        if not lo<=delta<=hi:db.event(mint,'STREAM','MOMENTUM_WAIT',{'mc1':mc1,'mc2':mc2,'momentum_pct':delta});continue
+        cached=security_cache.get(mint)
+        if cached and now_ms()-cached[0]<600000:safe,why,proof=cached[1:]
+        else:safe,why,proof=security_curve(md,mint);security_cache[mint]=(now_ms(),safe,why,proof)
+        db.event(mint,'SECURITY_CURVE',why,proof)
+        if not safe:continue
+        strength=2.0 if delta>=3 else (1.5 if delta>=1 else 1.0);out=exp.open_curve(mint,c2.get('symbol') or mint[:8],strength);db.event(mint,'DECISION',out,{'source':'PUMP_WSS','momentum_pct':delta,'market_cap_usd':mc2})
+
 def heartbeat(db,name,status):
     with db.lock,db.cx:db.s['heartbeat'][name]={'ts_ms':now_ms(),'status':status};db.save()
 
@@ -197,7 +280,7 @@ def main():
     import signal
     lock_file=open(db_path().with_suffix('.worker.lock'),'w');fcntl.flock(lock_file,fcntl.LOCK_EX|fcntl.LOCK_NB);db=Store();stop=threading.Event()
     for sig in (signal.SIGTERM,signal.SIGINT):signal.signal(sig,lambda *_:stop.set())
-    threads=[threading.Thread(target=f,args=(db,stop),daemon=True) for f in (scanner,exit_monitor,hourly_telegram_report)]
+    threads=[threading.Thread(target=f,args=(db,stop),daemon=True) for f in (pump_stream,stream_candidate_loop,scanner,exit_monitor,hourly_telegram_report)]
     for t in threads:t.start()
     while not stop.wait(1):
         if not all(t.is_alive() for t in threads):raise RuntimeError('Worker thread stopped')
