@@ -1,47 +1,48 @@
-"""Railway supervisor: V7.5 worker runs even with no browser connected."""
-import os
-import signal
-import subprocess
-import sys
-import time
-import threading
-from http.server import BaseHTTPRequestHandler,HTTPServer
+import os,signal,subprocess,sys,time,threading,json,asyncio
+from aiohttp import web,ClientSession,WSMsgType
+os.environ['DATA_DIR']=os.path.join(os.getenv('DATA_DIR','/data'),'v79')
 from engine import Store,now_ms
-
-class StatsHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path.startswith('/stats15'):
-            db=Store(); cutoff=now_ms()-15*60*1000
-            with db.lock:
-                rows=db.cx.execute('SELECT id,ts_ms,mint,stage,reason,payload FROM events WHERE ts_ms>=? ORDER BY id DESC LIMIT 1000',(cutoff,)).fetchall()
-            body=json.dumps({'generated_ms':now_ms(),'stats':db.stats(),'events':[dict(zip(['id','ts_ms','mint','stage','reason','payload'],x)) for x in rows],'positions':db.snapshot().get('positions',[])},default=str).encode()
-            self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(body);return
-        self.send_response(404);self.end_headers()
-    def log_message(self,*a):pass
-
-def stats_api():
-    HTTPServer(('0.0.0.0',8081),StatsHandler).serve_forever()
-
+INTERNAL=8502
+async def stats15(request):
+ db=Store();cutoff=now_ms()-15*60*1000
+ with db.lock:rows=db.cx.execute('SELECT id,ts_ms,mint,stage,reason,payload FROM events WHERE ts_ms>=? ORDER BY id DESC LIMIT 1500',(cutoff,)).fetchall()
+ return web.json_response({'generated_ms':now_ms(),'stats':db.stats(),'events':[dict(zip(['id','ts_ms','mint','stage','reason','payload'],x)) for x in rows],'positions':db.snapshot().get('positions',[])})
+async def proxy(request):
+ target=f'http://127.0.0.1:{INTERNAL}{request.rel_url}'
+ if request.headers.get('Upgrade','').lower()=='websocket':
+  ws=web.WebSocketResponse();await ws.prepare(request)
+  async with ClientSession() as s:
+   async with s.ws_connect(target) as up:
+    async def a():
+     async for m in ws:
+      if m.type==WSMsgType.TEXT:await up.send_str(m.data)
+      elif m.type==WSMsgType.BINARY:await up.send_bytes(m.data)
+    async def b():
+     async for m in up:
+      if m.type==WSMsgType.TEXT:await ws.send_str(m.data)
+      elif m.type==WSMsgType.BINARY:await ws.send_bytes(m.data)
+    await asyncio.gather(a(),b())
+  return ws
+ body=await request.read();headers={k:v for k,v in request.headers.items() if k.lower() not in ('host','content-length')}
+ async with ClientSession() as s:
+  async with s.request(request.method,target,data=body,headers=headers,allow_redirects=False) as x:
+   data=await x.read();h={k:v for k,v in x.headers.items() if k.lower() not in ('content-length','transfer-encoding','connection','content-encoding')};return web.Response(body=data,status=x.status,headers=h)
+def gateway():
+ app=web.Application();app.router.add_get('/stats15',stats15);app.router.add_route('*','/{tail:.*}',proxy);web.run_app(app,host='0.0.0.0',port=int(os.getenv('PORT','8501')),handle_signals=False)
 def main():
-    children=[]; stopping=False
-    threading.Thread(target=stats_api,daemon=True).start()
-    def stop(*_):
-        nonlocal stopping
-        stopping=True
-    signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
-    try:
-        children.append(subprocess.Popen([sys.executable,'worker.py']))
-        children.append(subprocess.Popen([sys.executable,'-m','streamlit','run','app75.py',
-            '--server.address=0.0.0.0','--server.port='+os.getenv('PORT','8501'),
-            '--server.headless=true']))
-        while not stopping:
-            if any(p.poll() is not None for p in children): return 1
-            time.sleep(.5)
-        return 0
-    finally:
-        for p in children:
-            if p.poll() is None:p.terminate()
-        for p in children:
-            try:p.wait(timeout=25)
-            except subprocess.TimeoutExpired:p.kill();p.wait()
+ children=[];stopping=False
+ def stop(*_):
+  nonlocal stopping;stopping=True
+ signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
+ try:
+  children.append(subprocess.Popen([sys.executable,'worker.py']))
+  children.append(subprocess.Popen([sys.executable,'-m','streamlit','run','app75.py','--server.address=127.0.0.1','--server.port='+str(INTERNAL),'--server.headless=true']))
+  threading.Thread(target=gateway,daemon=True).start()
+  while not stopping:
+   if any(p.poll() is not None for p in children):return 1
+   time.sleep(.5)
+  return 0
+ finally:
+  for p in children:
+   if p.poll() is None:p.terminate()
 if __name__=='__main__':sys.exit(main())
