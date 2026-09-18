@@ -1,6 +1,6 @@
 {
-  "version": "7.9.0-WAVE",
-  "experiment": "v7-9-wave-peaklock-paper-001",
+  "version": "7.9.1-WAVE",
+  "experiment": "v7-9-1-wave-timestamp-funnel-002",
   "paper_capital_usd": 150,
   "risk_fraction": 1,
   "max_open_positions": 30,
