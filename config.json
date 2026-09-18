@@ -1,6 +1,6 @@
 {
-  "version": "7.9.2-WAVE",
-  "experiment": "v7-9-2-full-wave-curve-watch-003",
+  "version": "7.9.3-WAVE",
+  "experiment": "v7-9-3-dense-curve-wave-exec-004",
   "paper_capital_usd": 150,
   "risk_fraction": 1,
   "max_open_positions": 30,
@@ -49,7 +49,7 @@
   "pump_program": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
   "stream_curve_warmup_sec": 6.15,
   "stream_curve_min_age_sec": 3,
-  "stream_curve_max_age_sec": 1800,
+  "stream_curve_max_age_sec": 900,
   "stream_curve_min_mc_usd": 4000,
   "stream_curve_max_trade_age_sec": 45,
   "stream_curve_min_momentum_pct": 0.5,
@@ -68,5 +68,7 @@
   "peak_lock_arm_net_pct": 1,
   "peak_lock_min_giveback_pct": 0.7,
   "peak_lock_giveback_fraction": 0.28,
-  "peak_lock_max_giveback_pct": 3
+  "peak_lock_max_giveback_pct": 3,
+  "scanner_curve_min_age_sec": 8,
+  "scanner_curve_max_age_sec": 900
 }
