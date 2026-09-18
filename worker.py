@@ -2,7 +2,7 @@
 import concurrent.futures, fcntl, json, math, os, queue, threading, time, websocket
 # Isolate V7.5 experiment in its own persistent subdirectory.
 os.environ['DATA_DIR']=os.path.join(os.getenv('DATA_DIR','/data'),'v77')
-from engine import Store, Experiment, CFG, SUPPORTED_TOKEN_PROGRAMS, now_ms, db_path
+from engine import Store, Experiment, CFG, USDC_MINT, SUPPORTED_TOKEN_PROGRAMS, now_ms, db_path
 from market import MarketData
 from pump_curve import PumpCurve
 from telegram_status import configured as telegram_configured, status_text, send
