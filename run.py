@@ -10,9 +10,11 @@ async def stats15(request):
 async def proxy(request):
  target=f'http://127.0.0.1:{INTERNAL}{request.rel_url}'
  if request.headers.get('Upgrade','').lower()=='websocket':
-  ws=web.WebSocketResponse();await ws.prepare(request)
+  proto=request.headers.get('Sec-WebSocket-Protocol'); protocols=[x.strip() for x in proto.split(',')] if proto else []
+  ws=web.WebSocketResponse(protocols=protocols);await ws.prepare(request)
   async with ClientSession() as s:
-   async with s.ws_connect(target) as up:
+   proto=request.headers.get('Sec-WebSocket-Protocol'); protocols=[x.strip() for x in proto.split(',')] if proto else []
+   async with s.ws_connect(target,protocols=protocols) as up:
     async def a():
      async for m in ws:
       if m.type==WSMsgType.TEXT:await up.send_str(m.data)
