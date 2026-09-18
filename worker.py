@@ -272,7 +272,7 @@ def scanner(db,stop):
                         now=int(time.time());created=_unix_seconds(coin.get('created_timestamp'));last=_unix_seconds(coin.get('last_trade_timestamp'));mc=float(coin.get('usd_market_cap') or 0);age=max(0,now-created) if created else 999999;fresh_trade=max(0,now-last) if last else 999999
                         prev=curve_watch.get(mint);delta=0 if not prev or prev[0]<=0 else 100*(mc/prev[0]-1);curve_watch[mint]=(mc,now_ms())
                         ev={'venue':'PUMP_CURVE','market_cap_usd':mc,'age_sec':age,'last_trade_age_sec':fresh_trade,'momentum_pct':delta}
-                        if not (8<=age<=1800):db.event(mint,'CURVE','CURVE_AGE_WAIT',dict(ev,funnel='CURVE_AGE'));continue
+                        if not (int(db.cfg.get('scanner_curve_min_age_sec',8))<=age<=int(db.cfg.get('scanner_curve_max_age_sec',900))):db.event(mint,'CURVE','CURVE_AGE_WAIT',dict(ev,funnel='CURVE_AGE'));continue
                         if mc<4000:db.event(mint,'CURVE','CURVE_MC_LOW',dict(ev,funnel='CURVE_MC'));continue
                         if fresh_trade>60:db.event(mint,'CURVE','CURVE_TRADE_STALE',dict(ev,funnel='CURVE_TRADE_FRESHNESS'));continue
                         if not prev:db.event(mint,'CURVE','CURVE_WARMUP',dict(ev,funnel='CURVE_WARMUP'));continue
