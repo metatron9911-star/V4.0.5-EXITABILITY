@@ -28,12 +28,13 @@ def dashboard():
     with db.lock:
         last_discovery=db.cx.execute("SELECT ts_ms FROM events WHERE stage='DISCOVERY' ORDER BY id DESC LIMIT 1").fetchone(); last_report=db.cx.execute("SELECT ts_ms,reason FROM events WHERE stage='TELEGRAM_REPORT' ORDER BY id DESC LIMIT 1").fetchone()
     st.caption('Эксперимент: '+s['config']['experiment']+' · '+s['config_hash'][:12])
-    st.subheader('Состояние машинки');cards=st.columns(5);hb=s.get('heartbeat',{});scan=hb.get('scanner');ex=hb.get('exits')
+    st.subheader('Состояние машинки');cards=st.columns(6);hb=s.get('heartbeat',{});scan=hb.get('scanner');ex=hb.get('exits');pump=hb.get('pump_wss')
     with cards[0]:indicator('Scanner',bool(scan and now-scan['ts_ms']<60000),scan.get('status','NO HEARTBEAT') if scan else 'NO HEARTBEAT')
     with cards[1]:indicator('Exit monitor',bool(ex and now-ex['ts_ms']<30000),ex.get('status','NO HEARTBEAT') if ex else 'NO HEARTBEAT')
-    with cards[2]:indicator('Discovery',bool(last_discovery and now-last_discovery[0]<120000),'свежий проход' if last_discovery else 'нет данных')
-    with cards[3]:indicator('Telegram',configured(),'настроен; отчёт каждый час'+(f' · {tm(last_report[0])} {last_report[1]}' if last_report else ''))
-    with cards[4]:indicator('PAPER / adaptive',True,f"до {s['config']['max_open_positions']} позиций · REAL execution OFF")
+    with cards[2]:indicator('Pump WSS',bool(pump and now-pump['ts_ms']<60000),pump.get('status','NO HEARTBEAT') if pump else 'NO HEARTBEAT')
+    with cards[3]:indicator('Discovery',bool(last_discovery and now-last_discovery[0]<120000),'свежий проход' if last_discovery else 'нет данных')
+    with cards[4]:indicator('Telegram',configured(),'настроен; отчёт каждый час'+(f' · {tm(last_report[0])} {last_report[1]}' if last_report else ''))
+    with cards[5]:indicator('PAPER / adaptive',True,f"до {s['config']['max_open_positions']} позиций · REAL execution OFF")
     st.subheader('Банк и результат')
     stats_rows=db.stats(s)
     if stats_rows:
@@ -49,8 +50,8 @@ def dashboard():
             pnl=None if p['mark_net'] is None else p['received']+p['mark_net']-p['cost'];rows.append({'монета':p['symbol'],'mint':p['mint'],'вход':tm(p['entry_ms']),'ставка_$':round(p['cost'],4),'текущее_PNL_$':None if pnl is None else round(pnl,4),'ожидает_выход':ru(p.get('pending'))})
     st.dataframe(rows,use_container_width=True,hide_index=True)
     st.subheader('Входы и причины отказов — последние решения')
-    with db.lock:ev=db.cx.execute("SELECT ts_ms,mint,stage,reason FROM events WHERE stage IN ('ENTRY','DECISION','RISK','SECURITY','SECURITY_CACHE','MARKET','WATCH') ORDER BY id DESC LIMIT 300").fetchall()
-    priority={'ENTRY':7,'DECISION':6,'SECURITY':5,'SECURITY_CACHE':5,'RISK':3,'WATCH':2,'MARKET':1};latest={}
+    with db.lock:ev=db.cx.execute("SELECT ts_ms,mint,stage,reason FROM events WHERE stage IN ('ENTRY','DECISION','RISK','SECURITY','SECURITY_CACHE','STREAM','MARKET','WATCH') ORDER BY id DESC LIMIT 300").fetchall()
+    priority={'ENTRY':8,'DECISION':7,'SECURITY':6,'SECURITY_CACHE':6,'STREAM':4,'RISK':3,'WATCH':2,'MARKET':1};latest={}
     for ts,mint,stage,reason in ev:
         if not mint:continue
         if mint not in latest or priority.get(stage,0)>latest[mint]['p']:latest[mint]={'время':tm(ts),'mint':mint,'этап':stage,'статус':'ВХОД' if reason=='COHORT_OPENED' else ('ПРОШЁЛ' if reason in ('PASS','CONFIRMED','SECURITY_SCREEN_PASSED','SECURITY_PASSED_WITH_WARNING','ADAPTIVE_RISK_OK') else 'ОТКАЗ/ОЖИДАНИЕ'),'причина':ru(reason),'p':priority.get(stage,0)}
