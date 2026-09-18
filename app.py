@@ -64,11 +64,13 @@ def dashboard():
     st.dataframe([{'этап':a,'причина':ru(b),'код':b,'сколько':c} for a,b,c in r],width="stretch",hide_index=True)
 dashboard()
 periods={'1 час':1,'3 часа':3,'6 часов':6,'12 часов':12,'24 часа':24,'48 часов':48,'7 дней':168,'Весь эксперимент':None};period=st.selectbox('Период Excel-отчёта',list(periods),index=0)
+st.caption('Excel формируется только по нажатию — страница больше не пересобирает тяжёлый файл при каждом обновлении.')
 try:
-    st.caption('Excel формируется только по нажатию — страница больше не пересобирает тяжёлый файл при каждом обновлении.')
-if st.button('🧾 Подготовить Excel',width="stretch"):
-    with st.spinner('Формирую отчёт…'):
-        st.session_state['v7_excel']=export_excel(db,periods[period]);st.session_state['v7_excel_name']=f'V7_8_STREAM_{periods[period] or "all"}h_{now_ms()}.xlsx'
-if st.session_state.get('v7_excel'):
-    st.download_button('📥 Скачать готовый Excel',st.session_state['v7_excel'],st.session_state.get('v7_excel_name','V7_8.xlsx'),mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',width="stretch")
-except Exception as exc:st.error('Excel не сформирован: '+type(exc).__name__+' — '+str(exc))
+    if st.button('🧾 Подготовить Excel',width="stretch"):
+        with st.spinner('Формирую отчёт…'):
+            st.session_state['v7_excel']=export_excel(db,periods[period])
+            st.session_state['v7_excel_name']=f'V7_8_STREAM_{periods[period] or "all"}h_{now_ms()}.xlsx'
+    if st.session_state.get('v7_excel'):
+        st.download_button('📥 Скачать готовый Excel',st.session_state['v7_excel'],st.session_state.get('v7_excel_name','V7_8.xlsx'),mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',width="stretch")
+except Exception as exc:
+    st.error('Excel не сформирован: '+type(exc).__name__+' — '+str(exc))
