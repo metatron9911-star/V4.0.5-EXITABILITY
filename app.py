@@ -39,8 +39,9 @@ def dashboard():
     stats_rows=db.stats(s)
     if stats_rows:
         first=stats_rows[0]
-        equity=float(first.get('equity',s['config'].get('paper_capital_usd',150)))
-        net=float(first.get('net_pnl',0))
+        equity_raw=first.get('equity'); net_raw=first.get('net_pnl')
+        equity=float(equity_raw) if equity_raw is not None else float(s['config'].get('paper_capital_usd',150))
+        net=float(net_raw) if net_raw is not None else equity-float(s['config'].get('paper_capital_usd',150))
         state='🟢' if net>0 else ('🔴' if net<0 else '⚪')
         st.metric(f"{state} Баланс после всех комиссий",f"$"+f"{equity:.4f}",delta=f"{net:+.4f}")
     st.dataframe(stats_rows,hide_index=True,use_container_width=True)
