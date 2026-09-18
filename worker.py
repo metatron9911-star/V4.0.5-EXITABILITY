@@ -1,7 +1,7 @@
 """V7.7 STREAM+CURVE+DEX PAPER worker. No wallet, no signing, no real execution."""
 import concurrent.futures, fcntl, json, math, os, queue, threading, time, websocket
 # Isolate V7.5 experiment in its own persistent subdirectory.
-os.environ['DATA_DIR']=os.path.join(os.getenv('DATA_DIR','/data'),'v77')
+os.environ['DATA_DIR']=os.path.join(os.getenv('DATA_DIR','/data'),'v78')
 from engine import Store, Experiment, CFG, USDC_MINT, SUPPORTED_TOKEN_PROGRAMS, now_ms, db_path
 from market import MarketData
 from pump_curve import PumpCurve
@@ -272,7 +272,7 @@ def hourly_telegram_report(db,stop):
     while not stop.wait(interval):
         heartbeat(db,'telegram_report','RUNNING')
         if not telegram_configured():heartbeat(db,'telegram_report','NOT_CONFIGURED');continue
-        try:ok,detail=send('V7.6 CURVE+DEX BASELINE PAPER\n'+status_text(db,db.snapshot()));db.event('','TELEGRAM_REPORT','SENT' if ok else 'FAILED',{'detail':detail});heartbeat(db,'telegram_report','IDLE' if ok else 'ERROR')
+        try:ok,detail=send('V7.8 STREAM+CURVE+DEX PAPER\n'+status_text(db,db.snapshot()));db.event('','TELEGRAM_REPORT','SENT' if ok else 'FAILED',{'detail':detail});heartbeat(db,'telegram_report','IDLE' if ok else 'ERROR')
         except Exception as exc:db.event('','TELEGRAM_REPORT','ERROR',{'error':type(exc).__name__});heartbeat(db,'telegram_report','ERROR')
 
 
