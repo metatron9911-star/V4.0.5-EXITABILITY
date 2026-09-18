@@ -15,14 +15,14 @@ def ru(x):return '; '.join(REASON_RU.get(p,p) for p in str(x or '').split('|'))
 def tm(ms):return time.strftime('%H:%M:%S',time.localtime(ms/1000)) if ms else ''
 def indicator(label,ok,detail):st.markdown(f"**{'🟢' if ok else '🔴'} {label}**  \n{detail}")
 cols=st.columns(4)
-if cols[0].button('🔄 Refresh',use_container_width=True):st.rerun()
-if cols[1].button('🔎 Scan now',use_container_width=True):
+if cols[0].button('🔄 Refresh',width="stretch"):st.rerun()
+if cols[1].button('🔎 Scan now',width="stretch"):
     i,s=db.request_scan();st.success(f'Сканирование #{i}: {s}')
-if cols[2].button('✈️ Telegram status',use_container_width=True):
+if cols[2].button('✈️ Telegram status',width="stretch"):
     ok,d=send(status_text(db,db.snapshot()));(st.success if ok else st.error)(d)
-if cols[3].button('🧪 Test Telegram',use_container_width=True):
+if cols[3].button('🧪 Test Telegram',width="stretch"):
     ok,d=send('V7.4 FAST CORE — PAPER\nПроверка Telegram. REAL execution OFF.');(st.success if ok else st.error)(d)
-@st.fragment(run_every='10s')
+@st.fragment(run_every='15s')
 def dashboard():
     s=db.snapshot();now=now_ms()
     with db.lock:
@@ -44,26 +44,31 @@ def dashboard():
         net=float(net_raw) if net_raw is not None else equity-float(s['config'].get('paper_capital_usd',150))
         state='🟢' if net>0 else ('🔴' if net<0 else '⚪')
         st.metric(f"{state} Баланс после всех комиссий",f"$"+f"{equity:.4f}",delta=f"{net:+.4f}")
-    st.dataframe(stats_rows,hide_index=True,use_container_width=True)
+    st.dataframe(stats_rows,hide_index=True,width="stretch")
     st.subheader('Открытые позиции');rows=[]
     for p in s['positions']:
         if int(p['remaining_raw']):
             pnl=None if p['mark_net'] is None else p['received']+p['mark_net']-p['cost'];rows.append({'монета':p['symbol'],'mint':p['mint'],'вход':tm(p['entry_ms']),'ставка_$':round(p['cost'],4),'текущее_PNL_$':None if pnl is None else round(pnl,4),'ожидает_выход':ru(p.get('pending'))})
-    st.dataframe(rows,use_container_width=True,hide_index=True)
+    st.dataframe(rows,width="stretch",hide_index=True)
     st.subheader('Входы и причины отказов — последние решения')
-    with db.lock:ev=db.cx.execute("SELECT ts_ms,mint,stage,reason FROM events WHERE stage IN ('ENTRY','DECISION','RISK','SECURITY','SECURITY_CACHE','STREAM','MARKET','WATCH') ORDER BY id DESC LIMIT 300").fetchall()
+    with db.lock:ev=db.cx.execute("SELECT ts_ms,mint,stage,reason FROM events WHERE stage IN ('ENTRY','DECISION','RISK','SECURITY','SECURITY_CACHE','STREAM','MARKET','WATCH') ORDER BY id DESC LIMIT 120").fetchall()
     priority={'ENTRY':8,'DECISION':7,'SECURITY':6,'SECURITY_CACHE':6,'STREAM':4,'RISK':3,'WATCH':2,'MARKET':1};latest={}
     for ts,mint,stage,reason in ev:
         if not mint:continue
         if mint not in latest or priority.get(stage,0)>latest[mint]['p']:latest[mint]={'время':tm(ts),'mint':mint,'этап':stage,'статус':'ВХОД' if reason=='COHORT_OPENED' else ('ПРОШЁЛ' if reason in ('PASS','CONFIRMED','SECURITY_SCREEN_PASSED','SECURITY_PASSED_WITH_WARNING','ADAPTIVE_RISK_OK') else 'ОТКАЗ/ОЖИДАНИЕ'),'причина':ru(reason),'p':priority.get(stage,0)}
     out=[]
     for x in latest.values():y=x.copy();y.pop('p');out.append(y)
-    st.dataframe(out[:80],use_container_width=True,hide_index=True)
+    st.dataframe(out[:40],width="stretch",hide_index=True)
     st.subheader('Сводка причин отказов')
-    with db.lock:r=db.cx.execute("SELECT stage,reason,COUNT(*) FROM events WHERE stage IN ('MARKET','WATCH','RISK','SECURITY','SECURITY_CACHE','DECISION') AND reason NOT IN ('PASS','WAIT','CONFIRMED','ADAPTIVE_RISK_OK','SECURITY_SCREEN_PASSED','SECURITY_PASSED_WITH_WARNING','COHORT_OPENED') GROUP BY stage,reason ORDER BY COUNT(*) DESC").fetchall()
-    st.dataframe([{'этап':a,'причина':ru(b),'код':b,'сколько':c} for a,b,c in r],use_container_width=True,hide_index=True)
+    with db.lock:r=db.cx.execute("SELECT stage,reason,COUNT(*) FROM events WHERE ts_ms>=? AND stage IN ('MARKET','WATCH','RISK','SECURITY','SECURITY_CACHE','SECURITY_CURVE','CURVE','STREAM','DECISION') AND reason NOT IN ('PASS','WAIT','CONFIRMED','ADAPTIVE_RISK_OK','SECURITY_SCREEN_PASSED','SECURITY_PASSED_WITH_WARNING','CURVE_SECURITY_PASSED','COHORT_OPENED','CURVE_OPENED') GROUP BY stage,reason ORDER BY COUNT(*) DESC LIMIT 40",(now-3600000,)).fetchall()
+    st.dataframe([{'этап':a,'причина':ru(b),'код':b,'сколько':c} for a,b,c in r],width="stretch",hide_index=True)
 dashboard()
 periods={'1 час':1,'3 часа':3,'6 часов':6,'12 часов':12,'24 часа':24,'48 часов':48,'7 дней':168,'Весь эксперимент':None};period=st.selectbox('Период Excel-отчёта',list(periods),index=0)
 try:
-    data=export_excel(db,periods[period]);st.download_button('📥 Скачать Excel сейчас',data,f'V7_4_FAST_CORE_{periods[period] or "all"}h_{now_ms()}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
+    st.caption('Excel формируется только по нажатию — страница больше не пересобирает тяжёлый файл при каждом обновлении.')
+if st.button('🧾 Подготовить Excel',width="stretch"):
+    with st.spinner('Формирую отчёт…'):
+        st.session_state['v7_excel']=export_excel(db,periods[period]);st.session_state['v7_excel_name']=f'V7_8_STREAM_{periods[period] or "all"}h_{now_ms()}.xlsx'
+if st.session_state.get('v7_excel'):
+    st.download_button('📥 Скачать готовый Excel',st.session_state['v7_excel'],st.session_state.get('v7_excel_name','V7_8.xlsx'),mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',width="stretch")
 except Exception as exc:st.error('Excel не сформирован: '+type(exc).__name__+' — '+str(exc))
