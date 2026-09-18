@@ -111,9 +111,15 @@ class HybridExperiment(Experiment):
             with self.db.lock,self.db.cx:
                 d=next(x for x in self.db.s['positions'] if x['id']==p['id']);d['mark_net']=None;self.db.save()
             return
-        net=max(0,float(mark['out_usd'])-network);total=p['received']+net;pnl=100*(total/p['cost']-1);reason=''
-        if pnl<=-float(self.c['stop_loss_pct']):reason='NET_STOP_LOSS'
+        net=max(0,float(mark['out_usd'])-network); total=p['received']+net; pnl=100*(total/p['cost']-1)
+        baseline=float(p.get('entry_baseline_net') or p.get('mark_net') or net)
+        move=100*(net/baseline-1) if baseline>0 else 0.0
+        mae=min(float(p.get('mae_pct',0.0)),move); mfe=max(float(p.get('mfe_pct',0.0)),move)
+        self.db.event(p['mint'],'PATH','EXECUTABLE_MARK',{'venue':mark.get('venue','PUMP_CURVE'),'net':net,'pnl_pct':pnl,'move_from_baseline_pct':move,'mae_pct':mae,'mfe_pct':mfe})
+        reason=''
+        if move<=-float(self.c.get('baseline_stop_pct',4.0)):reason='BASELINE_STOP'
         elif pnl>=float(self.c.get('take_profit_net_pct',1.5)):reason='NET_TAKE_PROFIT'
+        elif self.c.get('max_hold_sec',0)>0 and now_ms()-p['entry_ms']>=self.c['max_hold_sec']*1000:reason='TIME_EXIT'
         with self.db.lock,self.db.cx:
             d=next(x for x in self.db.s['positions'] if x['id']==p['id']);d.update(mark_net=net,mark_ms=now_ms(),peak_total=max(p['peak_total'],total),mae_pct=mae,mfe_pct=mfe,mark_count=int(d.get('mark_count',0))+1)
             if reason:
