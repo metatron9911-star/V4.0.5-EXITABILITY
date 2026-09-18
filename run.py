@@ -1,6 +1,9 @@
 import os,signal,subprocess,sys,time,threading,json,asyncio
 from aiohttp import web,ClientSession,WSMsgType
-os.environ['DATA_DIR']=os.path.join(os.getenv('DATA_DIR','/data'),'v79')
+# Gateway reads the single V7.9 experiment directory. Child wrappers append /v79
+# themselves, so pass them the base DATA_DIR to avoid /v79/v79 divergence.
+BASE_DATA_DIR=os.getenv('DATA_DIR','/data')
+os.environ['DATA_DIR']=os.path.join(BASE_DATA_DIR,'v79')
 from engine import Store,now_ms
 INTERNAL=8502
 async def stats15(request):
@@ -31,12 +34,13 @@ def gateway():
  app=web.Application();app.router.add_get('/stats15',stats15);app.router.add_route('*','/{tail:.*}',proxy);web.run_app(app,host='0.0.0.0',port=int(os.getenv('PORT','8501')),handle_signals=False)
 def main():
  children=[];stopping=False
+ child_env=os.environ.copy();child_env['DATA_DIR']=BASE_DATA_DIR
  def stop(*_):
   nonlocal stopping;stopping=True
  signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)
  try:
-  children.append(subprocess.Popen([sys.executable,'worker.py']))
-  children.append(subprocess.Popen([sys.executable,'-m','streamlit','run','app75.py','--server.address=127.0.0.1','--server.port='+str(INTERNAL),'--server.headless=true']))
+  children.append(subprocess.Popen([sys.executable,'worker.py'],env=child_env))
+  children.append(subprocess.Popen([sys.executable,'-m','streamlit','run','app75.py','--server.address=127.0.0.1','--server.port='+str(INTERNAL),'--server.headless=true'],env=child_env))
   threading.Thread(target=gateway,daemon=True).start()
   while not stopping:
    if any(p.poll() is not None for p in children):return 1
