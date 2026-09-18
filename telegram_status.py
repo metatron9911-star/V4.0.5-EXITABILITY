@@ -7,7 +7,7 @@ def configured():
 
 def status_text(db,s):
     def money(x):return 'UNKNOWN' if x is None else f'${x:.2f}'
-    lines=['V7.3 — PAPER hourly status','Real execution: DISABLED',
+    lines=['V7.6 — PAPER hourly status','Real execution: DISABLED',
         'Experiment: '+s['config']['experiment'],
         'New entries: '+('PAUSED' if s['paused'] else 'ENABLED')]
     for r in db.stats(s):
