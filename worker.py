@@ -215,6 +215,16 @@ def pump_stream(db,stop):
         except Exception as exc:
             heartbeat(db,'pump_wss','RECONNECT '+type(exc).__name__);stop.wait(2)
 
+def _unix_seconds(value):
+    """Normalize Pump API timestamps to Unix seconds; accepts seconds or milliseconds."""
+    try:
+        x=float(value or 0)
+        if not math.isfinite(x) or x<=0:return 0
+        if x>1e12:x/=1000.0
+        elif x>1e10:x/=1000.0
+        return int(x)
+    except Exception:return 0
+
 def stream_candidate_loop(db,stop):
     md=MarketData();exp=HybridExperiment(db,md);pump=PumpCurve();security_cache={}
     while not stop.is_set():
@@ -223,11 +233,11 @@ def stream_candidate_loop(db,stop):
         if mint in db.snapshot()['seen']:continue
         c1=pump.coin(mint)
         if not c1 or c1.get('complete') or not pump.is_sol_curve(c1):continue
-        now=int(time.time());created=int((c1.get('created_timestamp') or 0)/1000 if (c1.get('created_timestamp') or 0)>10**12 else (c1.get('created_timestamp') or 0));age=now-created if created else 999999
+        now=int(time.time());created=_unix_seconds(c1.get('created_timestamp'));age=max(0,now-created) if created else 999999
         if not int(db.cfg.get('stream_curve_min_age_sec',3))<=age<=int(db.cfg.get('stream_curve_max_age_sec',1800)):db.event(mint,'STREAM','AGE_WAIT',{'age_sec':age});continue
-        mc1=float(c1.get('usd_market_cap') or 0);last=int(c1.get('last_trade_timestamp') or 0)
+        mc1=float(c1.get('usd_market_cap') or 0);last=_unix_seconds(c1.get('last_trade_timestamp'));trade_age=max(0,now-last) if last else 999999
         if mc1<float(db.cfg.get('stream_curve_min_mc_usd',4000)):db.event(mint,'STREAM','MC_LOW',{'mc':mc1});continue
-        if last and now-last>int(db.cfg.get('stream_curve_max_trade_age_sec',45)):db.event(mint,'STREAM','TRADE_STALE');continue
+        if last and trade_age>int(db.cfg.get('stream_curve_max_trade_age_sec',45)):db.event(mint,'STREAM','TRADE_STALE',{'last_trade_age_sec':trade_age});continue
         samples,wm=probe_curve_wave(pump,mint,float(db.cfg.get('stream_curve_warmup_sec',1.05)))
         c2=pump.coin(mint)
         if not c2 or c2.get('complete'):continue
@@ -259,14 +269,14 @@ def scanner(db,stop):
                 if mint.endswith('pump'):
                     coin=pump.coin(mint)
                     if coin and not coin.get('complete') and pump.is_sol_curve(coin):
-                        now=int(time.time());created=int((coin.get('created_timestamp') or 0)/1000 if (coin.get('created_timestamp') or 0)>10**12 else (coin.get('created_timestamp') or 0));last=int(coin.get('last_trade_timestamp') or 0);mc=float(coin.get('usd_market_cap') or 0);age=now-created if created else 999999;fresh_trade=now-last if last else 999999
+                        now=int(time.time());created=_unix_seconds(coin.get('created_timestamp'));last=_unix_seconds(coin.get('last_trade_timestamp'));mc=float(coin.get('usd_market_cap') or 0);age=max(0,now-created) if created else 999999;fresh_trade=max(0,now-last) if last else 999999
                         prev=curve_watch.get(mint);delta=0 if not prev or prev[0]<=0 else 100*(mc/prev[0]-1);curve_watch[mint]=(mc,now_ms())
                         ev={'venue':'PUMP_CURVE','market_cap_usd':mc,'age_sec':age,'last_trade_age_sec':fresh_trade,'momentum_pct':delta}
-                        if not (8<=age<=1800):db.event(mint,'CURVE','CURVE_AGE_WAIT',ev);continue
-                        if mc<4000:db.event(mint,'CURVE','CURVE_MC_LOW',ev);continue
-                        if fresh_trade>60:db.event(mint,'CURVE','CURVE_TRADE_STALE',ev);continue
-                        if not prev:db.event(mint,'CURVE','CURVE_WARMUP',ev);continue
-                        if not 0.15<=delta<=25:db.event(mint,'CURVE','CURVE_MOMENTUM_WAIT',ev);continue
+                        if not (8<=age<=1800):db.event(mint,'CURVE','CURVE_AGE_WAIT',dict(ev,funnel='CURVE_AGE'));continue
+                        if mc<4000:db.event(mint,'CURVE','CURVE_MC_LOW',dict(ev,funnel='CURVE_MC'));continue
+                        if fresh_trade>60:db.event(mint,'CURVE','CURVE_TRADE_STALE',dict(ev,funnel='CURVE_TRADE_FRESHNESS'));continue
+                        if not prev:db.event(mint,'CURVE','CURVE_WARMUP',dict(ev,funnel='CURVE_WARMUP'));continue
+                        if not 0.15<=delta<=25:db.event(mint,'CURVE','CURVE_MOMENTUM_WAIT',dict(ev,funnel='CURVE_MOMENTUM'));continue
                         cached=security_cache.get(mint)
                         if cached and now_ms()-cached[0]<600000:safe,why,proof=cached[1:]
                         else:safe,why,proof=security_curve(md,mint);security_cache[mint]=(now_ms(),safe,why,proof)
