@@ -1,7 +1,7 @@
-"""V7.5 CURVE+DEX PAPER worker. No wallet, no signing, no real execution."""
+"""V7.6 CURVE+DEX BASELINE PAPER worker. No wallet, no signing, no real execution."""
 import concurrent.futures, fcntl, math, os, threading, time
 # Isolate V7.5 experiment in its own persistent subdirectory.
-os.environ['DATA_DIR']=os.path.join(os.getenv('DATA_DIR','/data'),'v75')
+os.environ['DATA_DIR']=os.path.join(os.getenv('DATA_DIR','/data'),'v76')
 from engine import Store, Experiment, CFG, SUPPORTED_TOKEN_PROGRAMS, now_ms, db_path
 from market import MarketData
 from pump_curve import PumpCurve
