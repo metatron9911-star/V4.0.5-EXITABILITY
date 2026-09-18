@@ -1,4 +1,4 @@
-"""V7.4 FAST CORE PAPER experiment; deliberately no wallet/execution API."""
+"""V7.6 BASELINE + MAE/MFE PAPER experiment; deliberately no wallet/execution API."""
 import copy
 import hashlib
 import io
@@ -13,7 +13,7 @@ import time
 ROOT = Path(__file__).resolve().parent
 CFG = json.loads((ROOT / 'config.json').read_text())
 USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-POLICIES = ('V7_4_FAST_CORE',)
+POLICIES = ('V7_6_BASELINE_MAE_MFE',)
 TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
 TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'
 SUPPORTED_TOKEN_PROGRAMS = {TOKEN_PROGRAM, TOKEN_2022_PROGRAM}
@@ -22,7 +22,7 @@ def encode(value): return json.dumps(value, ensure_ascii=False, allow_nan=False)
 def db_path():
     d = Path(os.getenv('DATA_DIR', str(ROOT / 'data')))
     d.mkdir(parents=True, exist_ok=True)
-    return d / 'v7_4.sqlite3'
+    return d / 'v7_6.sqlite3'
 
 class Store:
     def __init__(self, path=None, cfg=None):
