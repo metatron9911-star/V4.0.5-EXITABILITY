@@ -1,6 +1,6 @@
 {
-  "version": "7.4.0",
-  "experiment": "v7-4-fast-core-paper-001",
+  "version": "7.6.0",
+  "experiment": "v7-6-baseline-mae-mfe-paper-001",
   "paper_capital_usd": 150,
   "risk_fraction": 1.0,
   "max_open_positions": 50,
@@ -27,6 +27,8 @@
   "max_token_account_pct": 35,
   "min_lp_locked_pct": 70,
   "stop_loss_pct": 2.0,
+  "baseline_stop_pct": 4.0,
+  "max_hold_sec": 30,
   "principal_take_growth_pct": 100,
   "trail_pct": 0,
   "max_hold_sec": 0,
