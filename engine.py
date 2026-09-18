@@ -108,7 +108,7 @@ class Experiment:
             if mint in self.db.s['seen']:return 'ALREADY_TRADED'
             if not fresh(buy,self.c) or not fresh(sell,self.c):return 'QUOTE_EXPIRED'
             for policy in POLICIES:
-                self.db.s['positions'].append(dict(id=f'{mint}:{policy}',mint=mint,symbol=symbol,policy=policy,entry_ms=now_ms(),initial_raw=str(raw),remaining_raw=str(raw),decimals=decimals,cost=cost,reserve=2*fee,received=0,fees=fee,half_done=False,peak_total=cost,entry_mark_gross=sell['min_raw']/1e6,mark_net=net,mark_ms=sell['ts_ms'],pending='',exit_ms=None)); self.db.s['accounts'][policy]['cash']-=cost
+                self.db.s['positions'].append(dict(id=f'{mint}:{policy}',mint=mint,symbol=symbol,policy=policy,entry_ms=now_ms(),initial_raw=str(raw),remaining_raw=str(raw),decimals=decimals,cost=cost,reserve=2*fee,received=0,fees=fee,half_done=False,peak_total=cost,entry_mark_gross=sell['min_raw']/1e6,entry_baseline_net=net,mark_net=net,mark_ms=sell['ts_ms'],mae_pct=0.0,mfe_pct=0.0,mark_count=1,pending='',exit_ms=None)); self.db.s['accounts'][policy]['cash']-=cost
             self.db.s['seen'].append(mint); self.db.s['watch'].pop(mint,None); self.db.save()
         self.db.event(mint,'ENTRY','COHORT_OPENED',dict(budget=budget,cost=cost,raw=str(raw),roundtrip_pct=loss)); return 'COHORT_OPENED'
     def exit_one(self,position_id):
@@ -120,7 +120,11 @@ class Experiment:
                 dest=next(x for x in self.db.s['positions'] if x['id']==p['id']); dest['mark_net']=None; self.db.save()
             self.db.event(p['mint'],'EXIT','QUOTE_UNAVAILABLE',dict(policy=p['policy'])); return
         net=mark['min_raw']/1e6-fee; total=p['received']+net; peak=max(p['peak_total'],total); reason=p['pending']; pnl_pct=100*(total/p['cost']-1) if p['cost']>0 else -100
-        if not reason and pnl_pct<=-self.c['stop_loss_pct']:reason='NET_STOP_LOSS'
+        baseline=float(p.get('entry_baseline_net') or p.get('mark_net') or net)
+        move_pct=100*(net/baseline-1) if baseline>0 else 0.0
+        mae=min(float(p.get('mae_pct',0.0)),move_pct); mfe=max(float(p.get('mfe_pct',0.0)),move_pct)
+        self.db.event(p['mint'],'PATH','EXECUTABLE_MARK',dict(policy=p['policy'],net=net,pnl_pct=pnl_pct,move_from_baseline_pct=move_pct,mae_pct=mae,mfe_pct=mfe,quote_latency_ms=max(0,now_ms()-mark.get('ts_ms',now_ms()))))
+        if not reason and move_pct<=-float(self.c.get('baseline_stop_pct',4.0)):reason='BASELINE_STOP'
         if not reason and self.c.get('max_hold_sec',0)>0 and now_ms()-p['entry_ms']>=self.c['max_hold_sec']*1000:reason='TIME_EXIT'
         sale,qty=None,raw
         if reason:sale=mark
@@ -128,8 +132,8 @@ class Experiment:
         with self.db.lock,self.db.cx:
             dest=next(x for x in self.db.s['positions'] if x['id']==p['id'])
             if dest['remaining_raw']!=p['remaining_raw']:return
-            dest.update(mark_net=net,mark_ms=mark['ts_ms'],peak_total=peak)
-            if reason in ('NET_STOP_LOSS','TIME_EXIT','NET_TAKE_PROFIT'):dest['pending']=reason
+            dest.update(mark_net=net,mark_ms=mark['ts_ms'],peak_total=peak,mae_pct=mae,mfe_pct=mfe,mark_count=int(dest.get('mark_count',0))+1)
+            if reason in ('BASELINE_STOP','TIME_EXIT','NET_TAKE_PROFIT'):dest['pending']=reason
             if sale and fresh(sale,self.c):
                 proceeds=sale['min_raw']/1e6-fee; dest['received']+=proceeds; dest['fees']+=fee; dest['reserve']=max(0,dest['reserve']-fee); dest['remaining_raw']=str(raw-qty); dest['half_done']=True; dest['mark_net']=None if raw>qty else 0; dest['pending']=''; self.db.s['accounts'][p['policy']]['cash']+=proceeds
                 if raw==qty:dest['exit_ms']=now_ms(); dest['reserve']=0
