@@ -1,7 +1,7 @@
-"""V7.7 STREAM+CURVE+DEX PAPER worker. No wallet, no signing, no real execution."""
-import concurrent.futures, fcntl, json, math, os, queue, threading, time, websocket
+"""V7.9 WAVE+PEAK-LOCK PAPER worker. No wallet, no signing, no real execution."""
+import concurrent.futures, fcntl, json, math, os, queue, threading, time, websocket\nfrom collections import deque
 # Isolate V7.5 experiment in its own persistent subdirectory.
-os.environ['DATA_DIR']=os.path.join(os.getenv('DATA_DIR','/data'),'v78')
+os.environ['DATA_DIR']=os.path.join(os.getenv('DATA_DIR','/data'),'v79')
 from engine import Store, Experiment, CFG, USDC_MINT, SUPPORTED_TOKEN_PROGRAMS, now_ms, db_path
 from market import MarketData
 from pump_curve import PumpCurve
@@ -9,8 +9,26 @@ from telegram_status import configured as telegram_configured, status_text, send
 
 CURVE_FEE_BPS=125
 STREAM_Q=queue.Queue(maxsize=int(CFG.get('stream_queue_max',120)))
-STREAM_SEEN={}
+STREAM_SEEN={}\nWAVE_PATHS={}\nWAVE_LOCK=threading.RLock()
 
+
+def wave_metrics(samples):
+    if not samples:return {}
+    now=samples[-1][0];cur=samples[-1][1];out={}
+    for win in CFG.get('wave_windows_sec',[.3,1,2,3,6]):
+        old=min(samples,key=lambda x:abs(x[0]-(now-float(win))))
+        out[str(win)]=100*(cur/old[1]-1) if old[1]>0 else 0.0
+    return out
+
+def probe_curve_wave(pump,mint,seconds=1.05):
+    d=deque(maxlen=80);end=time.monotonic()+seconds
+    while time.monotonic()<end:
+        c=pump.coin(mint)
+        if c and not c.get('complete'):
+            mc=float(c.get('usd_market_cap') or 0)
+            if mc>0:d.append((time.monotonic(),mc))
+        time.sleep(float(CFG.get('wave_sample_sec',.15)))
+    return d,wave_metrics(d)
 
 def security_curve(md,mint):
     """Pre-graduation checks: verify mint program and authorities. LP/holder tests do not apply to Pump curve inventory."""
@@ -118,10 +136,19 @@ class HybridExperiment(Experiment):
         move=100*(net/baseline-1) if baseline>0 else 0.0
         mae=min(float(p.get('mae_pct',0.0)),move); mfe=max(float(p.get('mfe_pct',0.0)),move)
         self.db.event(p['mint'],'PATH','EXECUTABLE_MARK',{'venue':mark.get('venue','PUMP_CURVE'),'net':net,'pnl_pct':pnl,'move_from_baseline_pct':move,'mae_pct':mae,'mfe_pct':mfe})
-        reason=''
-        if move<=-float(self.c.get('baseline_stop_pct',4.0)):reason='BASELINE_STOP'
-        elif pnl>=float(self.c.get('take_profit_net_pct',1.5)):reason='NET_TAKE_PROFIT'
-        elif self.c.get('max_hold_sec',0)>0 and now_ms()-p['entry_ms']>=self.c['max_hold_sec']*1000:reason='TIME_EXIT'
+        with WAVE_LOCK:
+            dq=WAVE_PATHS.setdefault(p['id'],deque(maxlen=100));dq.append((time.monotonic(),net))
+            while dq and time.monotonic()-dq[0][0]>6.5:dq.popleft()
+            wm=wave_metrics(dq)
+        peak_net=max(float(p.get('mfe_pct',0.0)),pnl);arm=float(self.c.get('peak_lock_arm_net_pct',1.0));reason='';lock_floor=None
+        if peak_net>=arm:
+            give=min(float(self.c.get('peak_lock_max_giveback_pct',3.0)),max(float(self.c.get('peak_lock_min_giveback_pct',.7)),peak_net*float(self.c.get('peak_lock_giveback_fraction',.28))))
+            lock_floor=peak_net-give
+            if pnl<=lock_floor:reason='DYNAMIC_PEAK_LOCK'
+        if not reason and peak_net>=arm and wm.get('0.3',0)<0 and wm.get('1',wm.get('1.0',0))<0:reason='WAVE_REVERSAL'
+        if not reason and move<=-float(self.c.get('baseline_stop_pct',4.0)):reason='BASELINE_STOP'
+        if not reason and self.c.get('max_hold_sec',0)>0 and now_ms()-p['entry_ms']>=self.c['max_hold_sec']*1000:reason='TIME_EXIT'
+        self.db.event(p['mint'],'WAVE','EXECUTABLE_WAVE',{'windows_pct':wm,'net_pnl_pct':pnl,'peak_net_pct':peak_net,'lock_floor_pct':lock_floor})
         with self.db.lock,self.db.cx:
             d=next(x for x in self.db.s['positions'] if x['id']==p['id']);d.update(mark_net=net,mark_ms=now_ms(),peak_total=max(p['peak_total'],total),mae_pct=mae,mfe_pct=mfe,mark_count=int(d.get('mark_count',0))+1)
             if reason:
@@ -198,12 +225,13 @@ def stream_candidate_loop(db,stop):
         mc1=float(c1.get('usd_market_cap') or 0);last=int(c1.get('last_trade_timestamp') or 0)
         if mc1<float(db.cfg.get('stream_curve_min_mc_usd',4000)):db.event(mint,'STREAM','MC_LOW',{'mc':mc1});continue
         if last and now-last>int(db.cfg.get('stream_curve_max_trade_age_sec',45)):db.event(mint,'STREAM','TRADE_STALE');continue
-        if stop.wait(float(db.cfg.get('stream_curve_warmup_sec',2))):break
+        samples,wm=probe_curve_wave(pump,mint,float(db.cfg.get('stream_curve_warmup_sec',1.05)))
         c2=pump.coin(mint)
         if not c2 or c2.get('complete'):continue
-        mc2=float(c2.get('usd_market_cap') or 0);delta=100*(mc2/mc1-1) if mc1>0 else 0
-        lo=float(db.cfg.get('stream_curve_min_momentum_pct',.1));hi=float(db.cfg.get('stream_curve_max_momentum_pct',30))
-        if not lo<=delta<=hi:db.event(mint,'STREAM','MOMENTUM_WAIT',{'mc1':mc1,'mc2':mc2,'momentum_pct':delta});continue
+        mc2=float(c2.get('usd_market_cap') or 0);w03=wm.get('0.3',0);w1=wm.get('1',wm.get('1.0',0));delta=w1
+        db.event(mint,'WAVE','ENTRY_WINDOWS',{'windows_pct':wm,'samples':len(samples),'mc':mc2})
+        if w03<float(db.cfg.get('wave_entry_min_03_pct',.15)) or w1<float(db.cfg.get('wave_entry_min_1_pct',.5)):db.event(mint,'STREAM','WAVE_NOT_ACCELERATING',{'w03':w03,'w1':w1});continue
+        if w1>float(db.cfg.get('stream_curve_max_momentum_pct',30)):db.event(mint,'STREAM','WAVE_SPIKE_REJECT',{'w1':w1});continue
         cached=security_cache.get(mint)
         if cached and now_ms()-cached[0]<600000:safe,why,proof=cached[1:]
         else:safe,why,proof=security_curve(md,mint);security_cache[mint]=(now_ms(),safe,why,proof)
@@ -272,7 +300,7 @@ def hourly_telegram_report(db,stop):
     while not stop.wait(interval):
         heartbeat(db,'telegram_report','RUNNING')
         if not telegram_configured():heartbeat(db,'telegram_report','NOT_CONFIGURED');continue
-        try:ok,detail=send('V7.8 STREAM+CURVE+DEX PAPER\n'+status_text(db,db.snapshot()));db.event('','TELEGRAM_REPORT','SENT' if ok else 'FAILED',{'detail':detail});heartbeat(db,'telegram_report','IDLE' if ok else 'ERROR')
+        try:ok,detail=send('V7.9 WAVE + PEAK-LOCK PAPER\n'+status_text(db,db.snapshot()));db.event('','TELEGRAM_REPORT','SENT' if ok else 'FAILED',{'detail':detail});heartbeat(db,'telegram_report','IDLE' if ok else 'ERROR')
         except Exception as exc:db.event('','TELEGRAM_REPORT','ERROR',{'error':type(exc).__name__});heartbeat(db,'telegram_report','ERROR')
 
 
