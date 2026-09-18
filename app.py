@@ -34,7 +34,14 @@ def dashboard():
     with cards[2]:indicator('Discovery',bool(last_discovery and now-last_discovery[0]<120000),'свежий проход' if last_discovery else 'нет данных')
     with cards[3]:indicator('Telegram',configured(),'настроен; отчёт каждый час'+(f' · {tm(last_report[0])} {last_report[1]}' if last_report else ''))
     with cards[4]:indicator('PAPER / adaptive',True,f"до {s['config']['max_open_positions']} позиций · REAL execution OFF")
-    st.subheader('Банк и результат');st.dataframe(db.stats(s),hide_index=True,use_container_width=True)
+    st.subheader('Банк и результат')
+    stats_df=db.stats(s)
+    if not stats_df.empty:
+        equity=float(stats_df.iloc[0].get('equity',s['config'].get('paper_capital_usd',150)))
+        net=float(stats_df.iloc[0].get('net_pnl',0))
+        state='🟢' if net>0 else ('🔴' if net<0 else '⚪')
+        st.metric(f"{state} Баланс после всех комиссий",f"$"+f"{equity:.4f}",delta=f"{net:+.4f}")
+    st.dataframe(stats_df,hide_index=True,use_container_width=True)
     st.subheader('Открытые позиции');rows=[]
     for p in s['positions']:
         if int(p['remaining_raw']):
