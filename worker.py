@@ -1,5 +1,6 @@
 """V7.9 WAVE+PEAK-LOCK PAPER worker. No wallet, no signing, no real execution."""
-import concurrent.futures, fcntl, json, math, os, queue, threading, time, websocket\nfrom collections import deque
+import concurrent.futures, fcntl, json, math, os, queue, threading, time, websocket
+from collections import deque
 # Isolate V7.5 experiment in its own persistent subdirectory.
 os.environ['DATA_DIR']=os.path.join(os.getenv('DATA_DIR','/data'),'v79')
 from engine import Store, Experiment, CFG, USDC_MINT, SUPPORTED_TOKEN_PROGRAMS, now_ms, db_path
@@ -9,7 +10,9 @@ from telegram_status import configured as telegram_configured, status_text, send
 
 CURVE_FEE_BPS=125
 STREAM_Q=queue.Queue(maxsize=int(CFG.get('stream_queue_max',120)))
-STREAM_SEEN={}\nWAVE_PATHS={}\nWAVE_LOCK=threading.RLock()
+STREAM_SEEN={}
+WAVE_PATHS={}
+WAVE_LOCK=threading.RLock()
 
 
 def wave_metrics(samples):
@@ -300,7 +303,8 @@ def hourly_telegram_report(db,stop):
     while not stop.wait(interval):
         heartbeat(db,'telegram_report','RUNNING')
         if not telegram_configured():heartbeat(db,'telegram_report','NOT_CONFIGURED');continue
-        try:ok,detail=send('V7.9 WAVE + PEAK-LOCK PAPER\n'+status_text(db,db.snapshot()));db.event('','TELEGRAM_REPORT','SENT' if ok else 'FAILED',{'detail':detail});heartbeat(db,'telegram_report','IDLE' if ok else 'ERROR')
+        try:ok,detail=send('V7.9 WAVE + PEAK-LOCK PAPER
+'+status_text(db,db.snapshot()));db.event('','TELEGRAM_REPORT','SENT' if ok else 'FAILED',{'detail':detail});heartbeat(db,'telegram_report','IDLE' if ok else 'ERROR')
         except Exception as exc:db.event('','TELEGRAM_REPORT','ERROR',{'error':type(exc).__name__});heartbeat(db,'telegram_report','ERROR')
 
 
