@@ -61,9 +61,22 @@ def security_dex(md,mint,cfg):
         endpoint=os.getenv('SOLANA_RPC_URL') or (f'https://mainnet.helius-rpc.com/?api-key={md.helius_key}' if md.helius_key else '')
         if not endpoint:return False,'RPC_KEY_MISSING',{}
         def rpc(method,params):
-            r=md.s.post(endpoint,json={'jsonrpc':'2.0','id':1,'method':method,'params':params},timeout=8);r.raise_for_status();j=r.json()
-            if 'error' in j or 'result' not in j:raise ValueError('RPC_UNAVAILABLE')
-            return j['result']
+            # Preserve the same security checks, but do not discard a candidate because one RPC endpoint rate-limited.
+            endpoints=[endpoint]
+            public=os.getenv('SOLANA_PUBLIC_RPC_URL','https://api.mainnet-beta.solana.com').strip()
+            if public and public not in endpoints:endpoints.append(public)
+            last=None
+            for ep in endpoints:
+                for attempt in range(2):
+                    try:
+                        r=md.s.post(ep,json={'jsonrpc':'2.0','id':1,'method':method,'params':params},timeout=8)
+                        r.raise_for_status();j=r.json()
+                        if 'error' in j or 'result' not in j:raise ValueError('RPC_UNAVAILABLE')
+                        return j['result']
+                    except Exception as exc:
+                        last=exc
+                        if attempt==0:time.sleep(.25)
+            raise last or ValueError('RPC_UNAVAILABLE')
         account=rpc('getAccountInfo',[mint,{'encoding':'jsonParsed','commitment':'confirmed'}])['value']
         if not account:return False,'MINT_ACCOUNT_MISSING',{}
         owner=account.get('owner'); info=account['data']['parsed']['info']
