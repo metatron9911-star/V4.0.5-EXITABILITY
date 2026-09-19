@@ -6,7 +6,7 @@
   "max_open_positions": 30,
   "experiment_loss_limit_fraction": 0.25,
   "network_fee_usd": 0.01,
-  "scan_seconds": 20,
+  "scan_seconds": 30,
   "exit_seconds": 0.25,
   "quote_slippage_bps": 50,
   "quote_max_age_ms": 3000,
