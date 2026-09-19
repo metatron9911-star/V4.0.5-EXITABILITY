@@ -9,4 +9,5 @@ aiohttp>=3.10
 
 grpcio>=1.66
 solders>=0.21
-yellowstone-grpc>=1.0
+
+grpcio-tools>=1.66
