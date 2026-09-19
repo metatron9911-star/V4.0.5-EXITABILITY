@@ -302,7 +302,13 @@ def scanner(db,stop):
                 ready,e=observe_dex(db,mint,pair)
                 if not ready:continue
                 safe,why,proof=security_dex(md,mint,db.cfg);db.event(mint,'SECURITY',why,proof)
-                if not safe:continue
+                # SECURITY_UNAVAILABLE is infrastructure failure, not evidence that the token is unsafe.
+                # Never open on it; retain the candidate briefly and retry instead of silently discarding it.
+                if not safe:
+                    if why=='SECURITY_UNAVAILABLE':
+                        db.s['watch'][mint]={'retry_after_ms':now_ms()+15000,'source':'SECURITY_RETRY','market':e}
+                        with db.lock,db.cx:db.save()
+                    continue
                 strength=max(.5,min(2,(e.get('buys',0)/max(1,e.get('sells',1)))/2));out=exp.open_cohort(mint,(pair.get('baseToken') or {}).get('symbol') or mint[:8],e['price'],proof['decimals'],strength);db.event(mint,'DECISION',out)
             heartbeat(db,'scanner','IDLE')
         except Exception as exc:status='ERROR';db.event('','SCANNER','ERROR',{'error':type(exc).__name__});heartbeat(db,'scanner','ERROR')
