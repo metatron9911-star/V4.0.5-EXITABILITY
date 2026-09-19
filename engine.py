@@ -22,7 +22,7 @@ def encode(value): return json.dumps(value, ensure_ascii=False, allow_nan=False)
 def db_path():
     d = Path(os.getenv('DATA_DIR', str(ROOT / 'data')))
     d.mkdir(parents=True, exist_ok=True)
-    return d / 'v7_9_4_security.sqlite3'
+    return d / 'v7_9_5_data_telegram.sqlite3'
 
 class Store:
     def __init__(self, path=None, cfg=None):
