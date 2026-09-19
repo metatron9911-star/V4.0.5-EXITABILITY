@@ -309,7 +309,7 @@ def scanner(db,stop):
                             with db.lock,db.cx:db.s['watch'].pop(rm,None);db.save()
                         else:
                             with db.lock,db.cx:
-                                if rwhy=='SECURITY_UNAVAILABLE':db.s['watch'][rm]['retry_after_ms']=now_ms()+30000
+                                if rwhy=='SECURITY_UNAVAILABLE':db.s['watch'][rm]['retry_after_ms']=now_ms()+int(db.cfg.get('security_retry_sec',20))*1000
                                 else:db.s['watch'].pop(rm,None)
                                 db.save()
             listings,counts=md.discovery();db.event('','DISCOVERY','RESULT',counts);mints=list(dict.fromkeys(x.get('address') or x.get('mint') or x.get('tokenAddress') for x in listings));mints=[m for m in mints if m];rot=mints[cursor:]+mints[:cursor];cursor=(cursor+25)%max(1,len(mints));selected=rot[:int(db.cfg.get('max_candidates_per_scan',100))]
@@ -344,7 +344,7 @@ def scanner(db,stop):
                 # Never open on it; retain the candidate briefly and retry instead of silently discarding it.
                 if not safe:
                     if why=='SECURITY_UNAVAILABLE':
-                        db.s['watch'][mint]={'retry_after_ms':now_ms()+15000,'source':'SECURITY_RETRY','market':e}
+                        db.s['watch'][mint]={'retry_after_ms':now_ms()+int(db.cfg.get('security_retry_sec',20))*1000,'source':'SECURITY_RETRY','market':e}
                         with db.lock,db.cx:db.save()
                     continue
                 strength=max(.5,min(2,(e.get('buys',0)/max(1,e.get('sells',1)))/2));out=exp.open_cohort(mint,(pair.get('baseToken') or {}).get('symbol') or mint[:8],e['price'],proof['decimals'],strength);db.event(mint,'DECISION',out)
@@ -367,11 +367,21 @@ def exit_monitor(db,stop):
 
 def hourly_telegram_report(db,stop):
     interval=max(60,int(db.cfg.get('telegram_report_interval_sec',3600)))
-    while not stop.wait(interval):
-        heartbeat(db,'telegram_report','RUNNING')
+    # Send once shortly after every deploy/restart so Telegram health is observable immediately.
+    first=True
+    while not stop.wait(10 if first else interval):
+        first=False;heartbeat(db,'telegram_report','RUNNING')
         if not telegram_configured():heartbeat(db,'telegram_report','NOT_CONFIGURED');continue
-        try:ok,detail=send('V7.9 WAVE + PEAK-LOCK PAPER'+chr(10)+status_text(db,db.snapshot()));db.event('','TELEGRAM_REPORT','SENT' if ok else 'FAILED',{'detail':detail});heartbeat(db,'telegram_report','IDLE' if ok else 'ERROR')
-        except Exception as exc:db.event('','TELEGRAM_REPORT','ERROR',{'error':type(exc).__name__});heartbeat(db,'telegram_report','ERROR')
+        try:
+            snap=db.snapshot();stats=db.stats(snap);r=stats[0] if stats else {}
+            with db.lock:
+                cut=now_ms()-3600000
+                closed_1h=db.cx.execute("SELECT COUNT(*) FROM events WHERE ts_ms>=? AND stage='SALE'",(cut,)).fetchone()[0]
+                entries_1h=db.cx.execute("SELECT COUNT(*) FROM events WHERE ts_ms>=? AND stage='ENTRY'",(cut,)).fetchone()[0]
+                sec_fail=db.cx.execute("SELECT COUNT(*) FROM events WHERE ts_ms>=? AND stage IN ('SECURITY','SECURITY_RETRY') AND reason='SECURITY_UNAVAILABLE'",(cut,)).fetchone()[0]
+            msg='V7.9 PAPER — hourly'+chr(10)+status_text(db,snap)+chr(10)+f"Last 1h: entries {entries_1h} | sales {closed_1h} | security unavailable {sec_fail}"
+            ok,detail=send(msg);db.event('','TELEGRAM_REPORT','SENT' if ok else 'FAILED',{'detail':detail});heartbeat(db,'telegram_report','IDLE' if ok else 'ERROR')
+        except Exception as exc:db.event('','TELEGRAM_REPORT','ERROR',{'error':type(exc).__name__,'detail':str(exc)[:160]});heartbeat(db,'telegram_report','ERROR')
 
 
 def main():
