@@ -385,13 +385,29 @@ def hourly_telegram_report(db,stop):
 
 
 def yellowstone_pump_stream(db,stop):
-    """Primary Pump.fun ingress from Alchemy Yellowstone; legacy WSS remains fallback."""
+    """Primary Pump.fun create ingress from Alchemy Yellowstone; legacy WSS is independent fallback."""
+    md=MarketData()
+    def got(sig,source):
+        t=now_ms()
+        if sig in STREAM_SEEN and t-STREAM_SEEN[sig]<3600000:return
+        STREAM_SEEN[sig]=t;tx=None
+        for delay in (0,.12,.25,.5,.8):
+            if delay:time.sleep(delay)
+            tx=_rpc_tx(md,sig)
+            if tx:break
+        logs=((tx or {}).get('meta') or {}).get('logMessages') or []
+        if not _pump_create(logs):return
+        mint=_mint_from_tx(tx)
+        if not mint:db.event('','STREAM','YELLOWSTONE_CREATE_WITHOUT_MINT',{'sig':sig});return
+        try:STREAM_Q.put_nowait(mint)
+        except queue.Full:
+            try:STREAM_Q.get_nowait()
+            except queue.Empty:pass
+            try:STREAM_Q.put_nowait(mint)
+            except queue.Full:pass
+        db.event(mint,'STREAM','YELLOWSTONE_PUMP_CREATE',{'sig':sig,'queue':STREAM_Q.qsize(),'source':source});heartbeat(db,'yellowstone','CREATE '+mint[:8])
     try:
         from yellowstone_ingest import start_yellowstone
-        def got(sig,source):
-            # Existing candidate path fetches/parses the tx; enqueue signature for production-shadow processing.
-            db.event('','STREAM','YELLOWSTONE_TX',{'sig':sig,'source':source})
-            # Pump WSS path remains active until Yellowstone parser is fully proven in telemetry.
         ok=start_yellowstone(got,CFG["pump_program"],lambda s:heartbeat(db,'yellowstone',s))
         heartbeat(db,'yellowstone','STARTED' if ok else 'NOT_CONFIGURED')
     except Exception as ex:heartbeat(db,'yellowstone','START_ERROR '+type(ex).__name__)
