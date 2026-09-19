@@ -44,7 +44,7 @@
   "strong_position_fraction": 0.05,
   "max_position_fraction": 0.06,
   "min_trade_edge_over_roundtrip_pct": 1,
-  "max_candidates_per_scan": 80,
+  "max_candidates_per_scan": 60,
   "security_cache_sec": 600,
   "pump_program": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
   "stream_curve_warmup_sec": 6.15,
