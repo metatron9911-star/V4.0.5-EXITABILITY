@@ -385,30 +385,28 @@ def hourly_telegram_report(db,stop):
 
 
 def yellowstone_pump_stream(db,stop):
-    """Primary Pump.fun create ingress from Alchemy Yellowstone; legacy WSS is independent fallback."""
-    md=MarketData()
-    def got(sig,source):
-        t=now_ms()
-        if sig in STREAM_SEEN and t-STREAM_SEEN[sig]<3600000:return
-        STREAM_SEEN[sig]=t;tx=None
-        for delay in (0,.12,.25,.5,.8):
-            if delay:time.sleep(delay)
-            tx=_rpc_tx(md,sig)
-            if tx:break
-        logs=((tx or {}).get('meta') or {}).get('logMessages') or []
+    """Primary protobuf-native Pump.fun create ingress; no RPC getTransaction on Yellowstone path."""
+    def got(ev):
+        sig=ev.get("sig");t=now_ms()
+        if not sig or (sig in STREAM_SEEN and t-STREAM_SEEN[sig]<3600000):return
+        STREAM_SEEN[sig]=t;logs=ev.get("logs") or []
         if not _pump_create(logs):return
-        mint=_mint_from_tx(tx)
-        if not mint:db.event('','STREAM','YELLOWSTONE_CREATE_WITHOUT_MINT',{'sig':sig});return
+        blocked={USDC_MINT,'So11111111111111111111111111111111111111112'}
+        pre={b.get('mint') for b in ev.get('pre',[]) if b.get('mint')}
+        mint=next((b.get('mint') for b in ev.get('post',[]) if b.get('mint') and b.get('mint') not in blocked and b.get('mint') not in pre),None)
+        if not mint:mint=next((b.get('mint') for b in ev.get('post',[]) if b.get('mint') and b.get('mint') not in blocked),None)
+        if not mint:db.event('','STREAM','YELLOWSTONE_CREATE_WITHOUT_MINT',{'sig':sig,'slot':ev.get('slot')});return
         try:STREAM_Q.put_nowait(mint)
         except queue.Full:
             try:STREAM_Q.get_nowait()
             except queue.Empty:pass
             try:STREAM_Q.put_nowait(mint)
             except queue.Full:pass
-        db.event(mint,'STREAM','YELLOWSTONE_PUMP_CREATE',{'sig':sig,'queue':STREAM_Q.qsize(),'source':source});heartbeat(db,'yellowstone','CREATE '+mint[:8])
+        db.event(mint,'STREAM','YELLOWSTONE_PUMP_CREATE',{'sig':sig,'slot':ev.get('slot'),'queue':STREAM_Q.qsize(),'source':'YELLOWSTONE_DIRECT'})
+        heartbeat(db,'yellowstone','CONNECTED PRIMARY create '+mint[:8]+' slot='+str(ev.get('slot')))
     try:
         from yellowstone_ingest import start_yellowstone
-        ok=start_yellowstone(got,CFG["pump_program"],lambda s:heartbeat(db,'yellowstone',s))
+        ok=start_yellowstone(got,CFG["pump_program"],lambda x:heartbeat(db,'yellowstone',x))
         heartbeat(db,'yellowstone','STARTED' if ok else 'NOT_CONFIGURED')
     except Exception as ex:heartbeat(db,'yellowstone','START_ERROR '+type(ex).__name__)
     while not stop.wait(30):pass
