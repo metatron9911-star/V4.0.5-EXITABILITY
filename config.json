@@ -6,7 +6,7 @@
   "max_open_positions": 30,
   "experiment_loss_limit_fraction": 0.25,
   "network_fee_usd": 0.01,
-  "scan_seconds": 12,
+  "scan_seconds": 20,
   "exit_seconds": 0.25,
   "quote_slippage_bps": 50,
   "quote_max_age_ms": 3000,
@@ -32,11 +32,7 @@
   "principal_take_growth_pct": 100,
   "trail_pct": 0,
   "birdeye_poll_interval_sec": 300,
-  "discovery": {
-    "dexscreener_profiles": true,
-    "dexscreener_recent_updates": true,
-    "dexscreener_boosts": true
-  },
+  "discovery": {"dexscreener_profiles": true,"dexscreener_recent_updates": true,"dexscreener_boosts": true},
   "telegram_report_interval_sec": 3600,
   "take_profit_net_pct": 1.5,
   "min_position_usd": 2,
@@ -56,13 +52,7 @@
   "stream_curve_max_momentum_pct": 30,
   "stream_queue_max": 300,
   "wave_sample_sec": 0.15,
-  "wave_windows_sec": [
-    0.3,
-    1,
-    2,
-    3,
-    6
-  ],
+  "wave_windows_sec": [0.3,1,2,3,6],
   "wave_entry_min_03_pct": 0.15,
   "wave_entry_min_1_pct": 0.5,
   "peak_lock_arm_net_pct": 1,
