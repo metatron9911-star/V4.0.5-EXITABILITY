@@ -61,5 +61,5 @@
   "peak_lock_max_giveback_pct": 3,
   "scanner_curve_min_age_sec": 8,
   "scanner_curve_max_age_sec": 900,
-  "security_retry_sec": 60
+  "security_retry_sec": 120
 }
