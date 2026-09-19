@@ -22,7 +22,7 @@ def encode(value): return json.dumps(value, ensure_ascii=False, allow_nan=False)
 def db_path():
     d = Path(os.getenv('DATA_DIR', str(ROOT / 'data')))
     d.mkdir(parents=True, exist_ok=True)
-    return d / 'v7_10_yellowstone_shadow.sqlite3'
+    return d / 'v7_11_yellowstone_direct.sqlite3'
 
 class Store:
     def __init__(self, path=None, cfg=None):
