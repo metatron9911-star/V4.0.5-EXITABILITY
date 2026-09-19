@@ -1,6 +1,6 @@
 {
-  "version": "7.9.3-WAVE",
-  "experiment": "v7-9-3-dense-curve-wave-exec-004",
+  "version": "7.9.4-SECURITY-RETRY",
+  "experiment": "v7-9-4-security-retry-diagnostics-005",
   "paper_capital_usd": 150,
   "risk_fraction": 1,
   "max_open_positions": 30,
@@ -56,7 +56,13 @@
   "stream_curve_max_momentum_pct": 30,
   "stream_queue_max": 300,
   "wave_sample_sec": 0.15,
-  "wave_windows_sec": [0.3,1,2,3,6],
+  "wave_windows_sec": [
+    0.3,
+    1,
+    2,
+    3,
+    6
+  ],
   "wave_entry_min_03_pct": 0.15,
   "wave_entry_min_1_pct": 0.5,
   "peak_lock_arm_net_pct": 1,
@@ -64,5 +70,6 @@
   "peak_lock_giveback_fraction": 0.28,
   "peak_lock_max_giveback_pct": 3,
   "scanner_curve_min_age_sec": 8,
-  "scanner_curve_max_age_sec": 900
+  "scanner_curve_max_age_sec": 900,
+  "security_retry_sec": 45
 }
