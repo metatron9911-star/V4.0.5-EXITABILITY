@@ -6,3 +6,7 @@ python-dotenv>=1.0
 openpyxl>=3.1.5,<4
 
 aiohttp>=3.10
+
+grpcio>=1.66
+solders>=0.21
+yellowstone-grpc>=1.0
