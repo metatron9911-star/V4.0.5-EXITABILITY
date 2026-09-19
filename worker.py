@@ -86,20 +86,26 @@ def security_dex(md,mint,cfg):
         if not holders or supply<=0:return False,'HOLDERS_UNKNOWN',{}
         largest=100*max(int(h['amount']) for h in holders)/supply; evidence={'decimals':int(info['decimals']),'largest_token_account_pct':largest,'token_program':owner,'venue':'DEX'}
         if largest>cfg['max_token_account_pct']:return False,'LARGE_TOKEN_ACCOUNT_INCLUDING_POOLS',evidence
-        report=None;last_rug_error=None
+        report=None;last_rug_error=None;statuses=[]
+        rug_headers={'Accept':'application/json','User-Agent':'V7-PAPER-security/7.9.4'}
         for attempt in range(3):
             try:
-                r=md.s.get(f'https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary',timeout=8);r.raise_for_status();report=r.json();break
+                r=md.s.get(f'https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary',headers=rug_headers,timeout=8)
+                statuses.append(r.status_code)
+                if r.status_code==429:
+                    time.sleep(.75*(attempt+1));continue
+                r.raise_for_status();report=r.json();break
             except Exception as exc:
                 last_rug_error=exc
                 if attempt<2:time.sleep(.35*(attempt+1))
-        if report is None:raise RuntimeError('RUGCHECK_UNAVAILABLE:'+type(last_rug_error).__name__)
+        if report is None:
+            raise RuntimeError('RUGCHECK_UNAVAILABLE:'+type(last_rug_error).__name__+':'+','.join(map(str,statuses)))
         evidence['rugcheck']=report
         locked=float(report['lpLockedPct']); levels=[str(x.get('level','')).lower() for x in (report.get('risks') or [])]
         if not math.isfinite(locked) or locked<cfg['min_lp_locked_pct']:return False,'LP_LOCK_LOW',evidence
         if any(x=='danger' for x in levels):return False,'RUGCHECK_DANGER',evidence
         return True,'SECURITY_SCREEN_PASSED',evidence
-    except Exception as exc:return False,'SECURITY_UNAVAILABLE',{'error':type(exc).__name__}
+    except Exception as exc:return False,'SECURITY_UNAVAILABLE',{'error':type(exc).__name__,'detail':str(exc)[:160]}
 
 
 def observe_dex(db,mint,pair):
