@@ -9,7 +9,8 @@ INTERNAL=8502
 async def stats15(request):
  db=Store();cutoff=now_ms()-15*60*1000
  with db.lock:rows=db.cx.execute('SELECT id,ts_ms,mint,stage,reason,payload FROM events WHERE ts_ms>=? ORDER BY id DESC LIMIT 1500',(cutoff,)).fetchall()
- return web.json_response({'generated_ms':now_ms(),'stats':db.stats(),'events':[dict(zip(['id','ts_ms','mint','stage','reason','payload'],x)) for x in rows],'positions':db.snapshot().get('positions',[])})
+ snap=db.snapshot()
+ return web.json_response({'generated_ms':now_ms(),'stats':db.stats(snap),'events':[dict(zip(['id','ts_ms','mint','stage','reason','payload'],x)) for x in rows],'positions':snap.get('positions',[]),'heartbeats':snap.get('heartbeat',{})})
 async def proxy(request):
  target=f'http://127.0.0.1:{INTERNAL}{request.rel_url}'
  if request.headers.get('Upgrade','').lower()=='websocket':
