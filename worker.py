@@ -384,11 +384,24 @@ def hourly_telegram_report(db,stop):
         except Exception as exc:db.event('','TELEGRAM_REPORT','ERROR',{'error':type(exc).__name__,'detail':str(exc)[:160]});heartbeat(db,'telegram_report','ERROR')
 
 
+def yellowstone_pump_stream(db,stop):
+    """Primary Pump.fun ingress from Alchemy Yellowstone; legacy WSS remains fallback."""
+    try:
+        from yellowstone_ingest import start_yellowstone
+        def got(sig,source):
+            # Existing candidate path fetches/parses the tx; enqueue signature for production-shadow processing.
+            db.event('','STREAM','YELLOWSTONE_TX',{'sig':sig,'source':source})
+            # Pump WSS path remains active until Yellowstone parser is fully proven in telemetry.
+        ok=start_yellowstone(got,CFG["pump_program"],lambda s:heartbeat(db,'yellowstone',s))
+        heartbeat(db,'yellowstone','STARTED' if ok else 'NOT_CONFIGURED')
+    except Exception as ex:heartbeat(db,'yellowstone','START_ERROR '+type(ex).__name__)
+    while not stop.wait(30):pass
+
 def main():
     import signal
     lock_file=open(db_path().with_suffix('.worker.lock'),'w');fcntl.flock(lock_file,fcntl.LOCK_EX|fcntl.LOCK_NB);db=Store();stop=threading.Event()
     for sig in (signal.SIGTERM,signal.SIGINT):signal.signal(sig,lambda *_:stop.set())
-    threads=[threading.Thread(target=f,args=(db,stop),daemon=True) for f in (pump_stream,stream_candidate_loop,scanner,exit_monitor,hourly_telegram_report)]
+    threads=[threading.Thread(target=f,args=(db,stop),daemon=True) for f in (yellowstone_pump_stream,pump_stream,stream_candidate_loop,scanner,exit_monitor,hourly_telegram_report)]
     for t in threads:t.start()
     while not stop.wait(1):
         if not all(t.is_alive() for t in threads):raise RuntimeError('Worker thread stopped')
