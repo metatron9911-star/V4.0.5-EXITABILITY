@@ -1,6 +1,6 @@
 {
-  "version": "7.9.5-DATA-TELEGRAM",
-  "experiment": "v7-9-5-data-telegram-006",
+  "version": "7.10-YELLOWSTONE-SHADOW",
+  "experiment": "v7-10-yellowstone-shadow-007",
   "paper_capital_usd": 150,
   "risk_fraction": 1,
   "max_open_positions": 30,
@@ -56,7 +56,13 @@
   "stream_curve_max_momentum_pct": 30,
   "stream_queue_max": 300,
   "wave_sample_sec": 0.15,
-  "wave_windows_sec": [0.3, 1, 2, 3, 6],
+  "wave_windows_sec": [
+    0.3,
+    1,
+    2,
+    3,
+    6
+  ],
   "wave_entry_min_03_pct": 0.15,
   "wave_entry_min_1_pct": 0.5,
   "peak_lock_arm_net_pct": 1,
