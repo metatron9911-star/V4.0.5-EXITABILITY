@@ -33,11 +33,19 @@ def probe_curve_wave(pump,mint,seconds=1.05):
         time.sleep(float(CFG.get('wave_sample_sec',.15)))
     return d,wave_metrics(d)
 
+def _rpc_endpoints(md):
+    """Paid/private RPC only. Never fall through to the public Solana endpoint in the security hot path."""
+    out=[]
+    for ep in (os.getenv('SOLANA_RPC_URL','').strip(),os.getenv('ALCHEMY_SOLANA_RPC_URL','').strip(),(f'https://mainnet.helius-rpc.com/?api-key={md.helius_key}' if md.helius_key else '')):
+        if ep and ep not in out:out.append(ep)
+    return out
+
 def security_curve(md,mint):
     """Pre-graduation checks: verify mint program and authorities. LP/holder tests do not apply to Pump curve inventory."""
     try:
-        endpoint=os.getenv('SOLANA_RPC_URL') or (f'https://mainnet.helius-rpc.com/?api-key={md.helius_key}' if md.helius_key else '')
-        if not endpoint:return False,'RPC_KEY_MISSING',{}
+        endpoints=_rpc_endpoints(md)
+        if not endpoints:return False,'RPC_KEY_MISSING',{}
+        endpoint=endpoints[0]
         r=md.s.post(endpoint,json={'jsonrpc':'2.0','id':1,'method':'getAccountInfo','params':[mint,{'encoding':'jsonParsed','commitment':'confirmed'}]},timeout=7); r.raise_for_status(); j=r.json(); account=(j.get('result') or {}).get('value')
         if not account:return False,'MINT_ACCOUNT_MISSING',{}
         owner=account.get('owner'); info=((account.get('data') or {}).get('parsed') or {}).get('info') or {}
@@ -62,9 +70,7 @@ def security_dex(md,mint,cfg):
         if not endpoint:return False,'RPC_KEY_MISSING',{}
         def rpc(method,params):
             # Preserve the same security checks, but do not discard a candidate because one RPC endpoint rate-limited.
-            endpoints=[endpoint]
-            public=os.getenv('SOLANA_PUBLIC_RPC_URL','https://api.mainnet-beta.solana.com').strip()
-            if public and public not in endpoints:endpoints.append(public)
+            endpoints=_rpc_endpoints(md)
             last=None
             for ep in endpoints:
                 for attempt in range(2):
