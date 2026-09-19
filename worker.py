@@ -86,7 +86,15 @@ def security_dex(md,mint,cfg):
         if not holders or supply<=0:return False,'HOLDERS_UNKNOWN',{}
         largest=100*max(int(h['amount']) for h in holders)/supply; evidence={'decimals':int(info['decimals']),'largest_token_account_pct':largest,'token_program':owner,'venue':'DEX'}
         if largest>cfg['max_token_account_pct']:return False,'LARGE_TOKEN_ACCOUNT_INCLUDING_POOLS',evidence
-        r=md.s.get(f'https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary',timeout=8);r.raise_for_status();report=r.json();evidence['rugcheck']=report
+        report=None;last_rug_error=None
+        for attempt in range(3):
+            try:
+                r=md.s.get(f'https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary',timeout=8);r.raise_for_status();report=r.json();break
+            except Exception as exc:
+                last_rug_error=exc
+                if attempt<2:time.sleep(.35*(attempt+1))
+        if report is None:raise RuntimeError('RUGCHECK_UNAVAILABLE:'+type(last_rug_error).__name__)
+        evidence['rugcheck']=report
         locked=float(report['lpLockedPct']); levels=[str(x.get('level','')).lower() for x in (report.get('risks') or [])]
         if not math.isfinite(locked) or locked<cfg['min_lp_locked_pct']:return False,'LP_LOCK_LOW',evidence
         if any(x=='danger' for x in levels):return False,'RUGCHECK_DANGER',evidence
@@ -156,7 +164,10 @@ class HybridExperiment(Experiment):
             dq=WAVE_PATHS.setdefault(p['id'],deque(maxlen=100));dq.append((time.monotonic(),net))
             while dq and time.monotonic()-dq[0][0]>6.5:dq.popleft()
             wm=wave_metrics(dq)
-        peak_net=max(float(p.get('mfe_pct',0.0)),pnl);arm=float(self.c.get('peak_lock_arm_net_pct',1.0));reason='';lock_floor=None
+        # Peak lock uses net PnL from cost; baseline MFE is intentionally kept separate.
+        with WAVE_LOCK:
+            net_peak=max([100*(x[1]/p['cost']-1) for x in WAVE_PATHS.get(p['id'],[])]+[pnl])
+        peak_net=net_peak;arm=float(self.c.get('peak_lock_arm_net_pct',1.0));reason='';lock_floor=None
         if peak_net>=arm:
             give=min(float(self.c.get('peak_lock_max_giveback_pct',3.0)),max(float(self.c.get('peak_lock_min_giveback_pct',.7)),peak_net*float(self.c.get('peak_lock_giveback_fraction',.28))))
             lock_floor=peak_net-give
@@ -274,6 +285,27 @@ def scanner(db,stop):
     while not stop.is_set():
         command_id=db.claim_scan();status='DONE';heartbeat(db,'scanner','RUNNING')
         try:
+            # Retry infrastructure-blocked candidates instead of losing them after a transient security outage.
+            retry_now=[]
+            snap=db.snapshot()
+            for wm,wv in list((snap.get('watch') or {}).items()):
+                if isinstance(wv,dict) and wv.get('source')=='SECURITY_RETRY' and now_ms()>=int(wv.get('retry_after_ms') or 0):
+                    retry_now.append((wm,wv))
+            for rm,rv in retry_now[:25]:
+                pair=md.dex_pair(rm)
+                if pair:
+                    ready,re=observe_dex(db,rm,pair)
+                    if ready:
+                        rsafe,rwhy,rproof=security_dex(md,rm,db.cfg);db.event(rm,'SECURITY_RETRY',rwhy,rproof)
+                        if rsafe:
+                            rstrength=max(.5,min(2,(re.get('buys',0)/max(1,re.get('sells',1)))/2))
+                            rout=exp.open_cohort(rm,(pair.get('baseToken') or {}).get('symbol') or rm[:8],re['price'],rproof['decimals'],rstrength);db.event(rm,'DECISION',rout,{'source':'SECURITY_RETRY'})
+                            with db.lock,db.cx:db.s['watch'].pop(rm,None);db.save()
+                        else:
+                            with db.lock,db.cx:
+                                if rwhy=='SECURITY_UNAVAILABLE':db.s['watch'][rm]['retry_after_ms']=now_ms()+30000
+                                else:db.s['watch'].pop(rm,None)
+                                db.save()
             listings,counts=md.discovery();db.event('','DISCOVERY','RESULT',counts);mints=list(dict.fromkeys(x.get('address') or x.get('mint') or x.get('tokenAddress') for x in listings));mints=[m for m in mints if m];rot=mints[cursor:]+mints[:cursor];cursor=(cursor+25)%max(1,len(mints));selected=rot[:int(db.cfg.get('max_candidates_per_scan',100))]
             for mint in selected:
                 if stop.is_set():break
