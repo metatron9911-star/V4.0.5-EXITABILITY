@@ -1,0 +1,49 @@
+{
+  "mode": "PAPER",
+  "venue": "BYBIT",
+  "category": "linear",
+  "paper_start_usd": 500.0,
+  "profit_wallet": {
+    "enabled": true,
+    "skim_trigger_profit_usd": 10.0,
+    "skim_fraction": 0.5
+  },
+  "fees": {
+    "standard": {"maker_bps": 2.0, "taker_bps": 5.5},
+    "pre_market": {"maker_bps": 4.0, "taker_bps": 10.0},
+    "innovation": {"maker_bps": 4.0, "taker_bps": 11.0}
+  },
+  "market_data": {
+    "trade_topics": true,
+    "book_l1": true,
+    "book_l50": true,
+    "stale_trade_ms": 250,
+    "stale_book_ms": 100,
+    "max_queue": 100000
+  },
+  "heads": {
+    "LIQUID": {
+      "enabled": true,
+      "symbols": ["SOLUSDT", "ETHUSDT", "BTCUSDT"],
+      "max_open": 3,
+      "min_expected_edge_bps": 18.0,
+      "risk_fraction": 0.02
+    },
+    "VOL": {
+      "enabled": true,
+      "symbols": [],
+      "dynamic_universe": true,
+      "max_open": 6,
+      "min_expected_edge_bps": 25.0,
+      "risk_fraction": 0.015
+    },
+    "LAUNCH": {
+      "enabled": true,
+      "symbols": [],
+      "dynamic_universe": true,
+      "max_open": 2,
+      "min_expected_edge_bps": 40.0,
+      "risk_fraction": 0.01
+    }
+  }
+}
