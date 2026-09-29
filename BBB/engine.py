@@ -61,23 +61,28 @@ class Wallets:
             raise ValueError("start_usd must be positive")
         self.trading_cash_usd = self.start_usd
 
-    def reserve_margin(self, margin_usd: float) -> None:
-        if margin_usd <= 0 or margin_usd > self.trading_cash_usd:
+    def reserve_entry(self, margin_usd: float, entry_fee_usd: float) -> None:
+        debit = margin_usd + entry_fee_usd
+        if margin_usd <= 0 or entry_fee_usd < 0 or debit > self.trading_cash_usd:
             raise ValueError("insufficient trading cash")
-        self.trading_cash_usd -= margin_usd
+        self.trading_cash_usd -= debit
+        self.fees_usd += entry_fee_usd
 
-    def release_close(
+    def settle_close(
         self,
         margin_usd: float,
         gross_pnl_usd: float,
-        fees_usd: float,
+        entry_fee_usd: float,
+        exit_fee_usd: float,
         funding_usd: float,
         slippage_impact_usd: float,
     ) -> float:
-        net = gross_pnl_usd - fees_usd - funding_usd - slippage_impact_usd
-        self.trading_cash_usd += margin_usd + net
+        # Entry commission was already removed from cash on entry. Do not debit it twice.
+        cash_credit = margin_usd + gross_pnl_usd - exit_fee_usd - funding_usd - slippage_impact_usd
+        self.trading_cash_usd += cash_credit
+        net = gross_pnl_usd - entry_fee_usd - exit_fee_usd - funding_usd - slippage_impact_usd
         self.realized_pnl_usd += net
-        self.fees_usd += fees_usd
+        self.fees_usd += exit_fee_usd
         self.funding_usd += funding_usd
         self.slippage_impact_usd += slippage_impact_usd
         return net
@@ -167,8 +172,7 @@ class PaperBook:
         notional = margin_usd * leverage
         fee = BYBIT_FEES[signal.product_class].fee_usd(notional, maker)
         # Commission is a real cash cost at fill.
-        self.wallets.reserve_margin(margin_usd + fee)
-        self.wallets.fees_usd += fee
+        self.wallets.reserve_entry(margin_usd, fee)
 
         p = Position(
             position_id=position_id,
@@ -186,6 +190,29 @@ class PaperBook:
         )
         self.positions[position_id] = p
         return p
+
+    def close_position(
+        self,
+        position_id: str,
+        exit_vwap: float,
+        exit_fee_maker: bool = False,
+        funding_usd: float = 0.0,
+        slippage_impact_usd: float = 0.0,
+    ) -> float:
+        p = self.positions.pop(position_id)
+        direction = 1.0 if p.side.upper() == "BUY" else -1.0
+        gross = direction * (exit_vwap / p.entry_vwap - 1.0) * p.notional_usd
+        exit_fee = BYBIT_FEES[p.product_class].fee_usd(p.notional_usd, exit_fee_maker)
+        net = self.wallets.settle_close(
+            margin_usd=p.margin_usd,
+            gross_pnl_usd=gross,
+            entry_fee_usd=p.entry_fee_usd,
+            exit_fee_usd=exit_fee,
+            funding_usd=funding_usd,
+            slippage_impact_usd=slippage_impact_usd,
+        )
+        self.head_realized[p.head] += net
+        return net
 
     def snapshot(self) -> dict:
         return {
