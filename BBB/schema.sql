@@ -97,3 +97,32 @@ CREATE TABLE IF NOT EXISTS equity_samples (
 CREATE INDEX IF NOT EXISTS idx_events_session_ts ON events(session_id, ts_ms);
 CREATE INDEX IF NOT EXISTS idx_trades_head_closed ON trades(head, closed_ms);
 CREATE INDEX IF NOT EXISTS idx_ledger_session_ts ON wallet_ledger(session_id, ts_ms);
+
+
+CREATE TABLE IF NOT EXISTS feature_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_ms INTEGER NOT NULL,
+  exchange_ts_ms INTEGER,
+  session_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  head TEXT NOT NULL,
+  mid REAL,
+  bid REAL,
+  ask REAL,
+  spread_bps REAL,
+  depth_bid_5_usd REAL,
+  depth_ask_5_usd REAL,
+  book_imbalance_5 REAL,
+  trade_count_1s INTEGER,
+  trade_count_5s INTEGER,
+  buy_ratio_1s REAL,
+  ret_250ms_bps REAL,
+  ret_1s_bps REAL,
+  ret_5s_bps REAL,
+  realized_vol_5s_bps REAL,
+  score REAL,
+  gate REAL,
+  state TEXT,
+  payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_features_symbol_ts ON feature_samples(symbol, ts_ms);
