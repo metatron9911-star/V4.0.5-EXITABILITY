@@ -41,8 +41,12 @@ async def main():
     old=dict(cx.execute("SELECT key,value FROM meta").fetchall()).get("session_id")
     session=os.getenv("BBB_SESSION_ID") or old or str(uuid.uuid4())
     symbols=[x.strip().upper() for x in os.getenv("BBB_SYMBOLS",",".join(DEFAULT_SYMBOLS)).split(",") if x.strip()]
+    launch_symbols={x.strip().upper() for x in os.getenv("BBB_LAUNCH_SYMBOLS","").split(",") if x.strip()}
+    liquid_symbols={x.strip().upper() for x in os.getenv("BBB_LIQUID_SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT").split(",") if x.strip()}
     setmeta(cx,"session_id",session); setmeta(cx,"mode",os.getenv("BBB_MODE","PAPER"))
-    setmeta(cx,"symbols",",".join(symbols)); setmeta(cx,"paper_start_usd",os.getenv("BBB_PAPER_START_USD","500"))
+    setmeta(cx,"symbols",",".join(symbols)); setmeta(cx,"launch_symbols",",".join(sorted(launch_symbols)))
+    setmeta(cx,"liquid_symbols",",".join(sorted(liquid_symbols)))
+    setmeta(cx,"paper_start_usd",os.getenv("BBB_PAPER_START_USD","500"))
     cx.commit()
 
     q=asyncio.Queue(maxsize=int(os.getenv("BBB_MAX_QUEUE","100000")))
@@ -82,7 +86,7 @@ async def main():
             if symbol in books and now_ms()-last_sample[symbol]>=250:
                 snap=fx.snapshot(symbol,now_ms(),books[symbol])
                 if snap:
-                    head=classify_head(symbol)
+                    head="LAUNCH" if symbol in launch_symbols else ("LIQUID" if symbol in liquid_symbols else "VOL")
                     score=baseline_score(snap); gate=GATES[head]
                     state="SHADOW_PASS" if score>=gate else "GATED"
                     cx.execute("""INSERT INTO feature_samples(
