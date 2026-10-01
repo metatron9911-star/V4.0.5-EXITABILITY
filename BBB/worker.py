@@ -121,7 +121,8 @@ async def main():
                     cx.execute("DELETE FROM events WHERE ts_ms < ?",(cutoff,))
                     cx.execute("DELETE FROM feature_samples WHERE ts_ms < ?",(cutoff,))
                     cx.execute("DELETE FROM equity_samples WHERE ts_ms < ?",(cutoff,))
-                    cx.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    # Do not checkpoint from the hot writer loop: dashboard readers can
+                    # legitimately hold read locks. WAL autocheckpoint handles this safely.
                     last_maintenance=now_ms()
                 cx.commit(); last_hb=now_ms()
     finally:
