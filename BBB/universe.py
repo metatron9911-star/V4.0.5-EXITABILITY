@@ -58,10 +58,10 @@ def _scan_sync() -> list[Candidate]:
         bucket=None
         if turn>=100_000_000 and rng>=300:
             bucket="CORE"
+        elif turn>=10_000_000 and rng>=1200:
+            bucket="EXTREME"
         elif turn>=25_000_000 and rng>=500:
             bucket="FAST"
-        elif turn>=10_000_000 and rng>=900:
-            bucket="EXTREME"
         if bucket:
             rows.append(Candidate(s,bucket,turn,rng,ch,oi,rank))
 
