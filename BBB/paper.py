@@ -10,6 +10,7 @@ from typing import Dict
 
 from engine import PaperBook, SignalSnapshot, HeadName, ProductClass, BYBIT_FEES, now_ms
 from orderbook import LocalBook
+from sanitizer import Sanitizer
 
 @dataclass(frozen=True)
 class HeadPolicy:
@@ -41,6 +42,14 @@ class PaperTrader:
         self.leverage=max(1.0,float(os.getenv("BBB_PAPER_LEVERAGE","1")))
         self.skim_trigger=float(os.getenv("BBB_SKIM_TRIGGER_USD","10"))
         self.skim_fraction=float(os.getenv("BBB_SKIM_FRACTION","0.5"))
+        train=[x.strip() for x in os.getenv("BBB_SANITIZER_TRAIN_SESSIONS","").split(",") if x.strip()]
+        self.sanitizer=Sanitizer(
+            cx,train,
+            min_n=int(os.getenv("BBB_SANITIZER_MIN_N","12")),
+            min_winner_retention=float(os.getenv("BBB_SANITIZER_WINNER_RETENTION","0.90")),
+            min_losers_removed=int(os.getenv("BBB_SANITIZER_MIN_LOSERS_REMOVED","2")),
+        )
+        self.sanitizer_rejects=0
         self._write_wallet_meta()
 
     def _product(self,symbol:str) -> ProductClass:
@@ -76,6 +85,8 @@ class PaperTrader:
             "funding_usd":f"{w.funding_usd:.8f}",
             "slippage_impact_usd":f"{w.slippage_impact_usd:.8f}",
             "paper_open_positions":str(len(self.book.positions)),
+            "sanitizer_rejects":str(self.sanitizer_rejects),
+            "sanitizer_rules_json":self.sanitizer.as_json(),
         }
         for k,v in meta.items():
             self.cx.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",(k,v))
@@ -103,6 +114,19 @@ class PaperTrader:
         if max(long_score,short_score)<pol.gate:return
         side="BUY" if long_score>=short_score else "SELL"
         score=max(long_score,short_score)
+        san_features=dict(f)
+        san_features["entry_score"]=score
+        san_features["source_age_ms"]=max(0,int(receive_ts_ms or now_ms())-int(exchange_ts_ms or 0)) if exchange_ts_ms else 0
+        san_features["processing_ms"]=0
+        allowed,san_reason=self.sanitizer.decision(head,side,san_features)
+        if not allowed:
+            self.sanitizer_rejects+=1
+            self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (now_ms(),exchange_ts_ms,self.session_id,head,symbol,"SANITIZER_REJECT",san_reason,
+                             json.dumps({"side":side,"score":score,"features":san_features},separators=(",",":"))))
+            self._write_wallet_meta()
+            return
         margin=max(1.0,self.start_usd*pol.margin_fraction)
         notional=margin*self.leverage
         entry_vwap,filled=book.walk_vwap(side,notional)
