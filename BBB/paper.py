@@ -165,19 +165,92 @@ class PaperTrader:
         mid=float(book.mid or p.entry_vwap)
         direction=1.0 if p.side=="BUY" else -1.0
         move_bps=direction*(mid/p.entry_vwap-1.0)*10000
-        p.mfe_pct=max(p.mfe_pct,move_bps/100)
-        p.mae_pct=min(p.mae_pct,move_bps/100)
+        now=now_ms()
+        old_mfe=p.mfe_pct*100.0
+        old_mae=p.mae_pct*100.0
+        if move_bps>old_mfe:
+            p.mfe_pct=move_bps/100.0
+            p.mfe_ms=now
+        if move_bps<old_mae:
+            p.mae_pct=move_bps/100.0
+            p.mae_ms=now
         try:
             ef=p.signal.features or {}
             bucket=str(ef.get("vol_bucket","FAST"))
         except Exception:
             bucket="FAST"
         pol=POLICIES[(bucket,p.side)]
-        age=now_ms()-p.opened_ms
+        age=now-p.opened_ms
+        mfe_bps=p.mfe_pct*100.0
+        mae_bps=p.mae_pct*100.0
+
+        # ELC adapted from RHB: cut only a confirmed weak trajectory, not a shallow
+        # dip that has begun to recover. Thresholds scale to each VOL bucket policy.
+        sign=1.0 if p.side=="BUY" else -1.0
+        entry_flow=(float(ef.get("buy_ratio_1s",0.5))-0.5)*2.0*sign
+        current_flow=(float(f.get("buy_ratio_1s",0.5))-0.5)*2.0*sign
+        entry_imb=float(ef.get("book_imbalance_5",0))*sign
+        current_imb=float(f.get("book_imbalance_5",0))*sign
+        flow_drop=(entry_flow+entry_imb)-(current_flow+current_imb)
+        flow_deteriorating=(flow_drop>=0.20 or current_flow<0 or current_imb<-0.15)
+
+        winner_veto=(
+            age>=3_000
+            and mae_bps>=-0.45*pol.stop_loss_bps
+            and (now-p.mae_ms)>=2_000
+            and move_bps>=-0.15*pol.stop_loss_bps
+            and p.mfe_ms>p.mae_ms
+            and mfe_bps>0
+        )
+        r2_confirm=(
+            age>=10_000
+            and mfe_bps<=0.35*pol.take_profit_bps
+            and move_bps<0
+            and mae_bps<=-0.55*pol.stop_loss_bps
+            and flow_deteriorating
+        )
+        early_loser_cut=(not winner_veto) and r2_confirm
+
+        # Right-tail collector. Once a winner reaches nominal TP with continuing
+        # order-flow, keep it as a runner and exit only on a meaningful pullback.
+        momentum_aligned=max(
+            sign*float(f.get("ret_250ms_bps",0)),
+            sign*float(f.get("ret_1s_bps",0)),
+            0.5*sign*float(f.get("ret_5s_bps",0)),
+        )
+        continuation=(
+            classify_regime(f) in {"TREND","IMPULSE"}
+            and momentum_aligned>0
+            and current_flow>-0.05
+            and current_imb>-0.20
+        )
+        if (not p.tail_armed) and mfe_bps>=pol.take_profit_bps and continuation:
+            p.tail_armed=True
+            p.tail_arm_ms=now
+            self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (now,book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,"TAIL_ARM","RIGHT_TAIL",
+                             json.dumps({"side":p.side,"bucket":bucket,"mfe_bps":mfe_bps,
+                                         "move_bps":move_bps,"flow":current_flow,"imbalance":current_imb},
+                                        separators=(",",":"))))
+
+        from_peak_bps=mfe_bps-move_bps
+        tail_trail_bps=max(0.35*pol.take_profit_bps,0.30*max(mfe_bps,pol.take_profit_bps))
+        tail_timeout=pol.max_hold_ms*3
+
         reason=None
-        if move_bps>=pol.take_profit_bps:reason="TAKE_PROFIT"
-        elif move_bps<=-pol.stop_loss_bps:reason="STOP_LOSS"
-        elif age>=pol.max_hold_ms:reason="TIME_EXIT"
+        if move_bps<=-pol.stop_loss_bps:
+            reason="STOP_LOSS"
+        elif early_loser_cut:
+            reason="EARLY_LOSER_CUT"
+        elif p.tail_armed and from_peak_bps>=tail_trail_bps:
+            reason="RIGHT_TAIL_TRAIL"
+        elif (not p.tail_armed) and move_bps>=pol.take_profit_bps:
+            reason="TAKE_PROFIT"
+        elif p.tail_armed and age>=tail_timeout:
+            reason="RIGHT_TAIL_TIME"
+        elif (not p.tail_armed) and age>=pol.max_hold_ms:
+            reason="TIME_EXIT"
         if not reason:return
 
         exit_side="SELL" if p.side=="BUY" else "BUY"
@@ -193,7 +266,10 @@ class PaperTrader:
                           WHERE position_id=?""",
                        (exit_vwap,exit_fee,gross,net,p.mae_pct,p.mfe_pct,age,reason,now_ms(),p.position_id))
         self._ledger("TRADING",p.head.value,p.position_id,"CLOSE",w.trading_cash_usd-before,w.trading_cash_usd,
-                     {"reason":reason,"exit_vwap":exit_vwap,"net_pnl":net})
+                     {"reason":reason,"exit_vwap":exit_vwap,"net_pnl":net,
+                      "mfe_bps":mfe_bps,"mae_bps":mae_bps,"move_bps":move_bps,
+                      "tail_armed":p.tail_armed,"tail_trail_bps":tail_trail_bps,
+                      "early_loser_confirmed":early_loser_cut,"winner_veto":winner_veto})
         self.last_close_ms[p.symbol]=now_ms()
 
         # RHB-style reserve wallet: skim half of trading cash above start+trigger.
