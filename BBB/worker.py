@@ -11,6 +11,7 @@ from market_bybit import BybitPublicFeed, now_ms
 from orderbook import LocalBook
 from features import FeatureEngine, classify_head, baseline_score
 from paper import PaperTrader
+from universe import scan_vol_universe, universe_json
 
 ROOT=Path(__file__).resolve().parent
 DATA_DIR=Path(os.getenv("DATA_DIR",str(ROOT/"data")))
@@ -41,12 +42,21 @@ async def main():
     cx=connect()
     old=dict(cx.execute("SELECT key,value FROM meta").fetchall()).get("session_id")
     session=os.getenv("BBB_SESSION_ID") or old or str(uuid.uuid4())
-    symbols=[x.strip().upper() for x in os.getenv("BBB_SYMBOLS",",".join(DEFAULT_SYMBOLS)).split(",") if x.strip()]
-    launch_symbols={x.strip().upper() for x in os.getenv("BBB_LAUNCH_SYMBOLS","").split(",") if x.strip()}
-    liquid_symbols={x.strip().upper() for x in os.getenv("BBB_LIQUID_SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT").split(",") if x.strip()}
+    configured=[x.strip().upper() for x in os.getenv("BBB_SYMBOLS","").split(",") if x.strip()]
+    dynamic=os.getenv("BBB_VOL_DYNAMIC_UNIVERSE","1").lower() in {"1","true","yes","on"}
+    universe=[]
+    if dynamic:
+        try: universe=await scan_vol_universe()
+        except Exception: universe=[]
+    symbols=[x.symbol for x in universe] or configured or ["HYPEUSDT","GRASSUSDT","STRKUSDT","ZROUSDT"]
+    bucket_map={x.symbol:x.bucket for x in universe}
+    scan_meta={x.symbol:x for x in universe}
+    launch_symbols=set()
+    liquid_symbols=set()
     setmeta(cx,"session_id",session); setmeta(cx,"mode",os.getenv("BBB_MODE","PAPER"))
-    setmeta(cx,"symbols",",".join(symbols)); setmeta(cx,"launch_symbols",",".join(sorted(launch_symbols)))
-    setmeta(cx,"liquid_symbols",",".join(sorted(liquid_symbols)))
+    setmeta(cx,"symbols",",".join(symbols)); setmeta(cx,"launch_symbols","")
+    setmeta(cx,"liquid_symbols",""); setmeta(cx,"vol_universe_json",universe_json(universe))
+    setmeta(cx,"vol_dynamic","1" if dynamic else "0")
     setmeta(cx,"paper_start_usd",os.getenv("BBB_PAPER_START_USD","500"))
     # Any open rows from an older paper session are bookkeeping leftovers after a deliberate reset.
     cx.execute("""UPDATE trades SET status='ABANDONED', exit_reason='SESSION_RESET', closed_ms=?
@@ -62,6 +72,8 @@ async def main():
     market_persist_ms=int(os.getenv("BBB_MARKET_PERSIST_MS","5000"))
     retention_hours=int(os.getenv("BBB_RETENTION_HOURS","24"))
     last_maintenance=0
+    scan_interval_ms=int(os.getenv("BBB_VOL_SCAN_INTERVAL_SEC","900"))*1000
+    last_universe_scan=now_ms()
 
     async def on_event(ev):
         nonlocal dropped
@@ -98,10 +110,17 @@ async def main():
             if symbol in books and now_ms()-last_sample[symbol]>=feature_persist_ms:
                 snap=fx.snapshot(symbol,now_ms(),books[symbol])
                 if snap:
-                    head="LAUNCH" if symbol in launch_symbols else ("LIQUID" if symbol in liquid_symbols else "VOL")
-                    score=baseline_score(snap); gate=GATES[head]
-                    state="SHADOW_PASS" if score>=gate else "GATED"
-                    trader.on_snapshot(symbol,head,snap,books[symbol],books[symbol].exchange_ts_ms,recv)
+                    head="VOL"
+                    bucket=bucket_map.get(symbol,"FAST")
+                    meta_scan=scan_meta.get(symbol)
+                    if meta_scan:
+                        snap["vol_bucket"]=bucket
+                        snap["turnover24h"]=meta_scan.turnover24h
+                        snap["range24h_bps"]=meta_scan.range_bps
+                        snap["abs_change24h_bps"]=meta_scan.abs_change_bps
+                    score=baseline_score(snap); gate=65.0
+                    state=f"{bucket}|SHADOW"
+                    trader.on_snapshot(symbol,head,snap,books[symbol],books[symbol].exchange_ts_ms,recv,bucket=bucket)
                     cx.execute("""INSERT INTO feature_samples(
                       ts_ms,exchange_ts_ms,session_id,symbol,head,mid,bid,ask,spread_bps,
                       depth_bid_5_usd,depth_ask_5_usd,book_imbalance_5,trade_count_1s,trade_count_5s,
@@ -115,6 +134,28 @@ async def main():
                     last_sample[symbol]=now_ms()
 
             processing.append(max(0,now_ms()-start))
+
+            # Refresh the traded universe periodically. Existing open positions remain managed;
+            # new subscriptions are added/removed live.
+            if dynamic and now_ms()-last_universe_scan>=scan_interval_ms:
+                try:
+                    fresh=await scan_vol_universe()
+                    if fresh:
+                        new_symbols=[x.symbol for x in fresh]
+                        for s in new_symbols:
+                            if s not in books: books[s]=LocalBook(s)
+                        bucket_map={x.symbol:x.bucket for x in fresh}
+                        scan_meta={x.symbol:x for x in fresh}
+                        universe=fresh
+                        feed.set_symbols(new_symbols)
+                        symbols=new_symbols
+                        setmeta(cx,"symbols",",".join(new_symbols))
+                        setmeta(cx,"vol_universe_json",universe_json(fresh))
+                        setmeta(cx,"vol_universe_updated_ms",now_ms())
+                except Exception as e:
+                    setmeta(cx,"vol_universe_error",str(e)[:300])
+                last_universe_scan=now_ms()
+
             if now_ms()-last_hb>=1000:
                 setmeta(cx,"heartbeat_ms",now_ms()); setmeta(cx,"feed_state","CONNECTED" if feed.health.connected else "RECONNECTING")
                 setmeta(cx,"reconnects",feed.health.reconnects); setmeta(cx,"messages",feed.health.messages)
