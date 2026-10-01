@@ -72,7 +72,7 @@ def board():
     cols[5].metric("Open positions",db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='OPEN'",(session,)).fetchone()[0])
 
     st.subheader("Paper trading")
-    tcols=st.columns(6)
+    tcols=st.columns(8)
     closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED'",(session,)).fetchone()[0]
     wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND net_pnl_usd>0",(session,)).fetchone()[0]
     losses=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND net_pnl_usd<=0",(session,)).fetchone()[0]
@@ -82,6 +82,10 @@ def board():
     tcols[3].metric("Realized $",f"{float(meta.get('realized_pnl_usd','0')):.2f}")
     tcols[4].metric("Fees $",f"{float(meta.get('fees_usd','0')):.2f}")
     tcols[5].metric("Profit wallet $",f"{float(meta.get('profit_wallet_usd','0')):.2f}")
+    elc=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND exit_reason='EARLY_LOSER_CUT'",(session,)).fetchone()[0]
+    tails=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND exit_reason IN ('RIGHT_TAIL_TRAIL','RIGHT_TAIL_TIME')",(session,)).fetchone()[0]
+    tcols[6].metric("ELC cuts",elc)
+    tcols[7].metric("Tail closes",tails)
 
     recent=db.execute("""SELECT head,symbol,side,status,margin_usd,notional_usd,entry_vwap,exit_vwap,net_pnl_usd,exit_reason,
                                 opened_ms,closed_ms,risk_state,entry_features_json
