@@ -10,6 +10,7 @@ from pathlib import Path
 from market_bybit import BybitPublicFeed, now_ms
 from orderbook import LocalBook
 from features import FeatureEngine, classify_head, baseline_score
+from paper import PaperTrader
 
 ROOT=Path(__file__).resolve().parent
 DATA_DIR=Path(os.getenv("DATA_DIR",str(ROOT/"data")))
@@ -48,6 +49,7 @@ async def main():
     setmeta(cx,"liquid_symbols",",".join(sorted(liquid_symbols)))
     setmeta(cx,"paper_start_usd",os.getenv("BBB_PAPER_START_USD","500"))
     cx.commit()
+    trader=PaperTrader(cx,session,float(os.getenv("BBB_PAPER_START_USD","500")),launch_symbols)
 
     q=asyncio.Queue(maxsize=int(os.getenv("BBB_MAX_QUEUE","100000")))
     stop=asyncio.Event(); books={s:LocalBook(s) for s in symbols}; fx=FeatureEngine()
@@ -96,6 +98,7 @@ async def main():
                     head="LAUNCH" if symbol in launch_symbols else ("LIQUID" if symbol in liquid_symbols else "VOL")
                     score=baseline_score(snap); gate=GATES[head]
                     state="SHADOW_PASS" if score>=gate else "GATED"
+                    trader.on_snapshot(symbol,head,snap,books[symbol],books[symbol].exchange_ts_ms,recv)
                     cx.execute("""INSERT INTO feature_samples(
                       ts_ms,exchange_ts_ms,session_id,symbol,head,mid,bid,ask,spread_bps,
                       depth_bid_5_usd,depth_ask_5_usd,book_imbalance_5,trade_count_1s,trade_count_5s,
