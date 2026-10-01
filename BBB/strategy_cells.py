@@ -80,9 +80,46 @@ def projected_edge_bps(side:str,score:float,gate:float,f:dict) -> float:
     score_margin=max(0.0,score-gate)
     return aligned + min(20.0,rv*6.0) + score_margin*0.8
 
+def sizing_tier(pol:CellPolicy,side:str,score:float,regime:str,f:dict,expected_cost_bps:float,projected_edge:float) -> tuple[str,float,float]:
+    """Return (tier, multiplier, confidence 0..100).
+
+    Sizing uses only information known before entry. "PRIME" means higher-confidence,
+    never certainty. Weak-but-valid setups get smaller size instead of equal risk.
+    """
+    score_margin=max(0.0,score-pol.gate)
+    edge_surplus=max(0.0,projected_edge-(expected_cost_bps*pol.cost_mult+pol.cost_buffer_bps))
+    edge_ratio=projected_edge/max(1.0,expected_cost_bps)
+    spread=float(f.get("spread_bps",0))
+    spread_quality=max(0.0,1.0-spread/max(0.001,pol.max_spread_bps))
+    imb=abs(float(f.get("book_imbalance_5",0)))
+    flow=abs(float(f.get("buy_ratio_1s",0.5))-0.5)*2.0
+    regime_bonus=1.0 if regime=="IMPULSE" else (0.65 if regime=="TREND" else 0.0)
+
+    confidence=min(100.0,
+        35.0
+        + min(25.0,score_margin*2.0)
+        + min(20.0,edge_surplus*1.5)
+        + 8.0*spread_quality
+        + 6.0*min(1.0,imb)
+        + 4.0*min(1.0,flow)
+        + 2.0*regime_bonus
+    )
+
+    # Progressive paper sizing: doubtful-but-valid setups stay small; only strongly
+    # overqualified setups receive the top multiplier.
+    if confidence>=82 and score_margin>=8 and edge_ratio>=1.65 and regime=="IMPULSE":
+        return "PRIME",2.00,confidence
+    if confidence>=70 and score_margin>=5 and edge_ratio>=1.40:
+        return "STRONG",1.50,confidence
+    if confidence>=58 and edge_ratio>=1.20:
+        return "BASE",1.00,confidence
+    return "CAUTIOUS",0.50,confidence
+
 def policies_json() -> str:
     return json.dumps({p.cell:{
         "gate":p.gate,"tp_bps":p.take_profit_bps,"sl_bps":p.stop_loss_bps,
         "hold_ms":p.max_hold_ms,"spread_max_bps":p.max_spread_bps,
         "cost_mult":p.cost_mult,"cost_buffer_bps":p.cost_buffer_bps,
-        "regimes":list(p.allow_regimes)} for p in POLICIES.values()},separators=(",",":"))
+        "regimes":list(p.allow_regimes),
+        "sizing":"CAUTIOUS 0.5x / BASE 1x / STRONG 1.5x / PRIME 2x"
+        } for p in POLICIES.values()},separators=(",",":"))
