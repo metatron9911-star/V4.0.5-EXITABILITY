@@ -43,3 +43,15 @@ See:
 - `schema.sql`
 - `engine.py`
 
+
+
+## Telemetry retention
+
+To keep the Railway volume bounded, BBB does not persist every raw exchange message.
+Runtime defaults:
+- feature snapshots persisted every 1000 ms per symbol;
+- lightweight market evidence every 5000 ms per symbol;
+- rolling retention window 24 h;
+- latency percentiles are maintained in memory and published through meta telemetry.
+
+These can be adjusted with `BBB_FEATURE_PERSIST_MS`, `BBB_MARKET_PERSIST_MS`, and `BBB_RETENTION_HOURS`.
