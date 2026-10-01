@@ -52,7 +52,11 @@ async def main():
     q=asyncio.Queue(maxsize=int(os.getenv("BBB_MAX_QUEUE","100000")))
     stop=asyncio.Event(); books={s:LocalBook(s) for s in symbols}; fx=FeatureEngine()
     source_ages=deque(maxlen=10000); processing=deque(maxlen=10000)
-    last_sample=defaultdict(int); dropped=0
+    last_sample=defaultdict(int); last_market_sample=defaultdict(int); dropped=0
+    feature_persist_ms=int(os.getenv("BBB_FEATURE_PERSIST_MS","1000"))
+    market_persist_ms=int(os.getenv("BBB_MARKET_PERSIST_MS","5000"))
+    retention_hours=int(os.getenv("BBB_RETENTION_HOURS","24"))
+    last_maintenance=0
 
     async def on_event(ev):
         nonlocal dropped
@@ -77,13 +81,16 @@ async def main():
                 books[symbol].apply(ev.get("type"),data,exch)
                 fx.on_book(symbol,int(data.get("cts") or exch or recv),books[symbol])
 
-            # Persist light normalized market evidence, not the full raw message.
-            cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
-                          VALUES(?,?,?,?,?,?,?,?)""",
-                       (recv,exch,session,None,symbol,"MARKET",topic,
-                        json.dumps({"type":ev.get("type"),"receive_ts_ms":recv},separators=(",",":"))))
+            # Do not persist every exchange message: Bybit can emit thousands/sec.
+            # Keep a lightweight sampled evidence trail; latency counters remain in memory/meta.
+            if now_ms()-last_market_sample[symbol] >= market_persist_ms:
+                cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                              VALUES(?,?,?,?,?,?,?,?)""",
+                           (recv,exch,session,None,symbol,"MARKET_SAMPLE",topic,
+                            json.dumps({"type":ev.get("type"),"receive_ts_ms":recv},separators=(",",":"))))
+                last_market_sample[symbol]=now_ms()
 
-            if symbol in books and now_ms()-last_sample[symbol]>=250:
+            if symbol in books and now_ms()-last_sample[symbol]>=feature_persist_ms:
                 snap=fx.snapshot(symbol,now_ms(),books[symbol])
                 if snap:
                     head="LAUNCH" if symbol in launch_symbols else ("LIQUID" if symbol in liquid_symbols else "VOL")
@@ -108,6 +115,14 @@ async def main():
                 setmeta(cx,"queue_depth",q.qsize()); setmeta(cx,"dropped",dropped)
                 setmeta(cx,"source_age_p50_ms",round(pct(source_ages,.50),2)); setmeta(cx,"source_age_p99_ms",round(pct(source_ages,.99),2))
                 setmeta(cx,"processing_p50_ms",round(pct(processing,.50),2)); setmeta(cx,"processing_p99_ms",round(pct(processing,.99),2))
+                # Rolling retention prevents telemetry from filling the Railway volume.
+                if now_ms()-last_maintenance >= 60000:
+                    cutoff=now_ms()-retention_hours*3600*1000
+                    cx.execute("DELETE FROM events WHERE ts_ms < ?",(cutoff,))
+                    cx.execute("DELETE FROM feature_samples WHERE ts_ms < ?",(cutoff,))
+                    cx.execute("DELETE FROM equity_samples WHERE ts_ms < ?",(cutoff,))
+                    cx.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    last_maintenance=now_ms()
                 cx.commit(); last_hb=now_ms()
     finally:
         stop.set(); await feed_task; cx.commit(); cx.close()
