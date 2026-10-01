@@ -37,12 +37,16 @@ class FeedHealth:
 class BybitPublicFeed:
     def __init__(self, symbols: Iterable[str], on_event: Callable[[dict], Awaitable[None]]):
         self.symbols = sorted({s.upper() for s in symbols})
+        self.desired_symbols = set(self.symbols)
         self.on_event = on_event
         self.health = FeedHealth()
 
-    def topics(self) -> list[str]:
+    def set_symbols(self, symbols: Iterable[str]) -> None:
+        self.desired_symbols = {s.upper() for s in symbols}
+
+    def topics_for(self, symbols: Iterable[str]) -> list[str]:
         out = []
-        for s in self.symbols:
+        for s in sorted(set(symbols)):
             out.extend([
                 f"publicTrade.{s}",
                 f"orderbook.1.{s}",
@@ -50,6 +54,9 @@ class BybitPublicFeed:
                 f"tickers.{s}",
             ])
         return out
+
+    def topics(self) -> list[str]:
+        return self.topics_for(self.symbols)
 
     async def run(self, stop: asyncio.Event) -> None:
         backoff = 1.0
@@ -66,7 +73,17 @@ class BybitPublicFeed:
                     self.health.connected = True
                     backoff = 1.0
                     while not stop.is_set():
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        # Apply universe changes without restarting the service.
+                        desired=set(self.desired_symbols)
+                        current=set(self.symbols)
+                        add=desired-current; remove=current-desired
+                        if add:
+                            await ws.send(json.dumps({"op":"subscribe","args":self.topics_for(add)}))
+                        if remove:
+                            await ws.send(json.dumps({"op":"unsubscribe","args":self.topics_for(remove)}))
+                        if add or remove:
+                            self.symbols=sorted(desired)
+                        raw = await asyncio.wait_for(ws.recv(), timeout=5)
                         recv_ms = now_ms()
                         msg = json.loads(raw)
                         if "topic" not in msg:
