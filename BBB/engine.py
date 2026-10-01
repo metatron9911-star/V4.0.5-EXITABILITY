@@ -142,6 +142,10 @@ class Position:
     funding_usd: float = 0.0
     mae_pct: float = 0.0
     mfe_pct: float = 0.0
+    mfe_ms: int = 0
+    mae_ms: int = 0
+    tail_armed: bool = False
+    tail_arm_ms: int = 0
 
 
 class PaperBook:
@@ -187,6 +191,8 @@ class PaperBook:
             opened_ms=now_ms(),
             signal=signal,
             entry_fee_usd=fee,
+            mfe_ms=now_ms(),
+            mae_ms=now_ms(),
         )
         self.positions[position_id] = p
         return p
