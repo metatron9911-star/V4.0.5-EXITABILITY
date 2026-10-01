@@ -71,11 +71,18 @@ def board():
     tcols[4].metric("Fees $",f"{float(meta.get('fees_usd','0')):.2f}")
     tcols[5].metric("Profit wallet $",f"{float(meta.get('profit_wallet_usd','0')):.2f}")
 
-    recent=db.execute("""SELECT head,symbol,side,status,margin_usd,notional_usd,entry_vwap,exit_vwap,net_pnl_usd,exit_reason,opened_ms,closed_ms
+    recent=db.execute("""SELECT head,symbol,side,status,margin_usd,notional_usd,entry_vwap,exit_vwap,net_pnl_usd,exit_reason,
+                                opened_ms,closed_ms,risk_state,entry_features_json
                          FROM trades WHERE session_id=? ORDER BY id DESC LIMIT 20""",(session,)).fetchall()
-    st.dataframe([{"head":r[0],"symbol":r[1],"side":r[2],"status":r[3],"margin_$":r[4],"notional_$":r[5],
-                   "entry":r[6],"exit":r[7],"net_$":r[8],"reason":r[9],"opened_ms":r[10],"closed_ms":r[11]} for r in recent],
-                 hide_index=True,width="stretch")
+    rr=[]
+    for r in recent:
+        try: ef=json.loads(r[13] or "{}")
+        except Exception: ef={}
+        rr.append({"head":r[0],"symbol":r[1],"side":r[2],"status":r[3],
+                   "tier":ef.get("sizing_tier","—"),"conf":round(float(ef.get("confidence",0)),1),
+                   "size_x":ef.get("size_multiplier","—"),"margin_$":r[4],"notional_$":r[5],
+                   "entry":r[6],"exit":r[7],"net_$":r[8],"reason":r[9],"state":r[12]})
+    st.dataframe(rr,hide_index=True,width="stretch")
 
     st.subheader("Strategy cells")
     try:
