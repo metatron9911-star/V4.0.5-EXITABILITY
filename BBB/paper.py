@@ -11,7 +11,7 @@ from typing import Dict
 from engine import PaperBook, SignalSnapshot, HeadName, ProductClass, BYBIT_FEES, now_ms
 from orderbook import LocalBook
 from sanitizer import Sanitizer
-from strategy_cells import POLICIES, classify_regime, directional_scores, projected_edge_bps, policies_json
+from strategy_cells import POLICIES, classify_regime, directional_scores, projected_edge_bps, sizing_tier, policies_json
 
 class PaperTrader:
     def __init__(self, cx: sqlite3.Connection, session_id: str, start_usd: float, launch_symbols:set[str]):
@@ -104,11 +104,6 @@ class PaperTrader:
                              json.dumps({"side":side,"score":score,"features":san_features},separators=(",",":"))))
             self._write_wallet_meta()
             return
-        margin=max(1.0,self.start_usd*pol.margin_fraction)
-        notional=margin*self.leverage
-        entry_vwap,filled=book.walk_vwap(side,notional)
-        if not entry_vwap or filled<notional*0.999:return
-
         product=self._product(symbol)
         fee_bps=BYBIT_FEES[product].taker_bps
         expected_cost=2*fee_bps+float(f.get("spread_bps",0))
@@ -122,6 +117,16 @@ class PaperTrader:
                                          "required_bps":required_cost_edge,"expected_cost_bps":expected_cost},
                                         separators=(",",":"))))
             return
+
+        tier,size_mult,confidence=sizing_tier(pol,side,score,regime,f,expected_cost,edge)
+        base_margin=max(1.0,self.start_usd*pol.margin_fraction)
+        margin=max(1.0,base_margin*size_mult)
+        # Never let one PAPER position consume more than 5% of the original bank.
+        margin=min(margin,self.start_usd*0.05)
+        notional=margin*self.leverage
+        entry_vwap,filled=book.walk_vwap(side,notional)
+        if not entry_vwap or filled<notional*0.999:return
+
         sig=SignalSnapshot(
             exchange_ts_ms=int(exchange_ts_ms or 0),
             receive_ts_ms=int(receive_ts_ms or now_ms()),
@@ -129,9 +134,10 @@ class PaperTrader:
             symbol=symbol,head=self._head_enum(head),product_class=product,
             score=score,gate=pol.gate,bid=float(book.best_bid or 0),ask=float(book.best_ask or 0),
             expected_entry_vwap=float(entry_vwap),spread_bps=float(f.get("spread_bps",0)),
-            expected_roundtrip_cost_bps=expected_cost,risk_state=f"{pol.cell}|{regime}",
+            expected_roundtrip_cost_bps=expected_cost,risk_state=f"{pol.cell}|{regime}|{tier}",
             features={**dict(f),"strategy_cell":pol.cell,"regime":regime,
-                      "projected_edge_bps":edge,"required_cost_edge_bps":required_cost_edge},
+                      "projected_edge_bps":edge,"required_cost_edge_bps":required_cost_edge,
+                      "sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence},
         )
         pid=str(uuid.uuid4())
         pos=self.book.open_position(pid,sig,side,self.leverage,margin,float(entry_vwap),maker=False)
@@ -146,10 +152,12 @@ class PaperTrader:
              sig.exchange_ts_ms,sig.receive_ts_ms,sig.signal_ts_ms,sig.signal_ts_ms,now_ms(),
              float(f["mid"]),sig.bid,sig.ask,sig.expected_entry_vwap,pos.entry_vwap,
              pos.entry_fee_usd,sig.source_age_ms,sig.processing_ms,max(0,now_ms()-sig.signal_ts_ms),
-             score,pol.gate,f"{pol.cell}|{regime}",json.dumps({**f,"strategy_cell":pol.cell,"regime":regime,
-                 "projected_edge_bps":edge,"required_cost_edge_bps":required_cost_edge},separators=(",",":")),"OPEN",pos.opened_ms))
+             score,pol.gate,f"{pol.cell}|{regime}|{tier}",json.dumps({**f,"strategy_cell":pol.cell,"regime":regime,
+                 "projected_edge_bps":edge,"required_cost_edge_bps":required_cost_edge,
+                 "sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence},separators=(",",":")),"OPEN",pos.opened_ms))
         self._ledger("TRADING",head,pid,"OPEN_MARGIN",-margin-pos.entry_fee_usd,self.book.wallets.trading_cash_usd,
-                     {"side":side,"symbol":symbol,"entry_vwap":entry_vwap,"notional":notional})
+                     {"side":side,"symbol":symbol,"entry_vwap":entry_vwap,"notional":notional,
+                      "sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence})
         self._write_wallet_meta()
 
     def _manage_open(self,p,f,book):
