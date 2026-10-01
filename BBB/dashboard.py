@@ -77,6 +77,14 @@ def board():
                    "entry":r[6],"exit":r[7],"net_$":r[8],"reason":r[9],"opened_ms":r[10],"closed_ms":r[11]} for r in recent],
                  hide_index=True,width="stretch")
 
+    st.subheader("Strategy cells")
+    try:
+        cells=json.loads(meta.get("strategy_cells_json","{}"))
+    except Exception:
+        cells={}
+    if cells:
+        st.dataframe([{"cell":k,**v} for k,v in cells.items()],hide_index=True,width="stretch")
+
     st.subheader("Sanitizer")
     sc=st.columns(3)
     sc[0].metric("Rejected",meta.get("sanitizer_rejects","0"))
