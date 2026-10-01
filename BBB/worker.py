@@ -48,6 +48,9 @@ async def main():
     setmeta(cx,"symbols",",".join(symbols)); setmeta(cx,"launch_symbols",",".join(sorted(launch_symbols)))
     setmeta(cx,"liquid_symbols",",".join(sorted(liquid_symbols)))
     setmeta(cx,"paper_start_usd",os.getenv("BBB_PAPER_START_USD","500"))
+    # Any open rows from an older paper session are bookkeeping leftovers after a deliberate reset.
+    cx.execute("""UPDATE trades SET status='ABANDONED', exit_reason='SESSION_RESET', closed_ms=?
+                  WHERE status='OPEN' AND session_id<>?""",(now_ms(),session))
     cx.commit()
     trader=PaperTrader(cx,session,float(os.getenv("BBB_PAPER_START_USD","500")),launch_symbols)
 
