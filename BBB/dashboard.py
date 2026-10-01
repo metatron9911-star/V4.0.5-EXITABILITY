@@ -40,6 +40,18 @@ def board():
                       FROM feature_samples WHERE id IN
                       (SELECT MAX(id) FROM feature_samples GROUP BY symbol)
                       ORDER BY head,symbol""").fetchall()
+    st.subheader("Dynamic VOL universe")
+    try:
+        uni=json.loads(meta.get("vol_universe_json","[]"))
+    except Exception:
+        uni=[]
+    if uni:
+        st.dataframe([{"symbol":x.get("symbol"),"bucket":x.get("bucket"),
+                       "turnover24h_$":round(float(x.get("turnover24h",0)),0),
+                       "range24h_bps":round(float(x.get("range_bps",0)),0),
+                       "abs_change24h_bps":round(float(x.get("abs_change_bps",0)),0)}
+                      for x in uni],hide_index=True,width="stretch")
+
     st.subheader("Heads / signals")
     st.dataframe([{
         "symbol":r[0],"head":r[1],"age_ms":now-r[2],"mid":r[3],"spread_bps":round(r[4] or 0,3),
