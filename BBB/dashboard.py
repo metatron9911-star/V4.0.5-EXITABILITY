@@ -56,13 +56,14 @@ def board():
     cols[2].metric("Symbols",meta.get("symbols","—"))
     cols[3].metric("DB events",db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
     cols[4].metric("Feature samples",db.execute("SELECT COUNT(*) FROM feature_samples").fetchone()[0])
-    cols[5].metric("Open positions",db.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'").fetchone()[0])
+    session=meta.get("session_id","")
+    cols[5].metric("Open positions",db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='OPEN'",(session,)).fetchone()[0])
 
     st.subheader("Paper trading")
     tcols=st.columns(6)
-    closed=db.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED'").fetchone()[0]
-    wins=db.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED' AND net_pnl_usd>0").fetchone()[0]
-    losses=db.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED' AND net_pnl_usd<=0").fetchone()[0]
+    closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED'",(session,)).fetchone()[0]
+    wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND net_pnl_usd>0",(session,)).fetchone()[0]
+    losses=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND net_pnl_usd<=0",(session,)).fetchone()[0]
     tcols[0].metric("Entries","ON" if meta.get("paper_entries_enabled","0")=="1" else "OFF")
     tcols[1].metric("Closed",closed)
     tcols[2].metric("W/L",f"{wins}/{losses}")
@@ -71,10 +72,29 @@ def board():
     tcols[5].metric("Profit wallet $",f"{float(meta.get('profit_wallet_usd','0')):.2f}")
 
     recent=db.execute("""SELECT head,symbol,side,status,margin_usd,notional_usd,entry_vwap,exit_vwap,net_pnl_usd,exit_reason,opened_ms,closed_ms
-                         FROM trades ORDER BY id DESC LIMIT 20""").fetchall()
+                         FROM trades WHERE session_id=? ORDER BY id DESC LIMIT 20""",(session,)).fetchall()
     st.dataframe([{"head":r[0],"symbol":r[1],"side":r[2],"status":r[3],"margin_$":r[4],"notional_$":r[5],
                    "entry":r[6],"exit":r[7],"net_$":r[8],"reason":r[9],"opened_ms":r[10],"closed_ms":r[11]} for r in recent],
                  hide_index=True,width="stretch")
+
+    st.subheader("Sanitizer")
+    sc=st.columns(3)
+    sc[0].metric("Rejected",meta.get("sanitizer_rejects","0"))
+    sc[1].metric("Winner retention target",">= 90%")
+    try:
+        rules=json.loads(meta.get("sanitizer_rules_json","{}"))
+    except Exception:
+        rules={}
+    sc[2].metric("Active rules",sum(len(v) for v in rules.values()))
+    if rules:
+        rr=[]
+        for k,vals in rules.items():
+            for r in vals:
+                rr.append({"head/side":k,"rule":f"{r['feature']} {r['op']} {r['threshold']:.6g}",
+                           "losers_removed":r["losers_removed"],"winners_removed":r["winners_removed"],
+                           "winner_retention":round(r["winner_retention"],3),
+                           "ΔPESB":round(r["delta_pesb"],6)})
+        st.dataframe(rr,hide_index=True,width="stretch")
 
     st.subheader("Wallets")
     start=float(meta.get("paper_start_usd","500"))
