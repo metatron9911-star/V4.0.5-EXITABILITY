@@ -11,24 +11,7 @@ from typing import Dict
 from engine import PaperBook, SignalSnapshot, HeadName, ProductClass, BYBIT_FEES, now_ms
 from orderbook import LocalBook
 from sanitizer import Sanitizer
-
-@dataclass(frozen=True)
-class HeadPolicy:
-    gate: float
-    margin_fraction: float
-    max_open: int
-    cooldown_ms: int
-    take_profit_bps: float
-    stop_loss_bps: float
-    max_hold_ms: int
-    max_spread_bps: float
-    min_trades_1s: int
-
-POLICIES = {
-    "LIQUID": HeadPolicy(60.0,0.020,3,15_000,30.0,22.0,120_000,2.0,2),
-    "VOL":    HeadPolicy(65.0,0.015,4,20_000,70.0,45.0,120_000,12.0,1),
-    "LAUNCH": HeadPolicy(70.0,0.010,2,30_000,120.0,80.0,90_000,30.0,0),
-}
+from strategy_cells import POLICIES, classify_regime, directional_scores, projected_edge_bps, policies_json
 
 class PaperTrader:
     def __init__(self, cx: sqlite3.Connection, session_id: str, start_usd: float, launch_symbols:set[str]):
@@ -66,14 +49,6 @@ class PaperTrader:
             if p.symbol==symbol:return p
         return None
 
-    def _directional_scores(self,f:dict) -> tuple[float,float]:
-        momentum=max(-20.0,min(20.0,float(f.get("ret_1s_bps",0))))
-        imbalance=float(f.get("book_imbalance_5",0))*15.0
-        flow=(float(f.get("buy_ratio_1s",0.5))-0.5)*20.0
-        spread_penalty=min(20.0,float(f.get("spread_bps",0))*2.0)
-        impulse=momentum+imbalance+flow
-        return 50.0+impulse-spread_penalty, 50.0-impulse-spread_penalty
-
     def _write_wallet_meta(self):
         w=self.book.wallets
         meta={
@@ -87,6 +62,7 @@ class PaperTrader:
             "paper_open_positions":str(len(self.book.positions)),
             "sanitizer_rejects":str(self.sanitizer_rejects),
             "sanitizer_rules_json":self.sanitizer.as_json(),
+            "strategy_cells_json":policies_json(),
         }
         for k,v in meta.items():
             self.cx.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",(k,v))
@@ -104,16 +80,17 @@ class PaperTrader:
             self._manage_open(p,f,book)
             return
 
-        pol=POLICIES[head]
+        long_score,short_score=directional_scores(head,f)
+        side="BUY" if long_score>=short_score else "SELL"
+        score=max(long_score,short_score)
+        pol=POLICIES[(head,side)]
         if self._head_count(head)>=pol.max_open:return
         if now_ms()-self.last_close_ms.get(symbol,0)<pol.cooldown_ms:return
         if float(f.get("spread_bps",9999))>pol.max_spread_bps:return
         if int(f.get("trade_count_1s",0))<pol.min_trades_1s:return
-
-        long_score,short_score=self._directional_scores(f)
-        if max(long_score,short_score)<pol.gate:return
-        side="BUY" if long_score>=short_score else "SELL"
-        score=max(long_score,short_score)
+        if score<pol.gate:return
+        regime=classify_regime(f)
+        if regime not in pol.allow_regimes:return
         san_features=dict(f)
         san_features["entry_score"]=score
         san_features["source_age_ms"]=max(0,int(receive_ts_ms or now_ms())-int(exchange_ts_ms or 0)) if exchange_ts_ms else 0
@@ -135,6 +112,16 @@ class PaperTrader:
         product=self._product(symbol)
         fee_bps=BYBIT_FEES[product].taker_bps
         expected_cost=2*fee_bps+float(f.get("spread_bps",0))
+        edge=projected_edge_bps(side,score,pol.gate,f)
+        required_cost_edge=expected_cost*pol.cost_mult+pol.cost_buffer_bps
+        if edge<required_cost_edge:
+            self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (now_ms(),exchange_ts_ms,self.session_id,head,symbol,"COST_GATE_REJECT",pol.cell,
+                             json.dumps({"side":side,"regime":regime,"edge_bps":edge,
+                                         "required_bps":required_cost_edge,"expected_cost_bps":expected_cost},
+                                        separators=(",",":"))))
+            return
         sig=SignalSnapshot(
             exchange_ts_ms=int(exchange_ts_ms or 0),
             receive_ts_ms=int(receive_ts_ms or now_ms()),
@@ -142,8 +129,9 @@ class PaperTrader:
             symbol=symbol,head=self._head_enum(head),product_class=product,
             score=score,gate=pol.gate,bid=float(book.best_bid or 0),ask=float(book.best_ask or 0),
             expected_entry_vwap=float(entry_vwap),spread_bps=float(f.get("spread_bps",0)),
-            expected_roundtrip_cost_bps=expected_cost,risk_state="CALIBRATION",
-            features=dict(f),
+            expected_roundtrip_cost_bps=expected_cost,risk_state=f"{pol.cell}|{regime}",
+            features={**dict(f),"strategy_cell":pol.cell,"regime":regime,
+                      "projected_edge_bps":edge,"required_cost_edge_bps":required_cost_edge},
         )
         pid=str(uuid.uuid4())
         pos=self.book.open_position(pid,sig,side,self.leverage,margin,float(entry_vwap),maker=False)
@@ -158,7 +146,8 @@ class PaperTrader:
              sig.exchange_ts_ms,sig.receive_ts_ms,sig.signal_ts_ms,sig.signal_ts_ms,now_ms(),
              float(f["mid"]),sig.bid,sig.ask,sig.expected_entry_vwap,pos.entry_vwap,
              pos.entry_fee_usd,sig.source_age_ms,sig.processing_ms,max(0,now_ms()-sig.signal_ts_ms),
-             score,pol.gate,"CALIBRATION",json.dumps(f,separators=(",",":")),"OPEN",pos.opened_ms))
+             score,pol.gate,f"{pol.cell}|{regime}",json.dumps({**f,"strategy_cell":pol.cell,"regime":regime,
+                 "projected_edge_bps":edge,"required_cost_edge_bps":required_cost_edge},separators=(",",":")),"OPEN",pos.opened_ms))
         self._ledger("TRADING",head,pid,"OPEN_MARGIN",-margin-pos.entry_fee_usd,self.book.wallets.trading_cash_usd,
                      {"side":side,"symbol":symbol,"entry_vwap":entry_vwap,"notional":notional})
         self._write_wallet_meta()
@@ -169,7 +158,7 @@ class PaperTrader:
         move_bps=direction*(mid/p.entry_vwap-1.0)*10000
         p.mfe_pct=max(p.mfe_pct,move_bps/100)
         p.mae_pct=min(p.mae_pct,move_bps/100)
-        pol=POLICIES[p.head.value]
+        pol=POLICIES[(p.head.value,p.side)]
         age=now_ms()-p.opened_ms
         reason=None
         if move_bps>=pol.take_profit_bps:reason="TAKE_PROFIT"
