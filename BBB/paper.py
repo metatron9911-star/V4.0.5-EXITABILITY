@@ -72,7 +72,7 @@ class PaperTrader:
                            VALUES(?,?,?,?,?,?,?,?,?)""",
                         (now_ms(),self.session_id,wallet,head,position_id,kind,amount,balance,json.dumps(detail,separators=(",",":"))))
 
-    def on_snapshot(self,symbol:str,head:str,f:dict,book:LocalBook,exchange_ts_ms:int,receive_ts_ms:int):
+    def on_snapshot(self,symbol:str,head:str,f:dict,book:LocalBook,exchange_ts_ms:int,receive_ts_ms:int,bucket:str="FAST"):
         if not self.enabled or not book.synced or not book.mid:
             return
         p=self._position_for_symbol(symbol)
@@ -83,7 +83,7 @@ class PaperTrader:
         long_score,short_score=directional_scores(head,f)
         side="BUY" if long_score>=short_score else "SELL"
         score=max(long_score,short_score)
-        pol=POLICIES[(head,side)]
+        pol=POLICIES[(bucket,side)]
         if self._head_count(head)>=pol.max_open:return
         if now_ms()-self.last_close_ms.get(symbol,0)<pol.cooldown_ms:return
         if float(f.get("spread_bps",9999))>pol.max_spread_bps:return
@@ -92,6 +92,7 @@ class PaperTrader:
         regime=classify_regime(f)
         if regime not in pol.allow_regimes:return
         san_features=dict(f)
+        san_features["vol_bucket"]=bucket
         san_features["entry_score"]=score
         san_features["source_age_ms"]=max(0,int(receive_ts_ms or now_ms())-int(exchange_ts_ms or 0)) if exchange_ts_ms else 0
         san_features["processing_ms"]=0
@@ -137,7 +138,7 @@ class PaperTrader:
             expected_roundtrip_cost_bps=expected_cost,risk_state=f"{pol.cell}|{regime}|{tier}",
             features={**dict(f),"strategy_cell":pol.cell,"regime":regime,
                       "projected_edge_bps":edge,"required_cost_edge_bps":required_cost_edge,
-                      "sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence},
+                      "vol_bucket":bucket,"sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence},
         )
         pid=str(uuid.uuid4())
         pos=self.book.open_position(pid,sig,side,self.leverage,margin,float(entry_vwap),maker=False)
@@ -153,7 +154,7 @@ class PaperTrader:
              float(f["mid"]),sig.bid,sig.ask,sig.expected_entry_vwap,pos.entry_vwap,
              pos.entry_fee_usd,sig.source_age_ms,sig.processing_ms,max(0,now_ms()-sig.signal_ts_ms),
              score,pol.gate,f"{pol.cell}|{regime}|{tier}",json.dumps({**f,"strategy_cell":pol.cell,"regime":regime,
-                 "projected_edge_bps":edge,"required_cost_edge_bps":required_cost_edge,
+                 "projected_edge_bps":edge,"required_cost_edge_bps":required_cost_edge,"vol_bucket":bucket,
                  "sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence},separators=(",",":")),"OPEN",pos.opened_ms))
         self._ledger("TRADING",head,pid,"OPEN_MARGIN",-margin-pos.entry_fee_usd,self.book.wallets.trading_cash_usd,
                      {"side":side,"symbol":symbol,"entry_vwap":entry_vwap,"notional":notional,
@@ -166,7 +167,12 @@ class PaperTrader:
         move_bps=direction*(mid/p.entry_vwap-1.0)*10000
         p.mfe_pct=max(p.mfe_pct,move_bps/100)
         p.mae_pct=min(p.mae_pct,move_bps/100)
-        pol=POLICIES[(p.head.value,p.side)]
+        try:
+            ef=p.signal.features or {}
+            bucket=str(ef.get("vol_bucket","FAST"))
+        except Exception:
+            bucket="FAST"
+        pol=POLICIES[(bucket,p.side)]
         age=now_ms()-p.opened_ms
         reason=None
         if move_bps>=pol.take_profit_bps:reason="TAKE_PROFIT"
