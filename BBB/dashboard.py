@@ -130,6 +130,7 @@ def board():
     m[5].metric("Retention",meta.get("retention_policy","—"))
 
     st.subheader("Dynamic VOL universe")
+    st.caption("Source: "+meta.get("vol_universe_source","—") + ((" · REST: "+meta.get("vol_universe_error","")) if meta.get("vol_universe_error") else ""))
     try: uni=json.loads(meta.get("vol_universe_json","[]"))
     except Exception: uni=[]
     if not uni:
