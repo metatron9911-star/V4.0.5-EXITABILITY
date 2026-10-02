@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio, json, math, os, urllib.parse, urllib.request
 from dataclasses import dataclass, asdict
 
-BASE="https://api.bybit.com"
+BASES=["https://api.bybit.com","https://api.bytick.com"]
 
 @dataclass(frozen=True)
 class Candidate:
@@ -20,13 +20,19 @@ class Candidate:
     score:float
 
 def _get(path:str,params:dict) -> dict:
-    url=BASE+path+"?"+urllib.parse.urlencode(params)
-    req=urllib.request.Request(url,headers={"User-Agent":"BBB-VOL-Scanner/1.0"})
-    with urllib.request.urlopen(req,timeout=15) as r:
-        obj=json.loads(r.read().decode("utf-8"))
-    if int(obj.get("retCode",0))!=0:
-        raise RuntimeError(f"Bybit REST error: {obj.get('retMsg')}")
-    return obj
+    last=None
+    for base in BASES:
+        try:
+            url=base+path+"?"+urllib.parse.urlencode(params)
+            req=urllib.request.Request(url,headers={"User-Agent":"BBB-VOL-Scanner/1.0"})
+            with urllib.request.urlopen(req,timeout=15) as r:
+                obj=json.loads(r.read().decode("utf-8"))
+            if int(obj.get("retCode",0))!=0:
+                raise RuntimeError(f"Bybit REST error: {obj.get('retMsg')}")
+            return obj
+        except Exception as e:
+            last=e
+    raise RuntimeError(f"all Bybit REST hosts failed: {last}")
 
 def _scan_sync() -> list[Candidate]:
     tickers=_get("/v5/market/tickers",{"category":"linear"}).get("result",{}).get("list",[])
@@ -55,20 +61,20 @@ def _scan_sync() -> list[Candidate]:
         rng=max(0.0,(hi-lo)/last*10000)
         # Large turnover is mandatory; range rewards actual movement.
         rank=math.log10(max(turn,1))*max(1.0,rng)
-        bucket=None
-        if turn>=100_000_000 and rng>=300:
+        # Initial bucket is deliberately permissive. Real-time velocity/volatility
+        # gates in worker.py decide if the instrument is actually tradable now.
+        if turn>=100_000_000:
             bucket="CORE"
-        elif turn>=10_000_000 and rng>=1200:
+        elif rng>=1000:
             bucket="EXTREME"
-        elif turn>=25_000_000 and rng>=500:
+        else:
             bucket="FAST"
-        if bucket:
-            rows.append(Candidate(s,bucket,turn,rng,ch,oi,rank))
+        rows.append(Candidate(s,bucket,turn,rng,ch,oi,rank))
 
     limits={
-        "CORE":int(os.getenv("BBB_VOL_CORE_N","4")),
-        "FAST":int(os.getenv("BBB_VOL_FAST_N","5")),
-        "EXTREME":int(os.getenv("BBB_VOL_EXTREME_N","3")),
+        "CORE":int(os.getenv("BBB_VOL_CORE_N","6")),
+        "FAST":int(os.getenv("BBB_VOL_FAST_N","8")),
+        "EXTREME":int(os.getenv("BBB_VOL_EXTREME_N","5")),
     }
     out=[]
     used=set()
