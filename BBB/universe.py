@@ -37,7 +37,7 @@ def _get(path:str,params:dict) -> dict:
         try:
             url=base+path+"?"+urllib.parse.urlencode(params)
             req=urllib.request.Request(url,headers={"User-Agent":"BBB-VOL-Scanner/1.0"})
-            with urllib.request.urlopen(req,timeout=15) as r:
+            with urllib.request.urlopen(req,timeout=4) as r:
                 obj=json.loads(r.read().decode("utf-8"))
             if int(obj.get("retCode",0))!=0:
                 raise RuntimeError(f"Bybit REST error: {obj.get('retMsg')}")
