@@ -259,11 +259,12 @@ class PaperTrader:
         if move_bps<old_mae:
             p.mae_pct=move_bps/100.0
             p.mae_ms=now
+        ef={}
         try:
             ef=p.signal.features or {}
-            bucket=str(ef.get("vol_bucket","FAST"))
         except Exception:
-            bucket="FAST"
+            ef={}
+        bucket=str(ef.get("vol_bucket","FAST"))
         pol=POLICIES[(bucket,p.side)]
         age=now-p.opened_ms
         mfe_bps=p.mfe_pct*100.0
