@@ -153,7 +153,8 @@ class PaperTrader:
         if sizing["reject"]:
             self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
                                VALUES(?,?,?,?,?,?,?,?)""",
-                            (now_ms(),exchange_ts_ms,self.session_id,head,symbol,"SIZING_REJECT","LOW_SIZING_SCORE",
+                            (now_ms(),exchange_ts_ms,self.session_id,head,symbol,"SIZING_REJECT",
+                             str(sizing.get("reject_reason") or "LOW_SIZING_SCORE"),
                              json.dumps({"side":side,"bucket":bucket,"regime":regime,**sizing},separators=(",",":"))))
             return
         tier=str(sizing["tier"])
