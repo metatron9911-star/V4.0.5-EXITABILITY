@@ -11,7 +11,7 @@ from market_bybit import BybitPublicFeed, now_ms
 from orderbook import LocalBook
 from features import FeatureEngine, classify_head, baseline_score
 from paper import PaperTrader
-from universe import scan_vol_universe, universe_json
+from universe import scan_vol_universe, fallback_vol_universe, universe_json
 
 ROOT=Path(__file__).resolve().parent
 DATA_DIR=Path(os.getenv("DATA_DIR",str(ROOT/"data")))
@@ -64,16 +64,30 @@ def live_vol_state(snap:dict,rest_bucket:str) -> tuple[str,bool,float]:
 async def main():
     cx=connect()
     old=dict(cx.execute("SELECT key,value FROM meta").fetchall()).get("session_id")
-    session=os.getenv("BBB_SESSION_ID") or old or str(uuid.uuid4())
+    requested_session=os.getenv("BBB_SESSION_ID") or old or str(uuid.uuid4())
+    # Never mix two runtime boots into the same paper accounting session. If the
+    # requested session already contains trades, create a restart segment.
+    prior_n=cx.execute("SELECT COUNT(*) FROM trades WHERE session_id=?",(requested_session,)).fetchone()[0]
+    if prior_n:
+        session=f"{requested_session}-R{int(time.time())}"
+    else:
+        session=requested_session
     configured=[x.strip().upper() for x in os.getenv("BBB_SYMBOLS","").split(",") if x.strip()]
     dynamic=os.getenv("BBB_VOL_DYNAMIC_UNIVERSE","1").lower() in {"1","true","yes","on"}
     universe=[]
+    universe_source="CONFIGURED"
     if dynamic:
         try:
             universe=await scan_vol_universe()
-            if not universe: setmeta(cx,"vol_universe_error","scanner_empty_fallback")
+            if universe:
+                universe_source="BYBIT_REST"
+            else:
+                universe=fallback_vol_universe()
+                universe_source="FALLBACK_LIVE_POOL"
+                setmeta(cx,"vol_universe_error","scanner_empty_using_live_pool")
         except Exception as e:
-            universe=[]
+            universe=fallback_vol_universe()
+            universe_source="FALLBACK_LIVE_POOL"
             setmeta(cx,"vol_universe_error",str(e)[:300])
     symbols=[x.symbol for x in universe] or configured or ["HYPEUSDT","GRASSUSDT","STRKUSDT","ZROUSDT"]
     bucket_map={x.symbol:x.bucket for x in universe}
@@ -84,6 +98,8 @@ async def main():
     setmeta(cx,"symbols",",".join(symbols)); setmeta(cx,"launch_symbols","")
     setmeta(cx,"liquid_symbols",""); setmeta(cx,"vol_universe_json",universe_json(universe))
     setmeta(cx,"vol_dynamic","1" if dynamic else "0")
+    setmeta(cx,"vol_universe_source",universe_source)
+    setmeta(cx,"runtime_base_session",requested_session)
     setmeta(cx,"paper_start_usd",os.getenv("BBB_PAPER_START_USD","500"))
     # Any open rows from an older paper session are bookkeeping leftovers after a deliberate reset.
     cx.execute("""UPDATE trades SET status='ABANDONED', exit_reason='SESSION_RESET', closed_ms=?
@@ -172,6 +188,7 @@ async def main():
                 try:
                     fresh=await scan_vol_universe()
                     if fresh:
+                        universe_source="BYBIT_REST"
                         new_symbols=[x.symbol for x in fresh]
                         for s in new_symbols:
                             if s not in books: books[s]=LocalBook(s)
@@ -184,6 +201,7 @@ async def main():
                         setmeta(cx,"symbols",",".join(new_symbols))
                         setmeta(cx,"vol_universe_json",universe_json(fresh))
                         setmeta(cx,"vol_universe_updated_ms",now_ms())
+                        setmeta(cx,"vol_universe_source",universe_source)
                         setmeta(cx,"vol_universe_error","")
                 except Exception as e:
                     setmeta(cx,"vol_universe_error",str(e)[:300])
