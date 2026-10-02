@@ -33,6 +33,7 @@ class PaperTrader:
             min_losers_removed=int(os.getenv("BBB_SANITIZER_MIN_LOSERS_REMOVED","2")),
         )
         self.sanitizer_rejects=0
+        self.elc_shadows=[]
         self._write_wallet_meta()
 
     def _product(self,symbol:str) -> ProductClass:
@@ -72,12 +73,15 @@ class PaperTrader:
                            VALUES(?,?,?,?,?,?,?,?,?)""",
                         (now_ms(),self.session_id,wallet,head,position_id,kind,amount,balance,json.dumps(detail,separators=(",",":"))))
 
-    def on_snapshot(self,symbol:str,head:str,f:dict,book:LocalBook,exchange_ts_ms:int,receive_ts_ms:int,bucket:str="FAST"):
+    def on_snapshot(self,symbol:str,head:str,f:dict,book:LocalBook,exchange_ts_ms:int,receive_ts_ms:int,bucket:str="FAST",allow_new_entries:bool=True):
         if not self.enabled or not book.synced or not book.mid:
             return
+        self._update_elc_shadows(symbol,book)
         p=self._position_for_symbol(symbol)
         if p:
             self._manage_open(p,f,book)
+            return
+        if not allow_new_entries:
             return
 
         long_score,short_score=directional_scores(head,f)
@@ -161,6 +165,39 @@ class PaperTrader:
                       "sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence})
         self._write_wallet_meta()
 
+    def _update_elc_shadows(self,symbol:str,book:LocalBook):
+        if not self.elc_shadows or not book.mid:
+            return
+        now=now_ms()
+        keep=[]
+        checkpoints=((10_000,1,10),(30_000,2,30),(60_000,4,60))
+        for s in self.elc_shadows:
+            if s["symbol"]!=symbol:
+                if now-s["cut_ms"]<=65_000: keep.append(s)
+                continue
+            sign=1.0 if s["side"]=="BUY" else -1.0
+            ret=sign*(float(book.mid)/float(s["entry_vwap"])-1.0)*10000
+            s["max_after_bps"]=max(float(s["max_after_bps"]),ret)
+            s["min_after_bps"]=min(float(s["min_after_bps"]),ret)
+            age=now-s["cut_ms"]
+            for ms,bit,sec in checkpoints:
+                if age>=ms and not (int(s["mask"]) & bit):
+                    s["mask"]=int(s["mask"])|bit
+                    recovered=ret>0 or float(s["max_after_bps"])>0
+                    self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                                       VALUES(?,?,?,?,?,?,?,?)""",
+                                    (now,book.exchange_ts_ms,self.session_id,"VOL",symbol,"ELC_COUNTERFACTUAL",f"{sec}s",
+                                     json.dumps({"position_id":s["position_id"],"side":s["side"],
+                                                 "cut_move_bps":s["cut_move_bps"],
+                                                 "mfe_bps_at_cut":s["mfe_bps_at_cut"],
+                                                 "mae_bps_at_cut":s["mae_bps_at_cut"],
+                                                 "cf_return_bps":ret,
+                                                 "cf_max_after_bps":s["max_after_bps"],
+                                                 "cf_min_after_bps":s["min_after_bps"],
+                                                 "recovered":recovered},separators=(",",":"))))
+            if age<=60_000: keep.append(s)
+        self.elc_shadows=keep
+
     def _manage_open(self,p,f,book):
         mid=float(book.mid or p.entry_vwap)
         direction=1.0 if p.side=="BUY" else -1.0
@@ -211,8 +248,8 @@ class PaperTrader:
         )
         early_loser_cut=(not winner_veto) and r2_confirm
 
-        # Right-tail collector. Once a winner reaches nominal TP with continuing
-        # order-flow, keep it as a runner and exit only on a meaningful pullback.
+        # Right-tail collector. Arm before nominal TP when direction remains strongly
+        # aligned, then protect a positive floor and trail the right tail.
         momentum_aligned=max(
             sign*float(f.get("ret_250ms_bps",0)),
             sign*float(f.get("ret_1s_bps",0)),
@@ -224,7 +261,8 @@ class PaperTrader:
             and current_flow>-0.05
             and current_imb>-0.20
         )
-        if (not p.tail_armed) and mfe_bps>=pol.take_profit_bps and continuation:
+        tail_arm_trigger=0.68*pol.take_profit_bps
+        if (not p.tail_armed) and mfe_bps>=tail_arm_trigger and continuation:
             p.tail_armed=True
             p.tail_arm_ms=now
             self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
@@ -235,7 +273,10 @@ class PaperTrader:
                                         separators=(",",":"))))
 
         from_peak_bps=mfe_bps-move_bps
-        tail_trail_bps=max(0.35*pol.take_profit_bps,0.30*max(mfe_bps,pol.take_profit_bps))
+        tail_trail_bps=max(0.30*pol.take_profit_bps,0.26*max(mfe_bps,pol.take_profit_bps))
+        # Once armed, do not allow a captured winner to decay back through costs.
+        expected_cost=float(ef.get("required_cost_edge_bps",0) or 0)
+        tail_profit_floor_bps=max(0.18*pol.take_profit_bps,0.65*expected_cost)
         tail_timeout=pol.max_hold_ms*3
 
         reason=None
@@ -243,6 +284,8 @@ class PaperTrader:
             reason="STOP_LOSS"
         elif early_loser_cut:
             reason="EARLY_LOSER_CUT"
+        elif p.tail_armed and move_bps<=tail_profit_floor_bps:
+            reason="RIGHT_TAIL_FLOOR"
         elif p.tail_armed and from_peak_bps>=tail_trail_bps:
             reason="RIGHT_TAIL_TRAIL"
         elif (not p.tail_armed) and move_bps>=pol.take_profit_bps:
@@ -269,8 +312,16 @@ class PaperTrader:
                      {"reason":reason,"exit_vwap":exit_vwap,"net_pnl":net,
                       "mfe_bps":mfe_bps,"mae_bps":mae_bps,"move_bps":move_bps,
                       "tail_armed":p.tail_armed,"tail_trail_bps":tail_trail_bps,
+                      "tail_profit_floor_bps":tail_profit_floor_bps,
                       "early_loser_confirmed":early_loser_cut,"winner_veto":winner_veto})
         self.last_close_ms[p.symbol]=now_ms()
+        if reason=="EARLY_LOSER_CUT":
+            self.elc_shadows.append({
+                "position_id":p.position_id,"symbol":p.symbol,"side":p.side,
+                "entry_vwap":p.entry_vwap,"cut_ms":now_ms(),
+                "cut_move_bps":move_bps,"mfe_bps_at_cut":mfe_bps,"mae_bps_at_cut":mae_bps,
+                "max_after_bps":move_bps,"min_after_bps":move_bps,"mask":0,
+            })
 
         # RHB-style reserve wallet: skim half of trading cash above start+trigger.
         excess=w.trading_cash_usd-(self.start_usd+self.skim_trigger)
