@@ -1,6 +1,6 @@
 """BBB H2 dashboard — RP7-style operational panel."""
 from __future__ import annotations
-import json, os, sqlite3, time
+import json, os, sqlite3, time, statistics
 from collections import defaultdict
 from pathlib import Path
 import streamlit as st
@@ -226,7 +226,91 @@ def board():
             "avg_loss_$":round(s["loss_sum"]/l,5) if l else 0,
         })
     if report: st.dataframe(report,hide_index=True,**_DF_KW)
-    else: st.caption("Waiting for H2 trades")
+    else: st.caption("Waiting for H3 trades")
+
+    # --- Frozen H3 analysis snapshot ---
+    # Analyze the requested/base session even after a restart creates a -R runtime segment.
+    analysis_sid=meta.get("runtime_base_session") or session
+    st.subheader("H3 analysis snapshot")
+    st.caption("Analysis session: "+analysis_sid)
+
+    analysis_rows=db.execute("""SELECT net_pnl_usd,entry_features_json,exit_reason
+                                FROM trades
+                                WHERE session_id=? AND status='CLOSED'""",
+                             (analysis_sid,)).fetchall()
+
+    if analysis_rows:
+        # 1) Tier distribution + sizing score percentiles.
+        a_stats=defaultdict(lambda:{"n":0,"w":0,"pnl":0.0,"nets":[]})
+        a_scores=[]
+        for pnl,js,reason in analysis_rows:
+            ef=safe_json(js)
+            tier=str(ef.get("sizing_tier","UNKNOWN"))
+            x=float(pnl or 0)
+            s=a_stats[tier]
+            s["n"]+=1; s["pnl"]+=x; s["nets"].append(x)
+            if x>0:s["w"]+=1
+            try:a_scores.append(float(ef.get("sizing_score",0) or 0))
+            except Exception:pass
+
+        a_report=[]
+        for tier in order:
+            s=a_stats.get(tier)
+            if not s or not s["n"]:continue
+            n=s["n"]; w=s["w"]; l=n-w
+            a_report.append({
+                "tier":tier,
+                "N":n,
+                "W/L":f"{w}/{l}",
+                "WR_%":round(w/n*100,1),
+                "total_net_$":round(s["pnl"],5),
+                "expectancy_$":round(s["pnl"]/n,6),
+                "median_net_$":round(statistics.median(s["nets"]),6),
+            })
+        st.markdown("**Tier distribution**")
+        st.dataframe(a_report,hide_index=True,**_DF_KW)
+
+        if a_scores:
+            a_scores=sorted(a_scores)
+            def pct(vals,p):
+                i=min(len(vals)-1,max(0,int((len(vals)-1)*p)))
+                return vals[i]
+            pcols=st.columns(6)
+            pcols[0].metric("Score N",len(a_scores))
+            pcols[1].metric("p50",f"{pct(a_scores,.50):.2f}")
+            pcols[2].metric("p75",f"{pct(a_scores,.75):.2f}")
+            pcols[3].metric("p90",f"{pct(a_scores,.90):.2f}")
+            pcols[4].metric("p95",f"{pct(a_scores,.95):.2f}")
+            pcols[5].metric("max",f"{a_scores[-1]:.2f}")
+
+        # 2) Tail vs TP economics.
+        kinds={"TAIL":[],"TP":[],"OTHER":[]}
+        for pnl,js,reason in analysis_rows:
+            x=float(pnl or 0)
+            rs=str(reason or "")
+            k="TAIL" if rs.startswith("RIGHT_TAIL") else ("TP" if rs=="TAKE_PROFIT" else "OTHER")
+            kinds[k].append(x)
+
+        k_report=[]
+        for k,xs in kinds.items():
+            if not xs:continue
+            ys=sorted(xs); n=len(ys)
+            def q(p):
+                i=min(n-1,max(0,int((n-1)*p)))
+                return ys[i]
+            k_report.append({
+                "kind":k,
+                "N":n,
+                "mean_$":round(sum(ys)/n,6),
+                "median_$":round(statistics.median(ys),6),
+                "p25_$":round(q(.25),6),
+                "p75_$":round(q(.75),6),
+                "total_net_$":round(sum(ys),5),
+            })
+        st.markdown("**TAIL vs TP**")
+        st.dataframe(k_report,hide_index=True,**_DF_KW)
+    else:
+        st.caption("No closed trades in analysis session yet.")
 
     st.subheader("Strategy cells")
     cells=safe_json(meta.get("strategy_cells_json","{}"))
