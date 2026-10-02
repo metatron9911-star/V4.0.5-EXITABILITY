@@ -1,7 +1,7 @@
-"""BBB strategy cells v1.
+"""BBB VOL strategy cells H2.
 
-Six independent policy cells: product class × direction.
-Shared market feed/execution/accounting; independent entry/exit/regime parameters.
+Direction-aware entry scoring + winner/loser risk decomposition + progressive sizing.
+PAPER only; no exchange execution path.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -34,6 +34,16 @@ POLICIES={
     ("EXTREME","SELL"):CellPolicy("VOL-EXTREME-SHORT","VOL","SELL",70.0,0.010,2,30_000,130.0,75.0,120_000,18.0,1,1.20,5.0,("IMPULSE",)),
 }
 
+TIER_MULTIPLIERS={
+    "MICRO":0.35,
+    "CAUTIOUS":0.50,
+    "BASE":0.85,
+    "GOOD":1.15,
+    "STRONG":1.50,
+    "PRIME":2.00,
+    "ELITE":2.50,
+}
+
 def classify_regime(f:dict) -> str:
     r250=abs(float(f.get("ret_250ms_bps",0)))
     r1=abs(float(f.get("ret_1s_bps",0)))
@@ -55,80 +65,177 @@ def directional_scores(head:str,f:dict) -> tuple[float,float]:
     imb=float(f.get("book_imbalance_5",0))
     flow=(float(f.get("buy_ratio_1s",0.5))-0.5)*2.0
     spread=float(f.get("spread_bps",0))
-    # Liquid emphasizes persistent order-flow; VOL emphasizes acceleration/tails;
-    # Launch demands larger directional displacement and penalizes spread hardest.
-    if head=="LIQUID":
-        impulse=0.8*r250 + 1.2*r1 + 0.25*r5 + 10*imb + 10*flow
-        penalty=min(12.0,spread*1.5)
-    elif head=="VOL":
+    if head=="VOL":
         impulse=1.2*r250 + 1.3*r1 + 0.35*r5 + 8*imb + 8*flow
         penalty=min(15.0,spread*1.2)
     else:
-        impulse=1.0*r250 + 1.5*r1 + 0.5*r5 + 6*imb + 6*flow
-        penalty=min(22.0,spread*1.5)
+        impulse=1.0*r250 + 1.0*r1 + 0.25*r5 + 7*imb + 7*flow
+        penalty=min(18.0,spread*1.3)
     impulse=max(-30.0,min(30.0,impulse))
     return 50.0+impulse-penalty, 50.0-impulse-penalty
 
-def projected_edge_bps(side:str,score:float,gate:float,f:dict) -> float:
-    """Directional edge only. Volatility is opportunity, never free edge."""
+def directional_features(side:str,f:dict) -> dict:
     sign=1.0 if side=="BUY" else -1.0
     d250=sign*float(f.get("ret_250ms_bps",0))
     d1=sign*float(f.get("ret_1s_bps",0))
     d5=sign*float(f.get("ret_5s_bps",0))
     dimb=sign*float(f.get("book_imbalance_5",0))
     dflow=sign*(float(f.get("buy_ratio_1s",0.5))-0.5)*2.0
-    # Require persistence/alignment: opposing flow/book subtract from expected edge.
-    motion=max(0.0,0.9*d250 + 0.9*d1 + 0.20*d5)
-    alignment=6.0*max(-1.0,min(1.0,dimb)) + 5.0*max(-1.0,min(1.0,dflow))
+    vals=(d250,d1,dflow,dimb)
+    return {
+        "dir_ret_250ms_bps":d250,
+        "dir_ret_1s_bps":d1,
+        "dir_ret_5s_bps":d5,
+        "dir_flow":dflow,
+        "dir_imbalance":dimb,
+        "aligned_count":sum(1 for x in vals if x>0),
+        "opposing_count":sum(1 for x in vals if x<0),
+    }
+
+def projected_edge_bps(side:str,score:float,gate:float,f:dict) -> float:
+    """Directional edge only; realized volatility is opportunity, not edge."""
+    d=directional_features(side,f)
+    motion=max(0.0,
+        0.95*d["dir_ret_250ms_bps"]
+        + 0.90*d["dir_ret_1s_bps"]
+        + 0.20*d["dir_ret_5s_bps"]
+    )
+    alignment=(
+        6.0*max(-1.0,min(1.0,d["dir_imbalance"]))
+        + 5.0*max(-1.0,min(1.0,d["dir_flow"]))
+    )
     score_margin=max(0.0,score-gate)
-    return max(0.0,motion + alignment + score_margin*0.55)
+    return max(0.0,motion+alignment+score_margin*0.55)
 
-def sizing_tier(pol:CellPolicy,side:str,score:float,regime:str,f:dict,expected_cost_bps:float,projected_edge:float) -> tuple[str,float,float]:
-    """Return (tier, multiplier, confidence 0..100).
-
-    Sizing uses only information known before entry. "PRIME" means higher-confidence,
-    never certainty. Weak-but-valid setups get smaller size instead of equal risk.
-    """
+def winner_loser_scores(
+    pol:CellPolicy,
+    side:str,
+    score:float,
+    regime:str,
+    f:dict,
+    required_cost_edge_bps:float,
+    projected_edge:float,
+    history_penalty:float=0.0,
+) -> dict:
+    d=directional_features(side,f)
     score_margin=max(0.0,score-pol.gate)
-    edge_surplus=max(0.0,projected_edge-(expected_cost_bps*pol.cost_mult+pol.cost_buffer_bps))
-    edge_ratio=projected_edge/max(1.0,expected_cost_bps)
-    spread=float(f.get("spread_bps",0))
-    spread_quality=max(0.0,1.0-spread/max(0.001,pol.max_spread_bps))
-    sign=1.0 if side=="BUY" else -1.0
-    dimb=sign*float(f.get("book_imbalance_5",0))
-    dflow=sign*(float(f.get("buy_ratio_1s",0.5))-0.5)*2.0
-    d250=sign*float(f.get("ret_250ms_bps",0))
-    d1=sign*float(f.get("ret_1s_bps",0))
-    aligned_count=sum(1 for x in (dimb,dflow,d250,d1) if x>0)
-    opposing_count=sum(1 for x in (dimb,dflow,d250,d1) if x<0)
-    regime_bonus=1.0 if regime=="IMPULSE" else (0.65 if regime=="TREND" else 0.0)
+    edge_ratio=projected_edge/max(1e-6,required_cost_edge_bps)
+    spread=float(f.get("spread_bps",0) or 0)
+    spread_ratio=spread/max(0.001,pol.max_spread_bps)
+    spread_quality=1.0 if spread_ratio<=0.40 else (0.5 if spread_ratio<=0.70 else (0.0 if spread_ratio<=1.0 else -1.0))
 
-    confidence=max(0.0,min(100.0,
-        30.0
-        + min(22.0,score_margin*1.7)
-        + min(22.0,edge_surplus*1.4)
-        + 8.0*spread_quality
-        + 7.0*max(-1.0,min(1.0,dimb))
-        + 6.0*max(-1.0,min(1.0,dflow))
-        + 3.0*regime_bonus
-        + 2.0*aligned_count
-        - 5.0*opposing_count
+    bid_depth=float(f.get("depth_bid_5_usd",0) or 0)
+    ask_depth=float(f.get("depth_ask_5_usd",0) or 0)
+    near_depth=min(bid_depth,ask_depth)
+    depth_quality="GOOD" if near_depth>=20_000 else ("OK" if near_depth>=2_000 else "BAD")
+    depth_score=8.0 if depth_quality=="GOOD" else (3.0 if depth_quality=="OK" else -6.0)
+
+    motion_score=(
+        1.0*max(0.0,d["dir_ret_250ms_bps"])
+        + 1.0*max(0.0,d["dir_ret_1s_bps"])
+        + 0.4*max(0.0,d["dir_ret_5s_bps"])
+    )
+    alignment_score=(
+        8.0*max(-1.0,min(1.0,d["dir_flow"]))
+        + 8.0*max(-1.0,min(1.0,d["dir_imbalance"]))
+    )
+    score_margin_score=min(20.0,score_margin*1.5)
+    if edge_ratio>=2.0: cost_score=20.0
+    elif edge_ratio>=1.6: cost_score=14.0
+    elif edge_ratio>=1.3: cost_score=8.0
+    elif edge_ratio>=1.1: cost_score=3.0
+    else: cost_score=-8.0
+
+    regime_score=10.0 if regime=="IMPULSE" else (6.0 if regime=="TREND" else -4.0)
+    trade_now=bool(int(f.get("live_trade_ok",1) or 0))
+    live_activity=float(f.get("live_activity_score",0) or 0)
+    activity_score=8.0 if trade_now else -6.0
+
+    winner_score=max(0.0,min(100.0,
+        20.0 + motion_score + alignment_score + score_margin_score + cost_score
+        + 5.0*spread_quality + depth_score + regime_score + activity_score
     ))
 
-    # High size requires directional agreement, not merely a large absolute signal.
-    if confidence>=84 and score_margin>=8 and edge_ratio>=1.70 and regime=="IMPULSE" and aligned_count>=3 and opposing_count==0:
-        return "PRIME",2.00,confidence
-    if confidence>=72 and score_margin>=5 and edge_ratio>=1.45 and aligned_count>=3 and opposing_count<=1:
-        return "STRONG",1.50,confidence
-    if confidence>=60 and edge_ratio>=1.25 and aligned_count>=2:
-        return "BASE",1.00,confidence
-    return "CAUTIOUS",0.50,confidence
+    mixed_penalty=d["opposing_count"]*10.0
+    if edge_ratio<1.05: edge_risk=25.0
+    elif edge_ratio<1.20: edge_risk=15.0
+    elif edge_ratio<1.35: edge_risk=8.0
+    else: edge_risk=0.0
+
+    market_quality_risk=0.0
+    if spread_ratio>1.0: market_quality_risk+=18.0
+    elif spread_ratio>0.75: market_quality_risk+=8.0
+    if depth_quality=="BAD": market_quality_risk+=14.0
+    regime_risk=0.0 if regime in {"TREND","IMPULSE"} else 10.0
+    activity_risk=0.0 if trade_now else 12.0
+
+    loser_risk=max(0.0,min(100.0,
+        mixed_penalty + edge_risk + market_quality_risk + regime_risk + activity_risk + max(0.0,history_penalty)
+    ))
+    sizing_score=winner_score-loser_risk
+
+    return {
+        **d,
+        "edge_ratio":edge_ratio,
+        "spread_quality":spread_quality,
+        "depth_quality":depth_quality,
+        "winner_score":winner_score,
+        "loser_risk":loser_risk,
+        "sizing_score":sizing_score,
+        "history_penalty":history_penalty,
+        "live_activity_score":live_activity,
+        "trade_now":trade_now,
+    }
+
+def size_decision(
+    pol:CellPolicy,
+    side:str,
+    score:float,
+    regime:str,
+    f:dict,
+    required_cost_edge_bps:float,
+    projected_edge:float,
+    history_penalty:float=0.0,
+) -> dict:
+    q=winner_loser_scores(pol,side,score,regime,f,required_cost_edge_bps,projected_edge,history_penalty)
+    s=q["sizing_score"]
+    if s<5:
+        tier,mult,reject="REJECT",0.0,True
+    elif s<15:
+        tier,mult,reject="MICRO",TIER_MULTIPLIERS["MICRO"],False
+    elif s<25:
+        tier,mult,reject="CAUTIOUS",TIER_MULTIPLIERS["CAUTIOUS"],False
+    elif s<40:
+        tier,mult,reject="BASE",TIER_MULTIPLIERS["BASE"],False
+    elif s<55:
+        tier,mult,reject="GOOD",TIER_MULTIPLIERS["GOOD"],False
+    elif s<70:
+        tier,mult,reject="STRONG",TIER_MULTIPLIERS["STRONG"],False
+    elif s<85:
+        tier,mult,reject="PRIME",TIER_MULTIPLIERS["PRIME"],False
+    else:
+        tier,mult,reject="ELITE",TIER_MULTIPLIERS["ELITE"],False
+
+    # Safety caps: big size only when the market actually agrees with the trade.
+    violations=0
+    if q["opposing_count"]>0: violations+=1
+    if not q["trade_now"]: violations+=1
+    if q["edge_ratio"]<1.45: violations+=1
+    if regime!="IMPULSE": violations+=1
+    if q["spread_quality"]<0: violations+=1
+    if violations>=2 and mult>TIER_MULTIPLIERS["BASE"]:
+        tier,mult="BASE",TIER_MULTIPLIERS["BASE"]
+    elif violations==1 and mult>TIER_MULTIPLIERS["GOOD"]:
+        tier,mult="GOOD",TIER_MULTIPLIERS["GOOD"]
+
+    q.update({"tier":tier,"size_multiplier":mult,"reject":reject,"sizing_violations":violations})
+    return q
 
 def policies_json() -> str:
+    ladder="MICRO .35x / CAUTIOUS .5x / BASE .85x / GOOD 1.15x / STRONG 1.5x / PRIME 2x / ELITE 2.5x"
     return json.dumps({p.cell:{
         "gate":p.gate,"tp_bps":p.take_profit_bps,"sl_bps":p.stop_loss_bps,
         "hold_ms":p.max_hold_ms,"spread_max_bps":p.max_spread_bps,
         "cost_mult":p.cost_mult,"cost_buffer_bps":p.cost_buffer_bps,
-        "regimes":list(p.allow_regimes),
-        "sizing":"CAUTIOUS 0.5x / BASE 1x / STRONG 1.5x / PRIME 2x"
-        } for p in POLICIES.values()},separators=(",",":"))
+        "regimes":list(p.allow_regimes),"sizing":ladder
+    } for p in POLICIES.values()},separators=(",",":"))
