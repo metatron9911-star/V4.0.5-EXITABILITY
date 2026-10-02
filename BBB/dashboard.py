@@ -63,6 +63,10 @@ def board():
     now=int(time.time()*1000)
     meta=dict(db.execute("SELECT key,value FROM meta").fetchall())
     session=meta.get("session_id","")
+    session_start_ms=int(meta.get("session_start_ms","0") or 0)
+    elapsed_ms=max(0,now-session_start_ms) if session_start_ms else 0
+    elapsed_s=elapsed_ms//1000
+    session_time=f"{elapsed_s//3600:02d}:{(elapsed_s%3600)//60:02d}:{elapsed_s%60:02d}"
     hb=int(meta.get("heartbeat_ms","0") or 0)
     feed_state=meta.get("feed_state","STARTING")
     reconnects=meta.get("reconnects","0")
@@ -99,7 +103,9 @@ def board():
         f"<div class='rp7-wallet-strip'>"
         f"<span class='lbl'>Trading wallet</span> <span class='val'>USD {trading_cash:.2f}</span>"
         f" &nbsp;|&nbsp; "
-        f"<span class='lbl'>Session</span> <span class='val'>{session[-18:] if session else '—'}</span>"
+        f"<span class='lbl'>Session</span> <span class='val'>{session if session else '—'}</span>"
+        f" &nbsp;|&nbsp; "
+        f"<span class='lbl'>Session time</span> <span class='val'>{session_time}</span>"
         f"</div>",
         unsafe_allow_html=True
     )
@@ -182,7 +188,7 @@ def board():
             "loser_risk":round(float(ef.get("loser_risk",0) or 0),1),
             "size_score":round(float(ef.get("sizing_score",0) or 0),1),
             "edge_ratio":round(float(ef.get("edge_ratio",0) or 0),2),
-            "aligned":ef.get("aligned_count","—"),"opposed":ef.get("opposing_count","—"),
+            "aligned":str(ef.get("aligned_count","—")),"opposed":str(ef.get("opposing_count","—")),
             "size_x":ef.get("size_multiplier","—"),"margin_$":r[4],"notional_$":r[5],
             "entry":r[6],"exit":r[7],"net_$":r[8],"reason":r[9],
             "MFE_bps":round(float(r[15] or 0)*100,1),"MAE_bps":round(float(r[14] or 0)*100,1),
