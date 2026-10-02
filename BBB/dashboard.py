@@ -309,6 +309,85 @@ def board():
             })
         st.markdown("**TAIL vs TP**")
         st.dataframe(k_report,hide_index=True,**_DF_KW)
+
+        # 3) Deep tier diagnostics: MICRO/CAUTIOUS/GOOD/STRONG/PRIME/ELITE.
+        diag_tiers=["MICRO","CAUTIOUS","BASE","GOOD","STRONG","PRIME","ELITE"]
+        diag=defaultdict(lambda:{
+            "n":0,"w":0,"nets":[],"holds":[],"buckets":defaultdict(int),
+            "regimes":defaultdict(int),"exits":defaultdict(int),
+            "impulse":0,
+            "sums":defaultdict(float),
+        })
+        feat_fields=["edge_ratio","loser_risk","winner_score","sizing_score",
+                     "opposing_count","spread_quality","history_penalty","sizing_violations"]
+        # Pull hold time via timestamps to avoid relying on a dedicated hold_ms column.
+        drows=db.execute("""SELECT net_pnl_usd,exit_reason,opened_ms,closed_ms,entry_features_json
+                            FROM trades
+                            WHERE session_id=? AND status='CLOSED'""",
+                         (analysis_sid,)).fetchall()
+        for pnl,reason,opened_ms,closed_ms,js in drows:
+            ef=safe_json(js)
+            tier=str(ef.get("sizing_tier","UNKNOWN"))
+            if tier not in diag_tiers: continue
+            x=float(pnl or 0)
+            a=diag[tier]
+            a["n"]+=1; a["nets"].append(x)
+            if x>0:a["w"]+=1
+            if opened_ms and closed_ms:
+                try:a["holds"].append(max(0,int(closed_ms)-int(opened_ms)))
+                except Exception:pass
+            bucket=str(ef.get("vol_bucket","—"))
+            regime=str(ef.get("regime","—"))
+            a["buckets"][bucket]+=1
+            a["regimes"][regime]+=1
+            a["exits"][str(reason or "—")]+=1
+            if regime=="IMPULSE":a["impulse"]+=1
+            for f in feat_fields:
+                try:a["sums"][f]+=float(ef.get(f,0) or 0)
+                except Exception:pass
+
+        st.markdown("**Tier diagnostics — why MICRO / PRIME / ELITE differ**")
+        diag_report=[]
+        for tier in diag_tiers:
+            a=diag.get(tier)
+            if not a or not a["n"]: continue
+            n=a["n"]; w=a["w"]; nets=sorted(a["nets"])
+            row={
+                "tier":tier,"N":n,"W/L":f"{w}/{n-w}","WR_%":round(100*w/n,1),
+                "avg_net_$":round(sum(nets)/n,6),
+                "median_net_$":round(statistics.median(nets),6),
+                "median_hold_ms":round(statistics.median(a["holds"]),0) if a["holds"] else 0,
+                "IMPULSE_%":round(100*a["impulse"]/n,1),
+            }
+            for f in feat_fields:
+                row["avg_"+f]=round(a["sums"][f]/n,3)
+            row["buckets"]="; ".join(f"{k}:{v}" for k,v in sorted(a["buckets"].items()))
+            row["regimes"]="; ".join(f"{k}:{v}" for k,v in sorted(a["regimes"].items()))
+            row["exits"]="; ".join(f"{k}:{v}" for k,v in sorted(a["exits"].items()))
+            diag_report.append(row)
+        if diag_report:
+            st.dataframe(diag_report,hide_index=True,**_DF_KW)
+
+        # Focused comparison table for the main question.
+        focus=[]
+        for tier in ["MICRO","CAUTIOUS","PRIME","ELITE"]:
+            a=diag.get(tier)
+            if not a or not a["n"]: continue
+            n=a["n"]; w=a["w"]
+            focus.append({
+                "tier":tier,"N":n,"WR_%":round(100*w/n,1),
+                "avg_edge_ratio":round(a["sums"]["edge_ratio"]/n,3),
+                "avg_loser_risk":round(a["sums"]["loser_risk"]/n,3),
+                "avg_winner_score":round(a["sums"]["winner_score"]/n,3),
+                "avg_opposing":round(a["sums"]["opposing_count"]/n,3),
+                "avg_spread_quality":round(a["sums"]["spread_quality"]/n,3),
+                "avg_history_penalty":round(a["sums"]["history_penalty"]/n,3),
+                "avg_violations":round(a["sums"]["sizing_violations"]/n,3),
+                "IMPULSE_%":round(100*a["impulse"]/n,1),
+            })
+        if focus:
+            st.markdown("**Focused PRIME vs ELITE / MICRO vs CAUTIOUS**")
+            st.dataframe(focus,hide_index=True,**_DF_KW)
     else:
         st.caption("No closed trades in analysis session yet.")
 
