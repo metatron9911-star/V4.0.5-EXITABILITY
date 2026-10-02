@@ -34,17 +34,20 @@ def board():
     green=hb and now-hb<10000 and feed_state=="CONNECTED"
     st.markdown(("🟢" if green else "🔴")+f" **BYBIT PUBLIC WS {feed_state}** | messages {msgs} | reconnects {reconnects} | queue {qdepth} | src p50/p99 {src_p50}/{src_p99} ms | proc p50/p99 {proc_p50}/{proc_p99} ms")
 
+    session=meta.get("session_id","")
     rows=db.execute("""SELECT symbol,head,ts_ms,mid,spread_bps,depth_bid_5_usd,depth_ask_5_usd,
                       book_imbalance_5,trade_count_1s,buy_ratio_1s,ret_1s_bps,realized_vol_5s_bps,
-                      score,gate,state
-                      FROM feature_samples WHERE id IN
-                      (SELECT MAX(id) FROM feature_samples GROUP BY symbol)
-                      ORDER BY head,symbol""").fetchall()
+                      score,gate,state,payload_json
+                      FROM feature_samples WHERE session_id=? AND id IN
+                      (SELECT MAX(id) FROM feature_samples WHERE session_id=? GROUP BY symbol)
+                      ORDER BY head,symbol""",(session,session)).fetchall()
     st.subheader("Dynamic VOL universe")
     try:
         uni=json.loads(meta.get("vol_universe_json","[]"))
     except Exception:
         uni=[]
+    if not uni:
+        st.caption("Universe scanner fallback: "+(meta.get("vol_universe_error") or "no candidates"))
     if uni:
         st.dataframe([{"symbol":x.get("symbol"),"bucket":x.get("bucket"),
                        "turnover24h_$":round(float(x.get("turnover24h",0)),0),
@@ -53,13 +56,19 @@ def board():
                       for x in uni],hide_index=True,width="stretch")
 
     st.subheader("Heads / signals")
-    st.dataframe([{
-        "symbol":r[0],"head":r[1],"age_ms":now-r[2],"mid":r[3],"spread_bps":round(r[4] or 0,3),
-        "bid_depth5_$":round(r[5] or 0,0),"ask_depth5_$":round(r[6] or 0,0),
-        "imbalance":round(r[7] or 0,3),"trades_1s":r[8],"buy_ratio":round(r[9] or 0,3),
-        "ret_1s_bps":round(r[10] or 0,2),"rv_5s_bps":round(r[11] or 0,2),
-        "score":round(r[12] or 0,1),"gate":r[13],"state":r[14]
-    } for r in rows],hide_index=True,width="stretch")
+    head_rows=[]
+    for r in rows:
+        try: payload=json.loads(r[15] or "{}")
+        except Exception: payload={}
+        head_rows.append({
+            "symbol":r[0],"head":r[1],"age_ms":now-r[2],"mid":r[3],"spread_bps":round(r[4] or 0,3),
+            "bid_depth5_$":round(r[5] or 0,0),"ask_depth5_$":round(r[6] or 0,0),
+            "imbalance":round(r[7] or 0,3),"trades_1s":r[8],"buy_ratio":round(r[9] or 0,3),
+            "ret_1s_bps":round(r[10] or 0,2),"rv_5s_bps":round(r[11] or 0,2),
+            "activity":round(float(payload.get("live_activity_score",0)),1),
+            "trade_now":"YES" if payload.get("live_trade_ok") else "NO",
+            "score":round(r[12] or 0,1),"gate":r[13],"state":r[14]})
+    st.dataframe(head_rows,hide_index=True,width="stretch")
 
     st.subheader("Machine state")
     cols=st.columns(6)
@@ -68,11 +77,10 @@ def board():
     cols[2].metric("Symbols",meta.get("symbols","—"))
     cols[3].metric("DB events",db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
     cols[4].metric("Feature samples",db.execute("SELECT COUNT(*) FROM feature_samples").fetchone()[0])
-    session=meta.get("session_id","")
     cols[5].metric("Open positions",db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='OPEN'",(session,)).fetchone()[0])
 
     st.subheader("Paper trading")
-    tcols=st.columns(8)
+    tcols=st.columns(10)
     closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED'",(session,)).fetchone()[0]
     wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND net_pnl_usd>0",(session,)).fetchone()[0]
     losses=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND net_pnl_usd<=0",(session,)).fetchone()[0]
@@ -83,9 +91,17 @@ def board():
     tcols[4].metric("Fees $",f"{float(meta.get('fees_usd','0')):.2f}")
     tcols[5].metric("Profit wallet $",f"{float(meta.get('profit_wallet_usd','0')):.2f}")
     elc=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND exit_reason='EARLY_LOSER_CUT'",(session,)).fetchone()[0]
-    tails=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND exit_reason IN ('RIGHT_TAIL_TRAIL','RIGHT_TAIL_TIME')",(session,)).fetchone()[0]
+    tails=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND exit_reason IN ('RIGHT_TAIL_TRAIL','RIGHT_TAIL_TIME','RIGHT_TAIL_FLOOR')",(session,)).fetchone()[0]
+    cf60=db.execute("SELECT payload_json FROM events WHERE session_id=? AND stage='ELC_COUNTERFACTUAL' AND reason='60s'",(session,)).fetchall()
+    cf60_rec=0
+    for (j,) in cf60:
+        try:
+            if json.loads(j or "{}").get("recovered"): cf60_rec+=1
+        except Exception: pass
     tcols[6].metric("ELC cuts",elc)
     tcols[7].metric("Tail closes",tails)
+    tcols[8].metric("ELC CF 60s",len(cf60))
+    tcols[9].metric("CF recovered",cf60_rec)
 
     recent=db.execute("""SELECT head,symbol,side,status,margin_usd,notional_usd,entry_vwap,exit_vwap,net_pnl_usd,exit_reason,
                                 opened_ms,closed_ms,risk_state,entry_features_json
