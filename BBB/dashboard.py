@@ -15,8 +15,8 @@ st.markdown("""
 .block-container { padding-top: 1.1rem; padding-bottom: 2rem; }
 h1 { font-size: 2.35rem !important; margin-bottom: .2rem !important; }
 h2, h3 { letter-spacing: .01em; }
-div[data-testid="stMetricLabel"] p { font-size: 1.05rem !important; font-weight: 750 !important; opacity: .92 !important; }
-div[data-testid="stMetricValue"] { font-size: 2.0rem !important; font-weight: 850 !important; }
+div[data-testid="stMetricLabel"] p { font-size: 1.18rem !important; font-weight: 800 !important; opacity: .96 !important; }
+div[data-testid="stMetricValue"] { font-size: 1.18rem !important; font-weight: 800 !important; }
 div[data-testid="stMetricDelta"] { font-size: .95rem !important; }
 [data-testid="stDataFrame"] { font-size: 0.94rem !important; }
 .rp7-strip { padding: .48rem .72rem; border: 1px solid rgba(128,128,128,.23); border-radius: .55rem; margin: .25rem 0 1rem 0; font-weight: 700; }
@@ -77,27 +77,30 @@ def board():
     profit_wallet=float(meta.get("profit_wallet_usd","0") or 0)
     trading_cash=float(meta.get("trading_cash_usd",meta.get("paper_start_usd","500")) or 0)
 
-    st.subheader("Session")
-    a=st.columns(7)
-    a[0].metric("Entries","ON" if meta.get("paper_entries_enabled","0")=="1" else "OFF")
-    a[1].metric("Closed",closed)
-    a[2].metric("W / L",f"{wins} / {losses}",delta=f"{wr:.1f}% WR")
-    a[3].markdown(pnl_html("Realized",realized),unsafe_allow_html=True)
-    a[4].metric("Fees $",f"{fees:.2f}")
-    a[5].markdown(pnl_html("Profit wallet",profit_wallet),unsafe_allow_html=True)
-    a[6].metric("Open positions",open_n)
-
     elc=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND exit_reason='EARLY_LOSER_CUT'",(session,)).fetchone()[0]
     tails=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND exit_reason IN ('RIGHT_TAIL_TRAIL','RIGHT_TAIL_TIME','RIGHT_TAIL_FLOOR')",(session,)).fetchone()[0]
     cf60=db.execute("SELECT payload_json FROM events WHERE session_id=? AND stage='ELC_COUNTERFACTUAL' AND reason='60s'",(session,)).fetchall()
     cf60_rec=sum(1 for (j,) in cf60 if safe_json(j).get("recovered"))
-    b=st.columns(6)
-    b[0].metric("ELC cuts",elc)
-    b[1].metric("Tail closes",tails)
-    b[2].metric("ELC CF 60s",len(cf60))
-    b[3].metric("CF recovered",cf60_rec)
-    b[4].metric("Trading wallet $",f"{trading_cash:.2f}")
-    b[5].metric("Session",session[-18:] if session else "—")
+
+    st.subheader("Session")
+    a=st.columns(11)
+    a[0].metric("Entries","ON" if meta.get("paper_entries_enabled","0")=="1" else "OFF")
+    a[1].metric("Closed",closed)
+    a[2].metric("W / L",f"{wins} / {losses}",delta=f"{wr:.1f}% WR")
+    a[3].metric("Realized $",f"{realized:.2f}")
+    a[4].metric("Fees $",f"{fees:.2f}")
+    a[5].metric("Profit wallet $",f"{profit_wallet:.2f}")
+    a[6].metric("Open positions",open_n)
+    a[7].metric("ELC cuts",elc)
+    a[8].metric("Tail closes",tails)
+    a[9].metric("ELC CF 60s",len(cf60))
+    a[10].metric("CF recovered",cf60_rec)
+
+    st.markdown(
+        f"<div class='rp7-strip'>Trading wallet <b>USD {trading_cash:.2f}</b>"
+        f" &nbsp;|&nbsp; Session <b>{session[-18:] if session else '—'}</b></div>",
+        unsafe_allow_html=True
+    )
 
     st.subheader("Machine state")
     m=st.columns(6)
