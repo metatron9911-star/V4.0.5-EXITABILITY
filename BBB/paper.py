@@ -11,7 +11,7 @@ from typing import Dict
 from engine import PaperBook, SignalSnapshot, HeadName, ProductClass, BYBIT_FEES, now_ms
 from orderbook import LocalBook
 from sanitizer import Sanitizer
-from strategy_cells import POLICIES, classify_regime, directional_scores, projected_edge_bps, sizing_tier, policies_json
+from strategy_cells import POLICIES, classify_regime, directional_scores, projected_edge_bps, size_decision, policies_json
 
 class PaperTrader:
     def __init__(self, cx: sqlite3.Connection, session_id: str, start_usd: float, launch_symbols:set[str]):
@@ -26,6 +26,7 @@ class PaperTrader:
         self.skim_trigger=float(os.getenv("BBB_SKIM_TRIGGER_USD","10"))
         self.skim_fraction=float(os.getenv("BBB_SKIM_FRACTION","0.5"))
         train=[x.strip() for x in os.getenv("BBB_SANITIZER_TRAIN_SESSIONS","").split(",") if x.strip()]
+        self.training_sessions=train
         self.sanitizer=Sanitizer(
             cx,train,
             min_n=int(os.getenv("BBB_SANITIZER_MIN_N","12")),
@@ -72,6 +73,30 @@ class PaperTrader:
         self.cx.execute("""INSERT INTO wallet_ledger(ts_ms,session_id,wallet,head,position_id,kind,amount_usd,balance_after_usd,detail_json)
                            VALUES(?,?,?,?,?,?,?,?,?)""",
                         (now_ms(),self.session_id,wallet,head,position_id,kind,amount,balance,json.dumps(detail,separators=(",",":"))))
+
+    def _historical_penalty(self,bucket:str,side:str,regime:str) -> float:
+        if not self.training_sessions:
+            return 0.0
+        qmarks=",".join("?" for _ in self.training_sessions)
+        rows=self.cx.execute(f"""SELECT net_pnl_usd,entry_features_json FROM trades
+                                WHERE status='CLOSED' AND side=? AND session_id IN ({qmarks})
+                                ORDER BY id DESC LIMIT 300""",
+                             (side,*self.training_sessions)).fetchall()
+        vals=[]
+        for pnl,js in rows:
+            try: ef=json.loads(js or "{}")
+            except Exception: ef={}
+            if str(ef.get("vol_bucket","FAST"))!=bucket: continue
+            if str(ef.get("regime",""))!=regime: continue
+            vals.append(float(pnl or 0))
+        if len(vals)<20:
+            return 0.0
+        exp=sum(vals)/len(vals)
+        wr=sum(1 for x in vals if x>0)/len(vals)
+        penalty=0.0
+        if exp<0: penalty+=12.0
+        if wr<0.35: penalty+=8.0
+        return penalty
 
     def on_snapshot(self,symbol:str,head:str,f:dict,book:LocalBook,exchange_ts_ms:int,receive_ts_ms:int,bucket:str="FAST",allow_new_entries:bool=True):
         if not self.enabled or not book.synced or not book.mid:
@@ -123,7 +148,17 @@ class PaperTrader:
                                         separators=(",",":"))))
             return
 
-        tier,size_mult,confidence=sizing_tier(pol,side,score,regime,f,expected_cost,edge)
+        history_penalty=self._historical_penalty(bucket,side,regime)
+        sizing=size_decision(pol,side,score,regime,f,required_cost_edge,edge,history_penalty)
+        if sizing["reject"]:
+            self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (now_ms(),exchange_ts_ms,self.session_id,head,symbol,"SIZING_REJECT","LOW_SIZING_SCORE",
+                             json.dumps({"side":side,"bucket":bucket,"regime":regime,**sizing},separators=(",",":"))))
+            return
+        tier=str(sizing["tier"])
+        size_mult=float(sizing["size_multiplier"])
+        confidence=float(sizing["winner_score"])
         base_margin=max(1.0,self.start_usd*pol.margin_fraction)
         margin=max(1.0,base_margin*size_mult)
         # Never let one PAPER position consume more than 5% of the original bank.
@@ -142,7 +177,12 @@ class PaperTrader:
             expected_roundtrip_cost_bps=expected_cost,risk_state=f"{pol.cell}|{regime}|{tier}",
             features={**dict(f),"strategy_cell":pol.cell,"regime":regime,
                       "projected_edge_bps":edge,"required_cost_edge_bps":required_cost_edge,
-                      "vol_bucket":bucket,"sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence},
+                      "vol_bucket":bucket,"sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence,
+                      "winner_score":sizing["winner_score"],"loser_risk":sizing["loser_risk"],
+                      "sizing_score":sizing["sizing_score"],"edge_ratio":sizing["edge_ratio"],
+                      "aligned_count":sizing["aligned_count"],"opposing_count":sizing["opposing_count"],
+                      "spread_quality":sizing["spread_quality"],"depth_quality":sizing["depth_quality"],
+                      "history_penalty":sizing["history_penalty"],"sizing_violations":sizing["sizing_violations"]},
         )
         pid=str(uuid.uuid4())
         pos=self.book.open_position(pid,sig,side,self.leverage,margin,float(entry_vwap),maker=False)
@@ -159,10 +199,18 @@ class PaperTrader:
              pos.entry_fee_usd,sig.source_age_ms,sig.processing_ms,max(0,now_ms()-sig.signal_ts_ms),
              score,pol.gate,f"{pol.cell}|{regime}|{tier}",json.dumps({**f,"strategy_cell":pol.cell,"regime":regime,
                  "projected_edge_bps":edge,"required_cost_edge_bps":required_cost_edge,"vol_bucket":bucket,
-                 "sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence},separators=(",",":")),"OPEN",pos.opened_ms))
+                 "sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence,
+                 "winner_score":sizing["winner_score"],"loser_risk":sizing["loser_risk"],
+                 "sizing_score":sizing["sizing_score"],"edge_ratio":sizing["edge_ratio"],
+                 "aligned_count":sizing["aligned_count"],"opposing_count":sizing["opposing_count"],
+                 "spread_quality":sizing["spread_quality"],"depth_quality":sizing["depth_quality"],
+                 "history_penalty":sizing["history_penalty"],"sizing_violations":sizing["sizing_violations"]},
+                 separators=(",",":")),"OPEN",pos.opened_ms))
         self._ledger("TRADING",head,pid,"OPEN_MARGIN",-margin-pos.entry_fee_usd,self.book.wallets.trading_cash_usd,
                      {"side":side,"symbol":symbol,"entry_vwap":entry_vwap,"notional":notional,
-                      "sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence})
+                      "sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence,
+                      "winner_score":sizing["winner_score"],"loser_risk":sizing["loser_risk"],
+                      "sizing_score":sizing["sizing_score"],"edge_ratio":sizing["edge_ratio"]})
         self._write_wallet_meta()
 
     def _update_elc_shadows(self,symbol:str,book:LocalBook):
