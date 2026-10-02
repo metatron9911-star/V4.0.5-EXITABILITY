@@ -70,15 +70,18 @@ def directional_scores(head:str,f:dict) -> tuple[float,float]:
     return 50.0+impulse-penalty, 50.0-impulse-penalty
 
 def projected_edge_bps(side:str,score:float,gate:float,f:dict) -> float:
+    """Directional edge only. Volatility is opportunity, never free edge."""
     sign=1.0 if side=="BUY" else -1.0
-    aligned=max(0.0,
-        sign*float(f.get("ret_250ms_bps",0)),
-        sign*float(f.get("ret_1s_bps",0)),
-        0.5*sign*float(f.get("ret_5s_bps",0)),
-    )
-    rv=max(0.0,float(f.get("realized_vol_5s_bps",0)))
+    d250=sign*float(f.get("ret_250ms_bps",0))
+    d1=sign*float(f.get("ret_1s_bps",0))
+    d5=sign*float(f.get("ret_5s_bps",0))
+    dimb=sign*float(f.get("book_imbalance_5",0))
+    dflow=sign*(float(f.get("buy_ratio_1s",0.5))-0.5)*2.0
+    # Require persistence/alignment: opposing flow/book subtract from expected edge.
+    motion=max(0.0,0.9*d250 + 0.9*d1 + 0.20*d5)
+    alignment=6.0*max(-1.0,min(1.0,dimb)) + 5.0*max(-1.0,min(1.0,dflow))
     score_margin=max(0.0,score-gate)
-    return aligned + min(20.0,rv*6.0) + score_margin*0.8
+    return max(0.0,motion + alignment + score_margin*0.55)
 
 def sizing_tier(pol:CellPolicy,side:str,score:float,regime:str,f:dict,expected_cost_bps:float,projected_edge:float) -> tuple[str,float,float]:
     """Return (tier, multiplier, confidence 0..100).
@@ -91,27 +94,33 @@ def sizing_tier(pol:CellPolicy,side:str,score:float,regime:str,f:dict,expected_c
     edge_ratio=projected_edge/max(1.0,expected_cost_bps)
     spread=float(f.get("spread_bps",0))
     spread_quality=max(0.0,1.0-spread/max(0.001,pol.max_spread_bps))
-    imb=abs(float(f.get("book_imbalance_5",0)))
-    flow=abs(float(f.get("buy_ratio_1s",0.5))-0.5)*2.0
+    sign=1.0 if side=="BUY" else -1.0
+    dimb=sign*float(f.get("book_imbalance_5",0))
+    dflow=sign*(float(f.get("buy_ratio_1s",0.5))-0.5)*2.0
+    d250=sign*float(f.get("ret_250ms_bps",0))
+    d1=sign*float(f.get("ret_1s_bps",0))
+    aligned_count=sum(1 for x in (dimb,dflow,d250,d1) if x>0)
+    opposing_count=sum(1 for x in (dimb,dflow,d250,d1) if x<0)
     regime_bonus=1.0 if regime=="IMPULSE" else (0.65 if regime=="TREND" else 0.0)
 
-    confidence=min(100.0,
-        35.0
-        + min(25.0,score_margin*2.0)
-        + min(20.0,edge_surplus*1.5)
+    confidence=max(0.0,min(100.0,
+        30.0
+        + min(22.0,score_margin*1.7)
+        + min(22.0,edge_surplus*1.4)
         + 8.0*spread_quality
-        + 6.0*min(1.0,imb)
-        + 4.0*min(1.0,flow)
-        + 2.0*regime_bonus
-    )
+        + 7.0*max(-1.0,min(1.0,dimb))
+        + 6.0*max(-1.0,min(1.0,dflow))
+        + 3.0*regime_bonus
+        + 2.0*aligned_count
+        - 5.0*opposing_count
+    ))
 
-    # Progressive paper sizing: doubtful-but-valid setups stay small; only strongly
-    # overqualified setups receive the top multiplier.
-    if confidence>=82 and score_margin>=8 and edge_ratio>=1.65 and regime=="IMPULSE":
+    # High size requires directional agreement, not merely a large absolute signal.
+    if confidence>=84 and score_margin>=8 and edge_ratio>=1.70 and regime=="IMPULSE" and aligned_count>=3 and opposing_count==0:
         return "PRIME",2.00,confidence
-    if confidence>=70 and score_margin>=5 and edge_ratio>=1.40:
+    if confidence>=72 and score_margin>=5 and edge_ratio>=1.45 and aligned_count>=3 and opposing_count<=1:
         return "STRONG",1.50,confidence
-    if confidence>=58 and edge_ratio>=1.20:
+    if confidence>=60 and edge_ratio>=1.25 and aligned_count>=2:
         return "BASE",1.00,confidence
     return "CAUTIOUS",0.50,confidence
 
