@@ -10,6 +10,16 @@ DATA_DIR=Path(os.getenv("DATA_DIR",str(ROOT/"data")))
 DB=DATA_DIR/"bbb.sqlite3"
 
 st.set_page_config(page_title="BBB — BybitBot Beta",layout="wide")
+
+def _st_ver():
+    try:
+        parts=st.__version__.split(".")[:2]
+        return tuple(int(x) for x in parts)
+    except Exception:
+        return (1,40)
+
+_DF_KW={"width":"stretch"} if _st_ver()>=(1,40) else {"use_container_width":True}
+
 st.markdown("""
 <style>
 .block-container { padding-top: 1.1rem; padding-bottom: 2rem; }
@@ -20,6 +30,9 @@ div[data-testid="stMetricValue"] { font-size: 1.18rem !important; font-weight: 8
 div[data-testid="stMetricDelta"] { font-size: .95rem !important; }
 [data-testid="stDataFrame"] { font-size: 0.94rem !important; }
 .rp7-strip { padding: .48rem .72rem; border: 1px solid rgba(128,128,128,.23); border-radius: .55rem; margin: .25rem 0 1rem 0; font-weight: 700; }
+.rp7-wallet-strip { padding: .55rem .8rem; border: 1px solid rgba(128,128,128,.23); border-radius: .55rem; margin: .25rem 0 1rem 0; font-size: 1.18rem; font-weight: 800; }
+.rp7-wallet-strip .lbl { opacity: .82; font-size: 1.18rem; font-weight: 800; }
+.rp7-wallet-strip .val { font-size: 1.18rem; font-weight: 800; }
 .pnl-green { color:#39d98a; font-size:2.15rem; font-weight:900; }
 .pnl-red { color:#ff6262; font-size:2.15rem; font-weight:900; }
 .pnl-flat { color:#e6e6e6; font-size:2.15rem; font-weight:900; }
@@ -82,6 +95,15 @@ def board():
     cf60=db.execute("SELECT payload_json FROM events WHERE session_id=? AND stage='ELC_COUNTERFACTUAL' AND reason='60s'",(session,)).fetchall()
     cf60_rec=sum(1 for (j,) in cf60 if safe_json(j).get("recovered"))
 
+    st.markdown(
+        f"<div class='rp7-wallet-strip'>"
+        f"<span class='lbl'>Trading wallet</span> <span class='val'>USD {trading_cash:.2f}</span>"
+        f" &nbsp;|&nbsp; "
+        f"<span class='lbl'>Session</span> <span class='val'>{session[-18:] if session else '—'}</span>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
     st.subheader("Session")
     a=st.columns(11)
     a[0].metric("Entries","ON" if meta.get("paper_entries_enabled","0")=="1" else "OFF")
@@ -95,12 +117,6 @@ def board():
     a[8].metric("Tail closes",tails)
     a[9].metric("ELC CF 60s",len(cf60))
     a[10].metric("CF recovered",cf60_rec)
-
-    st.markdown(
-        f"<div class='rp7-strip'>Trading wallet <b>USD {trading_cash:.2f}</b>"
-        f" &nbsp;|&nbsp; Session <b>{session[-18:] if session else '—'}</b></div>",
-        unsafe_allow_html=True
-    )
 
     st.subheader("Machine state")
     m=st.columns(6)
@@ -121,11 +137,11 @@ def board():
     else:
         st.dataframe([{
             "symbol":x.get("symbol"),"bucket":x.get("bucket"),
-            "turnover24h_$":round(float(x.get("turnover24h",0)),0),
-            "range24h_bps":round(float(x.get("range_bps",0)),0),
-            "abs_change24h_bps":round(float(x.get("abs_change_bps",0)),0),
-            "OI_$":round(float(x.get("open_interest_value",0)),0)
-        } for x in uni],hide_index=True,width="stretch")
+            "turnover24h_$":round(float(x.get("turnover24h") or 0),0),
+            "range24h_bps":round(float(x.get("range_bps") or 0),0),
+            "abs_change24h_bps":round(float(x.get("abs_change_bps") or 0),0),
+            "OI_$":round(float(x.get("open_interest_value") or 0),0)
+        } for x in uni],hide_index=True,**_DF_KW)
 
     rows=db.execute("""SELECT symbol,head,ts_ms,mid,spread_bps,depth_bid_5_usd,depth_ask_5_usd,
                       book_imbalance_5,trade_count_1s,buy_ratio_1s,ret_1s_bps,realized_vol_5s_bps,
@@ -140,7 +156,7 @@ def board():
         head_rows.append({
             "symbol":r[0],"rest_bucket":p.get("rest_bucket","—"),"live_bucket":p.get("vol_bucket","—"),
             "trade_now":"YES" if p.get("live_trade_ok") else "NO",
-            "activity":round(float(p.get("live_activity_score",0)),1),
+            "activity":round(float(p.get("live_activity_score") or 0),1),
             "age_ms":now-r[2],"mid":r[3],"spread_bps":round(r[4] or 0,3),
             "depth5_min_$":round(min(r[5] or 0,r[6] or 0),0),
             "imbalance":round(r[7] or 0,3),"trades_1s":r[8],
@@ -148,7 +164,7 @@ def board():
             "rv_5s_bps":round(r[11] or 0,2),"score":round(r[12] or 0,1),
             "gate":r[13],"state":r[14],
         })
-    st.dataframe(head_rows,hide_index=True,width="stretch")
+    st.dataframe(head_rows,hide_index=True,**_DF_KW)
 
     trades=db.execute("""SELECT head,symbol,side,status,margin_usd,notional_usd,entry_vwap,exit_vwap,
                                 net_pnl_usd,exit_reason,opened_ms,closed_ms,risk_state,entry_features_json,
@@ -174,11 +190,11 @@ def board():
         (open_rows if r[3]=="OPEN" else closed_rows).append(item)
 
     st.subheader("Open positions")
-    if open_rows: st.dataframe(open_rows,hide_index=True,width="stretch")
+    if open_rows: st.dataframe(open_rows,hide_index=True,**_DF_KW)
     else: st.caption("No open positions")
 
     st.subheader("Recent closed trades")
-    if closed_rows: st.dataframe(closed_rows[:30],hide_index=True,width="stretch")
+    if closed_rows: st.dataframe(closed_rows[:30],hide_index=True,**_DF_KW)
     else: st.caption("No closed trades yet")
 
     st.subheader("Sizing quality")
@@ -202,13 +218,13 @@ def board():
             "avg_win_$":round(s["win_sum"]/w,5) if w else 0,
             "avg_loss_$":round(s["loss_sum"]/l,5) if l else 0,
         })
-    if report: st.dataframe(report,hide_index=True,width="stretch")
+    if report: st.dataframe(report,hide_index=True,**_DF_KW)
     else: st.caption("Waiting for H2 trades")
 
     st.subheader("Strategy cells")
     cells=safe_json(meta.get("strategy_cells_json","{}"))
     if cells:
-        st.dataframe([{"cell":k,**v} for k,v in cells.items()],hide_index=True,width="stretch")
+        st.dataframe([{"cell":k,**v} for k,v in cells.items()],hide_index=True,**_DF_KW)
 
     st.subheader("Sanitizer")
     s=st.columns(4)
@@ -227,7 +243,7 @@ def board():
                     "winner_retention":round(r["winner_retention"],3),
                     "ΔPESB":round(r["delta_pesb"],6)
                 })
-        st.dataframe(rr,hide_index=True,width="stretch")
+        st.dataframe(rr,hide_index=True,**_DF_KW)
 
     st.subheader("Wallets")
     w=st.columns(4)
