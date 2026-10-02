@@ -7,7 +7,19 @@ from __future__ import annotations
 import asyncio, json, math, os, urllib.parse, urllib.request
 from dataclasses import dataclass, asdict
 
-BASES=["https://api.bybit.com","https://api.bytick.com"]
+# Main endpoints first, then official regional endpoints. Railway currently runs
+# in a US region where Bybit REST can return HTTP 403; the worker therefore also
+# has a websocket-driven fallback pool below.
+BASES=[
+    "https://api.bybit.com",
+    "https://api.bytick.com",
+    "https://api.bybit.eu",
+    "https://api.bybit.kz",
+    "https://api.bybit.tr",
+    "https://api.bybitgeorgia.ge",
+    "https://api.bybit.ae",
+    "https://api.bybit.id",
+]
 
 @dataclass(frozen=True)
 class Candidate:
@@ -94,3 +106,28 @@ async def scan_vol_universe() -> list[Candidate]:
 
 def universe_json(rows:list[Candidate]) -> str:
     return json.dumps([asdict(x) for x in rows],separators=(",",":"))
+
+
+def fallback_vol_universe() -> list[Candidate]:
+    """Static discovery fallback; live microstructure still decides tradability.
+
+    Used only when Bybit REST discovery is unavailable (for example regional
+    HTTP 403). It is deliberately broader than the old four-symbol fallback.
+    No 24h score is invented: the worker's live speed/impulse gate remains the
+    actual entry gate.
+    """
+    core=[x.strip().upper() for x in os.getenv(
+        "BBB_FALLBACK_CORE_SYMBOLS",
+        "XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LINKUSDT"
+    ).split(",") if x.strip()]
+    fast=[x.strip().upper() for x in os.getenv(
+        "BBB_FALLBACK_FAST_SYMBOLS",
+        "HYPEUSDT,SUIUSDT,AVAXUSDT,PEPEUSDT,ARBUSDT,APTUSDT,NEARUSDT,JUPUSDT,ONDOUSDT,ZROUSDT,GRASSUSDT"
+    ).split(",") if x.strip()]
+    out=[]; used=set()
+    for bucket,symbols in (("CORE",core),("FAST",fast)):
+        for s in symbols:
+            if s in used: continue
+            used.add(s)
+            out.append(Candidate(s,bucket,0.0,0.0,0.0,0.0,0.0))
+    return out
