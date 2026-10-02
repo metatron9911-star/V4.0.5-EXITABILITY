@@ -37,6 +37,29 @@ def pct(values,p):
     arr=sorted(values); i=min(len(arr)-1,max(0,int(round((len(arr)-1)*p))))
     return float(arr[i])
 
+def live_vol_state(snap:dict,rest_bucket:str) -> tuple[str,bool,float]:
+    """Classify present-tense speed/jumpiness. 24h stats choose the pool;
+    these microstructure features decide whether we trade it right now."""
+    t1=int(snap.get("trade_count_1s",0) or 0)
+    t5=int(snap.get("trade_count_5s",0) or 0)
+    rv=abs(float(snap.get("realized_vol_5s_bps",0) or 0))
+    r250=abs(float(snap.get("ret_250ms_bps",0) or 0))
+    r1=abs(float(snap.get("ret_1s_bps",0) or 0))
+    r5=abs(float(snap.get("ret_5s_bps",0) or 0))
+    impulse=max(r250,r1,0.5*r5)
+    velocity=t1 + 0.20*t5
+    if (impulse>=8 or rv>=0.80) and t5>=3:
+        bucket="EXTREME"
+        active=True
+    elif (impulse>=3 or rv>=0.25) and (t1>=1 or t5>=6):
+        bucket="FAST"
+        active=True
+    else:
+        bucket="CORE" if rest_bucket=="CORE" else rest_bucket
+        active=(rest_bucket=="CORE" and (t1>=3 or t5>=12) and (impulse>=1.5 or rv>=0.12))
+    activity_score=velocity + impulse*2.0 + rv*10.0
+    return bucket,active,activity_score
+
 
 async def main():
     cx=connect()
@@ -46,8 +69,12 @@ async def main():
     dynamic=os.getenv("BBB_VOL_DYNAMIC_UNIVERSE","1").lower() in {"1","true","yes","on"}
     universe=[]
     if dynamic:
-        try: universe=await scan_vol_universe()
-        except Exception: universe=[]
+        try:
+            universe=await scan_vol_universe()
+            if not universe: setmeta(cx,"vol_universe_error","scanner_empty_fallback")
+        except Exception as e:
+            universe=[]
+            setmeta(cx,"vol_universe_error",str(e)[:300])
     symbols=[x.symbol for x in universe] or configured or ["HYPEUSDT","GRASSUSDT","STRKUSDT","ZROUSDT"]
     bucket_map={x.symbol:x.bucket for x in universe}
     scan_meta={x.symbol:x for x in universe}
@@ -111,16 +138,20 @@ async def main():
                 snap=fx.snapshot(symbol,now_ms(),books[symbol])
                 if snap:
                     head="VOL"
-                    bucket=bucket_map.get(symbol,"FAST")
+                    rest_bucket=bucket_map.get(symbol,"FAST")
+                    bucket,trade_now,activity_score=live_vol_state(snap,rest_bucket)
                     meta_scan=scan_meta.get(symbol)
                     if meta_scan:
-                        snap["vol_bucket"]=bucket
                         snap["turnover24h"]=meta_scan.turnover24h
                         snap["range24h_bps"]=meta_scan.range_bps
                         snap["abs_change24h_bps"]=meta_scan.abs_change_bps
+                    snap["vol_bucket"]=bucket
+                    snap["rest_bucket"]=rest_bucket
+                    snap["live_activity_score"]=activity_score
+                    snap["live_trade_ok"]=1 if trade_now else 0
                     score=baseline_score(snap); gate=65.0
-                    state=f"{bucket}|SHADOW"
-                    trader.on_snapshot(symbol,head,snap,books[symbol],books[symbol].exchange_ts_ms,recv,bucket=bucket)
+                    state=f"{bucket}|{'ACTIVE' if trade_now else 'WAIT'}"
+                    trader.on_snapshot(symbol,head,snap,books[symbol],books[symbol].exchange_ts_ms,recv,bucket=bucket,allow_new_entries=trade_now)
                     cx.execute("""INSERT INTO feature_samples(
                       ts_ms,exchange_ts_ms,session_id,symbol,head,mid,bid,ask,spread_bps,
                       depth_bid_5_usd,depth_ask_5_usd,book_imbalance_5,trade_count_1s,trade_count_5s,
@@ -147,11 +178,13 @@ async def main():
                         bucket_map={x.symbol:x.bucket for x in fresh}
                         scan_meta={x.symbol:x for x in fresh}
                         universe=fresh
-                        feed.set_symbols(new_symbols)
+                        held={p.symbol for p in trader.book.positions.values()}
+                        feed.set_symbols(set(new_symbols)|held)
                         symbols=new_symbols
                         setmeta(cx,"symbols",",".join(new_symbols))
                         setmeta(cx,"vol_universe_json",universe_json(fresh))
                         setmeta(cx,"vol_universe_updated_ms",now_ms())
+                        setmeta(cx,"vol_universe_error","")
                 except Exception as e:
                     setmeta(cx,"vol_universe_error",str(e)[:300])
                 last_universe_scan=now_ms()
