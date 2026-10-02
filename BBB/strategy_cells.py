@@ -35,10 +35,10 @@ POLICIES={
 }
 
 TIER_MULTIPLIERS={
-    "MICRO":0.35,
-    "CAUTIOUS":0.50,
-    "BASE":0.85,
-    "GOOD":1.15,
+    "MICRO":0.20,
+    "CAUTIOUS":0.35,
+    "BASE":0.65,
+    "GOOD":1.00,
     "STRONG":1.50,
     "PRIME":2.00,
     "ELITE":2.50,
@@ -199,7 +199,19 @@ def size_decision(
 ) -> dict:
     q=winner_loser_scores(pol,side,score,regime,f,required_cost_edge_bps,projected_edge,history_penalty)
     s=q["sizing_score"]
-    if s<5:
+
+    # H3 economics gate: do not pay taker fees for thin or contradictory edge.
+    hard_reject_reason=None
+    if q["edge_ratio"]<1.30:
+        hard_reject_reason="EDGE_RATIO_LT_1_30"
+    elif q["opposing_count"]>=2:
+        hard_reject_reason="OPPOSING_GTE_2"
+    elif q["loser_risk"]>=35.0:
+        hard_reject_reason="LOSER_RISK_GTE_35"
+    elif s<5:
+        hard_reject_reason="SIZING_SCORE_LT_5"
+
+    if hard_reject_reason:
         tier,mult,reject="REJECT",0.0,True
     elif s<15:
         tier,mult,reject="MICRO",TIER_MULTIPLIERS["MICRO"],False
@@ -216,6 +228,12 @@ def size_decision(
     else:
         tier,mult,reject="ELITE",TIER_MULTIPLIERS["ELITE"],False
 
+    # Hard money caps for marginal setups.
+    if not reject and q["edge_ratio"]<1.45 and mult>TIER_MULTIPLIERS["MICRO"]:
+        tier,mult="MICRO",TIER_MULTIPLIERS["MICRO"]
+    if not reject and q["loser_risk"]>=25.0 and mult>TIER_MULTIPLIERS["CAUTIOUS"]:
+        tier,mult="CAUTIOUS",TIER_MULTIPLIERS["CAUTIOUS"]
+
     # Safety caps: big size only when the market actually agrees with the trade.
     violations=0
     if q["opposing_count"]>0: violations+=1
@@ -223,16 +241,22 @@ def size_decision(
     if q["edge_ratio"]<1.45: violations+=1
     if regime!="IMPULSE": violations+=1
     if q["spread_quality"]<0: violations+=1
-    if violations>=2 and mult>TIER_MULTIPLIERS["BASE"]:
+    if not reject and violations>=2 and mult>TIER_MULTIPLIERS["BASE"]:
         tier,mult="BASE",TIER_MULTIPLIERS["BASE"]
-    elif violations==1 and mult>TIER_MULTIPLIERS["GOOD"]:
+    elif not reject and violations==1 and mult>TIER_MULTIPLIERS["GOOD"]:
         tier,mult="GOOD",TIER_MULTIPLIERS["GOOD"]
 
-    q.update({"tier":tier,"size_multiplier":mult,"reject":reject,"sizing_violations":violations})
+    q.update({
+        "tier":tier,
+        "size_multiplier":mult,
+        "reject":reject,
+        "reject_reason":hard_reject_reason,
+        "sizing_violations":violations,
+    })
     return q
 
 def policies_json() -> str:
-    ladder="MICRO .35x / CAUTIOUS .5x / BASE .85x / GOOD 1.15x / STRONG 1.5x / PRIME 2x / ELITE 2.5x"
+    ladder="MICRO .20x / CAUTIOUS .35x / BASE .65x / GOOD 1x / STRONG 1.5x / PRIME 2x / ELITE 2.5x"
     return json.dumps({p.cell:{
         "gate":p.gate,"tp_bps":p.take_profit_bps,"sl_bps":p.stop_loss_bps,
         "hold_ms":p.max_hold_ms,"spread_max_bps":p.max_spread_bps,
