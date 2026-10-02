@@ -195,12 +195,18 @@ async def main():
                 setmeta(cx,"queue_depth",q.qsize()); setmeta(cx,"dropped",dropped)
                 setmeta(cx,"source_age_p50_ms",round(pct(source_ages,.50),2)); setmeta(cx,"source_age_p99_ms",round(pct(source_ages,.99),2))
                 setmeta(cx,"processing_p50_ms",round(pct(processing,.50),2)); setmeta(cx,"processing_p99_ms",round(pct(processing,.99),2))
-                # Rolling retention prevents telemetry from filling the Railway volume.
+                # Session-aware retention:
+                # - NEVER delete heavy telemetry from the active session.
+                # - After a session changes, keep its heavy telemetry for retention_hours.
+                # - trades and wallet_ledger are never deleted here, so compact session results
+                #   remain available for long-term analysis after raw telemetry expires.
                 if now_ms()-last_maintenance >= 60000:
                     cutoff=now_ms()-retention_hours*3600*1000
-                    cx.execute("DELETE FROM events WHERE ts_ms < ?",(cutoff,))
-                    cx.execute("DELETE FROM feature_samples WHERE ts_ms < ?",(cutoff,))
-                    cx.execute("DELETE FROM equity_samples WHERE ts_ms < ?",(cutoff,))
+                    cx.execute("DELETE FROM events WHERE session_id<>? AND ts_ms < ?",(session,cutoff))
+                    cx.execute("DELETE FROM feature_samples WHERE session_id<>? AND ts_ms < ?",(session,cutoff))
+                    cx.execute("DELETE FROM equity_samples WHERE session_id<>? AND ts_ms < ?",(session,cutoff))
+                    setmeta(cx,"retention_policy","ACTIVE_SESSION_FULL; PRIOR_SESSIONS_RAW_%sh; TRADES_LEDGER_KEEP" % retention_hours)
+                    setmeta(cx,"retention_last_cleanup_ms",now_ms())
                     # Do not checkpoint from the hot writer loop: dashboard readers can
                     # legitimately hold read locks. WAL autocheckpoint handles this safely.
                     last_maintenance=now_ms()
