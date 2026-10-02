@@ -72,6 +72,33 @@ async def main():
         session=f"{requested_session}-R{int(time.time())}"
     else:
         session=requested_session
+
+    # Publish a clean session immediately. This prevents the dashboard from
+    # showing wallet/PnL counters left by a previous runtime while discovery
+    # or websocket startup is still in progress.
+    session_start_ms=now_ms()
+    setmeta(cx,"session_id",session)
+    setmeta(cx,"session_start_ms",session_start_ms)
+    setmeta(cx,"heartbeat_ms",0)
+    setmeta(cx,"feed_state","STARTING")
+    setmeta(cx,"messages",0)
+    setmeta(cx,"reconnects",0)
+    setmeta(cx,"queue_depth",0)
+    setmeta(cx,"dropped",0)
+    setmeta(cx,"source_age_p50_ms",0)
+    setmeta(cx,"source_age_p99_ms",0)
+    setmeta(cx,"processing_p50_ms",0)
+    setmeta(cx,"processing_p99_ms",0)
+    setmeta(cx,"trading_cash_usd",os.getenv("BBB_PAPER_START_USD","500"))
+    setmeta(cx,"profit_wallet_usd",0)
+    setmeta(cx,"realized_pnl_usd",0)
+    setmeta(cx,"fees_usd",0)
+    setmeta(cx,"funding_usd",0)
+    setmeta(cx,"slippage_impact_usd",0)
+    setmeta(cx,"paper_open_positions",0)
+    setmeta(cx,"sanitizer_rejects",0)
+    cx.commit()
+
     configured=[x.strip().upper() for x in os.getenv("BBB_SYMBOLS","").split(",") if x.strip()]
     dynamic=os.getenv("BBB_VOL_DYNAMIC_UNIVERSE","1").lower() in {"1","true","yes","on"}
     universe=[]
@@ -94,7 +121,7 @@ async def main():
     scan_meta={x.symbol:x for x in universe}
     launch_symbols=set()
     liquid_symbols=set()
-    setmeta(cx,"session_id",session); setmeta(cx,"mode",os.getenv("BBB_MODE","PAPER"))
+    setmeta(cx,"session_id",session); setmeta(cx,"session_start_ms",session_start_ms); setmeta(cx,"mode",os.getenv("BBB_MODE","PAPER"))
     setmeta(cx,"symbols",",".join(symbols)); setmeta(cx,"launch_symbols","")
     setmeta(cx,"liquid_symbols",""); setmeta(cx,"vol_universe_json",universe_json(universe))
     setmeta(cx,"vol_dynamic","1" if dynamic else "0")
