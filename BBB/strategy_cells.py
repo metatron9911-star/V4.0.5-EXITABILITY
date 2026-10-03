@@ -303,22 +303,22 @@ def sniper_entry_quality(
     clear=(
         regime=="IMPULSE"
         and bool(sizing.get("trade_now"))
-        and int(sizing.get("opposing_count",99) or 99)==0
-        and int(sizing.get("aligned_count",0) or 0)>=4
-        and float(sizing.get("edge_ratio",0) or 0)>=1.80
-        and float(sizing.get("winner_score",0) or 0)>=96.0
-        and float(sizing.get("loser_risk",100) or 100)<=12.0
-        and int(sizing.get("sizing_violations",99) or 99)==0
-        and float(sizing.get("spread_quality",-1) or -1)>=0.5
-        and float(sizing.get("history_penalty",0) or 0)<=0.0
+        and int(sizing.get("opposing_count",99))==0
+        and int(sizing.get("aligned_count",0))>=4
+        and float(sizing.get("edge_ratio",0))>=1.80
+        and float(sizing.get("winner_score",0))>=96.0
+        and float(sizing.get("loser_risk",100))<=12.0
+        and int(sizing.get("sizing_violations",99))==0
+        and float(sizing.get("spread_quality",-1))>=0.5
+        and float(sizing.get("history_penalty",0))<=0.0
         and d250>0.0 and d1>0.0 and d5>0.0
         and dflow>=0.05 and dimb>=0.05
     )
     super_clear=(
         clear
-        and float(sizing.get("edge_ratio",0) or 0)>=2.20
-        and float(sizing.get("winner_score",0) or 0)>=98.5
-        and float(sizing.get("loser_risk",100) or 100)<=8.0
+        and float(sizing.get("edge_ratio",0))>=2.20
+        and float(sizing.get("winner_score",0))>=98.5
+        and float(sizing.get("loser_risk",100))<=8.0
         and d1>=2.0 and d5>=4.0
         and dflow>=0.15 and dimb>=0.15
     )
