@@ -349,6 +349,17 @@ class PaperTrader:
         base_floor_bps=max(0.18*tp_bps,0.65*expected_cost)
 
         st=self.tail_state.get(p.position_id)
+        # Self-heal H3T-B state after an unusual runtime restore/restart.
+        # This does not change arming; it only reconstructs post-arm telemetry/state.
+        if p.tail_armed and st is None:
+            self.tail_state[p.position_id]={
+                "tail_peak_bps":mfe_bps,
+                "tail_arm_momentum":self._directional_momentum(p.side,f),
+                "tail_accel":"FLAT",
+                "tail_milestones_hit":[],
+            }
+            st=self.tail_state[p.position_id]
+
         active_floor_bps=base_floor_bps
         trail_bps_eff=0.30*max(mfe_bps,tp_bps)
         timeout_ms_eff=pol.max_hold_ms*3
