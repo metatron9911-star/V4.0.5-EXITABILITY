@@ -14,8 +14,8 @@ from sanitizer import Sanitizer
 from strategy_cells import (
     POLICIES, classify_regime, directional_scores, projected_edge_bps,
     size_decision, policies_json,
-    classify_tail_accel, tail_milestones_hit, tail_active_floor_bps,
-    tail_trail_bps, tail_timeout_ms, sniper_entry_quality,
+    classify_tail_accel_delta, tail_milestones_hit, tail_active_floor_bps,
+    tail_trail_bps, tail_trail_bps_binding, tail_timeout_ms, sniper_entry_quality,
 )
 
 class PaperTrader:
@@ -430,10 +430,18 @@ class PaperTrader:
         if (not p.tail_armed) and mfe_bps>=tail_arm_trigger and continuation:
             p.tail_armed=True
             p.tail_arm_ms=now
+            m_arm=self._directional_momentum(p.side,f)
             self.tail_state[p.position_id]={
                 "tail_peak_bps":mfe_bps,
-                "tail_arm_momentum":self._directional_momentum(p.side,f),
+                "tail_arm_momentum":m_arm,
+                "tail_m_prev":m_arm,
+                "tail_m_now":m_arm,
+                "tail_delta_m":0.0,
+                "tail_max_delta_m":0.0,
                 "tail_accel":"FLAT",
+                "tail_accel_seen":set(),
+                "tail_accel_ticks":{"ACCEL":0,"FLAT":0,"DECEL":0},
+                "tail_transitions":0,
                 "tail_milestones_hit":[],
             }
             self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
@@ -453,10 +461,18 @@ class PaperTrader:
         # Self-heal H3T-B state after an unusual runtime restore/restart.
         # This does not change arming; it only reconstructs post-arm telemetry/state.
         if p.tail_armed and st is None:
+            m_restore=self._directional_momentum(p.side,f)
             self.tail_state[p.position_id]={
                 "tail_peak_bps":mfe_bps,
-                "tail_arm_momentum":self._directional_momentum(p.side,f),
+                "tail_arm_momentum":m_restore,
+                "tail_m_prev":m_restore,
+                "tail_m_now":m_restore,
+                "tail_delta_m":0.0,
+                "tail_max_delta_m":0.0,
                 "tail_accel":"FLAT",
+                "tail_accel_seen":set(),
+                "tail_accel_ticks":{"ACCEL":0,"FLAT":0,"DECEL":0},
+                "tail_transitions":0,
                 "tail_milestones_hit":[],
             }
             st=self.tail_state[p.position_id]
@@ -470,12 +486,26 @@ class PaperTrader:
             if mfe_bps>st["tail_peak_bps"]:
                 st["tail_peak_bps"]=mfe_bps
             m_now=self._directional_momentum(p.side,f)
-            accel=classify_tail_accel(m_now,st["tail_arm_momentum"])
+            m_prev=float(st.get("tail_m_prev",m_now))
+            delta_m=m_now-m_prev
+            accel=classify_tail_accel_delta(m_now,m_prev)
+            tick_total=sum(int(v) for v in st.get("tail_accel_ticks",{}).values())
+            if st.get("tail_accel")!=accel and tick_total>0:
+                st["tail_transitions"]=int(st.get("tail_transitions",0))+1
             st["tail_accel"]=accel
+            st.setdefault("tail_accel_seen",set()).add(accel)
+            ticks=st.setdefault("tail_accel_ticks",{"ACCEL":0,"FLAT":0,"DECEL":0})
+            ticks[accel]=int(ticks.get(accel,0))+1
+            st["tail_m_prev"]=m_now
+            st["tail_m_now"]=m_now
+            st["tail_delta_m"]=delta_m
+            if abs(delta_m)>abs(float(st.get("tail_max_delta_m",0.0))):
+                st["tail_max_delta_m"]=delta_m
             hit=tail_milestones_hit(mfe_bps,tp_bps)
             st["tail_milestones_hit"]=hit
             active_floor_bps=tail_active_floor_bps(tp_bps,base_floor_bps,hit)
-            trail_bps_eff=tail_trail_bps(mfe_bps,tp_bps,accel,bucket)
+            raw_trail=tail_trail_bps(mfe_bps,tp_bps,accel,bucket)
+            trail_bps_eff=tail_trail_bps_binding(raw_trail,mfe_bps,active_floor_bps,hit)
             timeout_ms_eff=tail_timeout_ms(pol.max_hold_ms,accel)
 
         floor_fired=p.tail_armed and move_bps<=active_floor_bps
@@ -535,6 +565,13 @@ class PaperTrader:
                 if st and st.get("tail_peak_bps",0)>0 else None
             ),
             "tail_accel_final":accel if p.tail_armed else None,
+            "tail_accel_seen":sorted(list(st.get("tail_accel_seen",set()))) if st else None,
+            "tail_accel_ticks":st.get("tail_accel_ticks") if st else None,
+            "tail_transitions":st.get("tail_transitions") if st else None,
+            "tail_max_delta_m":st.get("tail_max_delta_m") if st else None,
+            "tail_m_prev":st.get("tail_m_prev") if st else None,
+            "tail_m_now":st.get("tail_m_now") if st else None,
+            "tail_delta_m":st.get("tail_delta_m") if st else None,
             "tail_milestones_hit":st.get("tail_milestones_hit",[]) if st else [],
             "exit_trigger_secondary":secondary,
             "floor_fired":floor_fired,
