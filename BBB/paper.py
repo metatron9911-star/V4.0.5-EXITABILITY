@@ -42,9 +42,8 @@ class PaperTrader:
         self.elc_shadows=[]
         # H3T-B: post-arm tail state, keyed by position_id.
         self.tail_state: Dict[str,dict]={}
-        # H3T-D: candidate must remain ultra-clean across several snapshots
-        # before we pay fees and open a position.
-        self.sniper_pending: Dict[str,dict]={}
+        # H3T-D SHADOW: classify post-entry persistence without blocking H3T-C entries.
+        self.sniper_shadow: Dict[str,dict]={}
         self._write_wallet_meta()
 
     def _product(self,symbol:str) -> ProductClass:
@@ -176,47 +175,12 @@ class PaperTrader:
                              json.dumps({"side":side,"bucket":bucket,"regime":regime,**sizing},separators=(",",":"))))
             return
 
-        # H3T-D SNIPER: trade only fully aligned, persistent candidates.
+        # H3T-D SHADOW: score the entry, but DO NOT block or resize it.
+        # Persistence is observed for ~1.5s after entry and later compared with PnL.
         sniper=sniper_entry_quality(sizing,regime,f)
-        if not sniper["sniper_clear"]:
-            self.sniper_pending.pop(symbol,None)
-            self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
-                               VALUES(?,?,?,?,?,?,?,?)""",
-                            (now_ms(),exchange_ts_ms,self.session_id,head,symbol,"SNIPER_REJECT","QUALITY_GATE",
-                             json.dumps({"side":side,"bucket":bucket,"regime":regime,**sizing,**sniper},separators=(",",":"))))
-            return
-
-        tnow=now_ms()
-        cand=self.sniper_pending.get(symbol)
-        if (not cand or cand.get("side")!=side or cand.get("bucket")!=bucket
-                or tnow-int(cand.get("last_ms",0))>1500):
-            cand={"side":side,"bucket":bucket,"first_ms":tnow,"last_ms":tnow,"hits":1,
-                  "super_hits":1 if sniper["sniper_super"] else 0}
-            self.sniper_pending[symbol]=cand
-            return
-
-        cand["last_ms"]=tnow
-        cand["hits"]=int(cand.get("hits",0))+1
-        if sniper["sniper_super"]:
-            cand["super_hits"]=int(cand.get("super_hits",0))+1
-
-        confirm_ms=tnow-int(cand.get("first_ms",tnow))
-        if cand["hits"]<3 or confirm_ms<650:
-            return
-
-        # Confirmed winner candidate. CLEAR gets 1.5x; persistent SUPER gets 2.5x.
-        sniper_grade="SUPER" if (sniper["sniper_super"] and cand.get("super_hits",0)>=2) else "CLEAR"
         tier=str(sizing["tier"])
-        size_mult=2.50 if sniper_grade=="SUPER" else 1.50
+        size_mult=float(sizing["size_multiplier"])
         confidence=float(sizing["winner_score"])
-        sizing.update({
-            **sniper,
-            "sniper_grade":sniper_grade,
-            "sniper_confirm_ms":confirm_ms,
-            "sniper_hits":cand["hits"],
-            "size_multiplier":size_mult,
-        })
-        self.sniper_pending.pop(symbol,None)
         base_margin=max(1.0,self.start_usd*pol.margin_fraction)
         margin=max(1.0,base_margin*size_mult)
         # Never let one PAPER position consume more than 5% of the original bank.
@@ -241,12 +205,13 @@ class PaperTrader:
                       "aligned_count":sizing["aligned_count"],"opposing_count":sizing["opposing_count"],
                       "spread_quality":sizing["spread_quality"],"depth_quality":sizing["depth_quality"],
                       "history_penalty":sizing["history_penalty"],"sizing_violations":sizing["sizing_violations"],
-                      "sniper_grade":sizing.get("sniper_grade"),"sniper_confirm_ms":sizing.get("sniper_confirm_ms"),
-                      "sniper_hits":sizing.get("sniper_hits"),"sniper_clear":sizing.get("sniper_clear"),
-                      "sniper_super":sizing.get("sniper_super"),
-                      "sniper_d250":sizing.get("sniper_d250"),"sniper_d1":sizing.get("sniper_d1"),
-                      "sniper_d5":sizing.get("sniper_d5"),"sniper_dflow":sizing.get("sniper_dflow"),
-                      "sniper_dimb":sizing.get("sniper_dimb")},
+                      "sniper_shadow_entry_clear":sniper.get("sniper_clear"),
+                      "sniper_shadow_entry_super":sniper.get("sniper_super"),
+                      "sniper_shadow_entry_d250":sniper.get("sniper_d250"),
+                      "sniper_shadow_entry_d1":sniper.get("sniper_d1"),
+                      "sniper_shadow_entry_d5":sniper.get("sniper_d5"),
+                      "sniper_shadow_entry_dflow":sniper.get("sniper_dflow"),
+                      "sniper_shadow_entry_dimb":sniper.get("sniper_dimb")},
         )
         pid=str(uuid.uuid4())
         pos=self.book.open_position(pid,sig,side,self.leverage,margin,float(entry_vwap),maker=False)
@@ -268,13 +233,32 @@ class PaperTrader:
                  "sizing_score":sizing["sizing_score"],"edge_ratio":sizing["edge_ratio"],
                  "aligned_count":sizing["aligned_count"],"opposing_count":sizing["opposing_count"],
                  "spread_quality":sizing["spread_quality"],"depth_quality":sizing["depth_quality"],
-                 "history_penalty":sizing["history_penalty"],"sizing_violations":sizing["sizing_violations"]},
+                 "history_penalty":sizing["history_penalty"],"sizing_violations":sizing["sizing_violations"],
+                 "sniper_shadow_entry_clear":sniper.get("sniper_clear"),
+                 "sniper_shadow_entry_super":sniper.get("sniper_super"),
+                 "sniper_shadow_entry_d250":sniper.get("sniper_d250"),
+                 "sniper_shadow_entry_d1":sniper.get("sniper_d1"),
+                 "sniper_shadow_entry_d5":sniper.get("sniper_d5"),
+                 "sniper_shadow_entry_dflow":sniper.get("sniper_dflow"),
+                 "sniper_shadow_entry_dimb":sniper.get("sniper_dimb")},
                  separators=(",",":")),"OPEN",pos.opened_ms))
         self._ledger("TRADING",head,pid,"OPEN_MARGIN",-margin-pos.entry_fee_usd,self.book.wallets.trading_cash_usd,
                      {"side":side,"symbol":symbol,"entry_vwap":entry_vwap,"notional":notional,
                       "sizing_tier":tier,"size_multiplier":size_mult,"confidence":confidence,
                       "winner_score":sizing["winner_score"],"loser_risk":sizing["loser_risk"],
-                      "sizing_score":sizing["sizing_score"],"edge_ratio":sizing["edge_ratio"]})
+                      "sizing_score":sizing["sizing_score"],"edge_ratio":sizing["edge_ratio"],
+                      "sniper_shadow_entry_clear":sniper.get("sniper_clear"),
+                      "sniper_shadow_entry_super":sniper.get("sniper_super")})
+        self.sniper_shadow[pid]={
+            "entry_ms":pos.opened_ms,
+            "hits":1 if sniper.get("sniper_clear") else 0,
+            "super_hits":1 if sniper.get("sniper_super") else 0,
+            "first_good_ms":pos.opened_ms if sniper.get("sniper_clear") else None,
+            "last_good_ms":pos.opened_ms if sniper.get("sniper_clear") else None,
+            "outcome":None,
+            "confirm_ms":None,
+            "max_hits":1 if sniper.get("sniper_clear") else 0,
+        }
         self._write_wallet_meta()
 
     def _update_elc_shadows(self,symbol:str,book:LocalBook):
@@ -333,6 +317,75 @@ class PaperTrader:
         age=now-p.opened_ms
         mfe_bps=p.mfe_pct*100.0
         mae_bps=p.mae_pct*100.0
+
+        # H3T-D SHADOW: observe whether the original hard sniper would confirm
+        # shortly AFTER the H3T-C entry. This never changes entry, size, or exit.
+        sh=self.sniper_shadow.get(p.position_id)
+        if sh is not None and sh.get("outcome") is None:
+            try:
+                cur_long,cur_short=directional_scores(p.head.value,f)
+                cur_score=cur_long if p.side=="BUY" else cur_short
+                cur_regime=classify_regime(f)
+                product=self._product(p.symbol)
+                fee_bps=BYBIT_FEES[product].taker_bps
+                cur_expected_cost=2*fee_bps+float(f.get("spread_bps",0) or 0)
+                cur_edge=projected_edge_bps(p.side,cur_score,pol.gate,f)
+                cur_required=cur_expected_cost*pol.cost_mult+pol.cost_buffer_bps
+                cur_sizing=size_decision(
+                    pol,p.side,cur_score,cur_regime,f,cur_required,cur_edge,
+                    float(ef.get("history_penalty",0) or 0),
+                )
+                cur_sniper=sniper_entry_quality(cur_sizing,cur_regime,f)
+                pre_ok=(
+                    float(f.get("spread_bps",9999) or 9999)<=pol.max_spread_bps
+                    and int(f.get("trade_count_1s",0) or 0)>=pol.min_trades_1s
+                    and cur_score>=pol.gate
+                    and cur_regime in pol.allow_regimes
+                    and cur_edge>=cur_required
+                    and not cur_sizing.get("reject")
+                )
+                good=bool(pre_ok and cur_sniper.get("sniper_clear"))
+                if good:
+                    last=sh.get("last_good_ms")
+                    if last is None or now-int(last)>1500:
+                        sh["hits"]=1
+                        sh["first_good_ms"]=now
+                    else:
+                        sh["hits"]=int(sh.get("hits",0))+1
+                    sh["last_good_ms"]=now
+                    if cur_sniper.get("sniper_super"):
+                        sh["super_hits"]=int(sh.get("super_hits",0))+1
+                    sh["max_hits"]=max(int(sh.get("max_hits",0)),int(sh.get("hits",0)))
+                    first=int(sh.get("first_good_ms") or now)
+                    confirm_ms=now-first
+                    if int(sh.get("hits",0))>=3 and confirm_ms>=650:
+                        sh["outcome"]="PASS"
+                        sh["confirm_ms"]=confirm_ms
+                        sh["grade"]="SUPER" if int(sh.get("super_hits",0))>=2 else "CLEAR"
+                        self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                                           VALUES(?,?,?,?,?,?,?,?)""",
+                                        (now,book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
+                                         "SNIPER_SHADOW","PASS",
+                                         json.dumps({"position_id":p.position_id,"side":p.side,"bucket":bucket,
+                                                     "hits":sh["hits"],"super_hits":sh["super_hits"],
+                                                     "confirm_ms":confirm_ms,"grade":sh["grade"],
+                                                     "move_bps_at_confirm":move_bps},
+                                                    separators=(",",":"))))
+                if sh.get("outcome") is None and age>=1500:
+                    sh["outcome"]="REJECT"
+                    sh["grade"]=None
+                    self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                                       VALUES(?,?,?,?,?,?,?,?)""",
+                                    (now,book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
+                                     "SNIPER_SHADOW","REJECT",
+                                     json.dumps({"position_id":p.position_id,"side":p.side,"bucket":bucket,
+                                                 "hits":sh.get("hits",0),"super_hits":sh.get("super_hits",0),
+                                                 "max_hits":sh.get("max_hits",0),"age_ms":age},
+                                                separators=(",",":"))))
+            except Exception as e:
+                if age>=1500 and sh.get("outcome") is None:
+                    sh["outcome"]="ERROR"
+                    sh["error"]=str(e)[:200]
 
         # ELC adapted from RHB: cut only a confirmed weak trajectory, not a shallow
         # dip that has begun to recover. Thresholds scale to each VOL bucket policy.
@@ -489,9 +542,26 @@ class PaperTrader:
             "trail_fired":trail_fired,
             "early_loser_confirmed":early_loser_cut,
             "winner_veto":winner_veto,
+            "sniper_shadow_outcome":(
+                self.sniper_shadow.get(p.position_id,{}).get("outcome")
+                if p.position_id in self.sniper_shadow else None
+            ),
+            "sniper_shadow_grade":(
+                self.sniper_shadow.get(p.position_id,{}).get("grade")
+                if p.position_id in self.sniper_shadow else None
+            ),
+            "sniper_shadow_confirm_ms":(
+                self.sniper_shadow.get(p.position_id,{}).get("confirm_ms")
+                if p.position_id in self.sniper_shadow else None
+            ),
+            "sniper_shadow_hits":(
+                self.sniper_shadow.get(p.position_id,{}).get("max_hits")
+                if p.position_id in self.sniper_shadow else None
+            ),
         }
         self._ledger("TRADING",p.head.value,p.position_id,"CLOSE",w.trading_cash_usd-before,w.trading_cash_usd,detail)
         self.tail_state.pop(p.position_id,None)
+        self.sniper_shadow.pop(p.position_id,None)
         self.last_close_ms[p.symbol]=now_ms()
         if reason=="EARLY_LOSER_CUT":
             self.elc_shadows.append({
