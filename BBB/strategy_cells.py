@@ -281,6 +281,57 @@ def size_decision(
     })
     return q
 
+def sniper_entry_quality(
+    sizing:dict,
+    regime:str,
+    f:dict,
+) -> dict:
+    """H3T-D ultra-selective pre-entry quality gate.
+
+    CLEAR requires full short-horizon directional agreement, positive 5s
+    persistence, clean market quality, no historical penalty, and strong
+    cost-adjusted edge. SUPER is a stricter subset eligible for larger size.
+    """
+    d=directional_features("BUY" if float(sizing.get("dir_ret_1s_bps",0))>=0 else "SELL", f)
+    # Use the already direction-normalized values from sizing whenever present.
+    d250=float(sizing.get("dir_ret_250ms_bps", d.get("dir_ret_250ms_bps",0)) or 0)
+    d1=float(sizing.get("dir_ret_1s_bps", d.get("dir_ret_1s_bps",0)) or 0)
+    d5=float(sizing.get("dir_ret_5s_bps", d.get("dir_ret_5s_bps",0)) or 0)
+    dflow=float(sizing.get("dir_flow", d.get("dir_flow",0)) or 0)
+    dimb=float(sizing.get("dir_imbalance", d.get("dir_imbalance",0)) or 0)
+
+    clear=(
+        regime=="IMPULSE"
+        and bool(sizing.get("trade_now"))
+        and int(sizing.get("opposing_count",99) or 99)==0
+        and int(sizing.get("aligned_count",0) or 0)>=4
+        and float(sizing.get("edge_ratio",0) or 0)>=1.80
+        and float(sizing.get("winner_score",0) or 0)>=96.0
+        and float(sizing.get("loser_risk",100) or 100)<=12.0
+        and int(sizing.get("sizing_violations",99) or 99)==0
+        and float(sizing.get("spread_quality",-1) or -1)>=0.5
+        and float(sizing.get("history_penalty",0) or 0)<=0.0
+        and d250>0.0 and d1>0.0 and d5>0.0
+        and dflow>=0.05 and dimb>=0.05
+    )
+    super_clear=(
+        clear
+        and float(sizing.get("edge_ratio",0) or 0)>=2.20
+        and float(sizing.get("winner_score",0) or 0)>=98.5
+        and float(sizing.get("loser_risk",100) or 100)<=8.0
+        and d1>=2.0 and d5>=4.0
+        and dflow>=0.15 and dimb>=0.15
+    )
+    return {
+        "sniper_clear":clear,
+        "sniper_super":super_clear,
+        "sniper_d250":d250,
+        "sniper_d1":d1,
+        "sniper_d5":d5,
+        "sniper_dflow":dflow,
+        "sniper_dimb":dimb,
+    }
+
 def policies_json() -> str:
     ladder="H3T-C: MICRO .20x(clean only) / CAUTIOUS .35x / BASE .65x / GOOD 1x / STRONG 1.5x / PRIME 1x cap / ELITE 1x cap"
     return json.dumps({p.cell:{
