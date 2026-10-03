@@ -477,6 +477,41 @@ def board():
                     "median_net_$":round(float(pd.Series(nets).median()),6),
                 })
             st.dataframe(pd.DataFrame(shadow_table),hide_index=True,**_DF_KW)
+
+            # Near-miss diagnostics: how much retention would looser hit-count
+            # thresholds have produced on the exact same trades.
+            hit_rows=[]
+            for k in (0,1,2,3):
+                wg=sum(1 for x in rows_shadow if x["winner"] and int(x.get("hits") or 0)>=k)
+                lg=sum(1 for x in rows_shadow if (not x["winner"]) and int(x.get("hits") or 0)>=k)
+                hit_rows.append({
+                    "min_shadow_hits":k,
+                    "winner_retention_%":round((100.0*wg/wins) if wins else 0.0,1),
+                    "loser_pass_%":round((100.0*lg/losses) if losses else 0.0,1),
+                    "losers_rejected_%":round((100.0*(losses-lg)/losses) if losses else 0.0,1),
+                    "would_pass_W/L":f"{wg}/{lg}",
+                })
+            st.caption("Shadow near-miss by max consecutive good hits")
+            st.dataframe(pd.DataFrame(hit_rows),hide_index=True,**_DF_KW)
+
+            entry_clear_w=0
+            entry_clear_l=0
+            entry_super_w=0
+            entry_super_l=0
+            for pid,pnl,exit_reason,efs in sh_trades:
+                ef=safe_json(efs)
+                isw=float(pnl or 0)>0
+                if bool(ef.get("sniper_shadow_entry_clear")):
+                    if isw: entry_clear_w+=1
+                    else: entry_clear_l+=1
+                if bool(ef.get("sniper_shadow_entry_super")):
+                    if isw: entry_super_w+=1
+                    else: entry_super_l+=1
+            st.caption(
+                f"At entry: CLEAR winners {entry_clear_w}/{wins}, losers {entry_clear_l}/{losses} · "
+                f"SUPER winners {entry_super_w}/{wins}, losers {entry_super_l}/{losses}"
+            )
+
         else:
             st.caption("H3T-D shadow analysis: no matched closed trades yet.")
     except Exception as e:
