@@ -200,18 +200,39 @@ def size_decision(
     q=winner_loser_scores(pol,side,score,regime,f,required_cost_edge_bps,projected_edge,history_penalty)
     s=q["sizing_score"]
 
-    # H3 economics gate: do not pay taker fees for thin or contradictory edge.
-    hard_reject_reason=None
-    if q["edge_ratio"]<1.30:
-        hard_reject_reason="EDGE_RATIO_LT_1_30"
-    elif q["opposing_count"]>=2:
-        hard_reject_reason="OPPOSING_GTE_2"
-    elif q["loser_risk"]>=35.0:
-        hard_reject_reason="LOSER_RISK_GTE_35"
-    elif s<5:
-        hard_reject_reason="SIZING_SCORE_LT_5"
+    # H3T-C churn gate: compute quality violations before sizing so the same
+    # evidence can reject weak trades instead of merely shrinking them.
+    violations=0
+    if q["opposing_count"]>0: violations+=1
+    if not q["trade_now"]: violations+=1
+    if q["edge_ratio"]<1.45: violations+=1
+    if regime!="IMPULSE": violations+=1
+    if q["spread_quality"]<0: violations+=1
 
-    if hard_reject_reason:
+    reject_reason=None
+
+    # Existing H3 hard rejects.
+    if q["edge_ratio"]<1.30:
+        reject_reason="EDGE_RATIO_LT_1_30"
+    elif q["opposing_count"]>=2:
+        reject_reason="OPPOSING_GTE_2"
+    elif q["loser_risk"]>=35.0:
+        reject_reason="LOSER_RISK_GTE_35"
+    elif s<5:
+        reject_reason="SIZING_SCORE_LT_5"
+
+    # H3T-C: EXTREME must actually be exceptional. It was dominating flow,
+    # so require clean alignment and meaningfully stronger cost-adjusted edge.
+    is_extreme="-EXTREME-" in pol.cell
+    if reject_reason is None and is_extreme:
+        if q["edge_ratio"]<1.60:
+            reject_reason="EXTREME_EDGE_RATIO_LT_1_60"
+        elif q["opposing_count"]>0:
+            reject_reason="EXTREME_OPPOSING"
+        elif violations>0:
+            reject_reason="EXTREME_QUALITY_VIOLATION"
+
+    if reject_reason:
         tier,mult,reject="REJECT",0.0,True
     elif s<15:
         tier,mult,reject="MICRO",TIER_MULTIPLIERS["MICRO"],False
@@ -228,35 +249,40 @@ def size_decision(
     else:
         tier,mult,reject="ELITE",TIER_MULTIPLIERS["ELITE"],False
 
-    # Hard money caps for marginal setups.
+    # Existing marginal-setup money caps.
     if not reject and q["edge_ratio"]<1.45 and mult>TIER_MULTIPLIERS["MICRO"]:
         tier,mult="MICRO",TIER_MULTIPLIERS["MICRO"]
     if not reject and q["loser_risk"]>=25.0 and mult>TIER_MULTIPLIERS["CAUTIOUS"]:
         tier,mult="CAUTIOUS",TIER_MULTIPLIERS["CAUTIOUS"]
 
-    # Safety caps: big size only when the market actually agrees with the trade.
-    violations=0
-    if q["opposing_count"]>0: violations+=1
-    if not q["trade_now"]: violations+=1
-    if q["edge_ratio"]<1.45: violations+=1
-    if regime!="IMPULSE": violations+=1
-    if q["spread_quality"]<0: violations+=1
-    if not reject and violations>=2 and mult>TIER_MULTIPLIERS["BASE"]:
+    # H3T-C: one violation gets at most BASE; two or more do not pay fees at all.
+    if not reject and violations>=2:
+        tier,mult,reject="REJECT",0.0,True
+        reject_reason="SIZING_VIOLATIONS_GTE_2"
+    elif not reject and violations==1 and mult>TIER_MULTIPLIERS["BASE"]:
         tier,mult="BASE",TIER_MULTIPLIERS["BASE"]
-    elif not reject and violations==1 and mult>TIER_MULTIPLIERS["GOOD"]:
-        tier,mult="GOOD",TIER_MULTIPLIERS["GOOD"]
+
+    # H3T-C: low-edge / compromised MICRO is churn, not a small opportunity.
+    if not reject and tier=="MICRO" and (q["edge_ratio"]<1.45 or violations>=1):
+        tier,mult,reject="REJECT",0.0,True
+        reject_reason="MICRO_CHURN_GATE"
+
+    # H3T-C: pre-entry score has not earned leverage-like size amplification.
+    # Preserve PRIME/ELITE labels for diagnostics, but cap pre-arm size at 1x.
+    if not reject and tier in {"PRIME","ELITE"}:
+        mult=min(mult,1.0)
 
     q.update({
         "tier":tier,
         "size_multiplier":mult,
         "reject":reject,
-        "reject_reason":hard_reject_reason,
+        "reject_reason":reject_reason,
         "sizing_violations":violations,
     })
     return q
 
 def policies_json() -> str:
-    ladder="MICRO .20x / CAUTIOUS .35x / BASE .65x / GOOD 1x / STRONG 1.5x / PRIME 2x / ELITE 2.5x"
+    ladder="H3T-C: MICRO .20x(clean only) / CAUTIOUS .35x / BASE .65x / GOOD 1x / STRONG 1.5x / PRIME 1x cap / ELITE 1x cap"
     return json.dumps({p.cell:{
         "gate":p.gate,"tp_bps":p.take_profit_bps,"sl_bps":p.stop_loss_bps,
         "hold_ms":p.max_hold_ms,"spread_max_bps":p.max_spread_bps,
