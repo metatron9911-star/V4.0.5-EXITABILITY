@@ -272,6 +272,12 @@ def size_decision(
     if not reject and tier in {"PRIME","ELITE"}:
         mult=min(mult,1.0)
 
+    # H3T-D SHADOW equal-size control:
+    # keep all entry/reject logic and tier labels unchanged, but remove sizing
+    # distortion while the shadow classifier is being measured.
+    if not reject:
+        mult=1.0
+
     q.update({
         "tier":tier,
         "size_multiplier":mult,
@@ -333,7 +339,7 @@ def sniper_entry_quality(
     }
 
 def policies_json() -> str:
-    ladder="H3T-C live sizing; H3T-D shadow PASS/REJECT only (no entry blocking or resize)"
+    ladder="H3T-D shadow control: all accepted entries 1.0x; PASS/REJECT remains observational"
     return json.dumps({p.cell:{
         "gate":p.gate,"tp_bps":p.take_profit_bps,"sl_bps":p.stop_loss_bps,
         "hold_ms":p.max_hold_ms,"spread_max_bps":p.max_spread_bps,
