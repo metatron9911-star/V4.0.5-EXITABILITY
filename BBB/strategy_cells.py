@@ -364,6 +364,16 @@ TAIL_TIMEOUT_MULT = {"ACCEL": 4.5, "FLAT": 3.0, "DECEL": 2.0}
 # This intentionally allows genuine post-arm momentum expansion to classify as
 # ACCEL even when the arm moment itself was weak.
 TAIL_ARM_MOMENTUM_MIN = 0.75
+TAIL_ACCEL_EPS = 0.30
+
+def classify_tail_accel_delta(m_now: float, m_prev: float) -> str:
+    """H3T-B2: classify tail state from the derivative of directional momentum."""
+    delta = m_now - m_prev
+    if delta > TAIL_ACCEL_EPS and m_now > 0:
+        return "ACCEL"
+    if delta < -TAIL_ACCEL_EPS or m_now <= 0:
+        return "DECEL"
+    return "FLAT"
 
 def classify_tail_accel(m_now: float, m_arm: float) -> str:
     """Post-arm momentum classification.
@@ -406,6 +416,18 @@ def tail_trail_bps(
 ) -> float:
     base = TAIL_TRAIL_COEF[accel] * max(mfe_bps, tp_bps)
     return base * TAIL_BUCKET_SCALE.get(bucket, 1.00)
+
+def tail_trail_bps_binding(
+    trail_by_accel: float,
+    mfe_bps: float,
+    active_floor_bps: float,
+    hit: list[int],
+) -> float:
+    """H3T-B2: cap giveback by milestone floor only after a milestone is hit."""
+    if not hit:
+        return trail_by_accel
+    headroom = max(0.0, mfe_bps - active_floor_bps)
+    return min(trail_by_accel, headroom)
 
 def tail_timeout_ms(max_hold_ms: int, accel: str) -> int:
     return int(max_hold_ms * TAIL_TIMEOUT_MULT[accel])
