@@ -167,7 +167,6 @@ class PaperTrader:
         history_penalty=self._historical_penalty(bucket,side,regime)
         sizing=size_decision(pol,side,score,regime,f,required_cost_edge,edge,history_penalty)
         if sizing["reject"]:
-            self.sniper_pending.pop(symbol,None)
             self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
                                VALUES(?,?,?,?,?,?,?,?)""",
                             (now_ms(),exchange_ts_ms,self.session_id,head,symbol,"SIZING_REJECT",
