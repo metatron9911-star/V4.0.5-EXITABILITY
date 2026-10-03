@@ -474,9 +474,9 @@ def board():
                     "WR_%":round(100*w/n,1),
                     "total_net_$":round(sum(nets),5),
                     "avg_net_$":round(sum(nets)/n,6),
-                    "median_net_$":round(float(pd.Series(nets).median()),6),
+                    "median_net_$":round(float(statistics.median(nets)),6),
                 })
-            st.dataframe(pd.DataFrame(shadow_table),hide_index=True,**_DF_KW)
+            st.dataframe(shadow_table,hide_index=True,**_DF_KW)
 
             # Near-miss diagnostics: how much retention would looser hit-count
             # thresholds have produced on the exact same trades.
@@ -492,7 +492,7 @@ def board():
                     "would_pass_W/L":f"{wg}/{lg}",
                 })
             st.caption("Shadow near-miss by max consecutive good hits")
-            st.dataframe(pd.DataFrame(hit_rows),hide_index=True,**_DF_KW)
+            st.dataframe(hit_rows,hide_index=True,**_DF_KW)
 
             entry_clear_w=0
             entry_clear_l=0
