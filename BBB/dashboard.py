@@ -41,7 +41,7 @@ div[data-testid="stMetricDelta"] { font-size: .95rem !important; }
 """,unsafe_allow_html=True)
 
 st.title("BBB — BYBIT BOT BETA")
-st.caption("PAPER / SHADOW ONLY · H3 loss-first sizing · dynamic VOL universe")
+st.caption("PAPER / SHADOW ONLY · H3T-C churn gate · dynamic VOL universe")
 
 def cx():
     return sqlite3.connect(DB,check_same_thread=False) if DB.exists() else None
@@ -95,7 +95,7 @@ def board():
     trading_cash=float(meta.get("trading_cash_usd",meta.get("paper_start_usd","500")) or 0)
 
     elc=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND exit_reason='EARLY_LOSER_CUT'",(session,)).fetchone()[0]
-    tails=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND exit_reason IN ('RIGHT_TAIL_TRAIL','RIGHT_TAIL_TIME','RIGHT_TAIL_FLOOR')",(session,)).fetchone()[0]
+    tails=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND exit_reason LIKE 'RIGHT_TAIL%'",(session,)).fetchone()[0]
     cf60=db.execute("SELECT payload_json FROM events WHERE session_id=? AND stage='ELC_COUNTERFACTUAL' AND reason='60s'",(session,)).fetchall()
     cf60_rec=sum(1 for (j,) in cf60 if safe_json(j).get("recovered"))
 
