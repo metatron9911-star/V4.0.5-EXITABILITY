@@ -1,0 +1,33 @@
+name: H3T-B2 smoke
+
+on:
+  push:
+    branches:
+      - bbb-h3t-b2
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile
+        run: python -m py_compile BBB/strategy_cells.py BBB/paper.py BBB/dashboard.py
+      - name: Import sanity
+        env:
+          PYTHONPATH: BBB
+        run: |
+          python - <<'PY'
+          import inspect, paper
+          src = inspect.getsource(paper)
+          assert "classify_tail_accel_delta" in src
+          assert "classify_tail_accel," not in src.replace("classify_tail_accel_delta","")
+          print("import sanity: OK")
+          PY
+      - name: H3T-B2 unit and scenario tests
+        env:
+          PYTHONPATH: BBB
+        run: python -m unittest -v BBB/test_h3t_b2.py
