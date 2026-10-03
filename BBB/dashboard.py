@@ -391,6 +391,97 @@ def board():
     else:
         st.caption("No closed trades in analysis session yet.")
 
+
+    # H3T-D shadow retention analysis (read-only)
+    try:
+        shadow_sid="PAPER-BBB-20261003-H3T-D-SHADOW"
+        sh_events=db.execute("""SELECT reason,payload_json FROM events
+                                WHERE session_id=? AND stage='SNIPER_SHADOW'
+                                  AND reason IN ('PASS','REJECT')""",
+                             (shadow_sid,)).fetchall()
+        sh_by_pid={}
+        for reason,j in sh_events:
+            pp=safe_json(j)
+            pid=str(pp.get("position_id") or "")
+            if pid:
+                sh_by_pid[pid]={"shadow":str(reason),"payload":pp}
+
+        sh_trades=db.execute("""SELECT position_id,net_pnl_usd,exit_reason,entry_features_json
+                                FROM trades
+                                WHERE session_id=? AND status='CLOSED'""",
+                             (shadow_sid,)).fetchall()
+        rows_shadow=[]
+        for pid,pnl,exit_reason,efs in sh_trades:
+            sh=sh_by_pid.get(str(pid))
+            if not sh:
+                continue
+            ef=safe_json(efs)
+            rows_shadow.append({
+                "position_id":str(pid),
+                "shadow":sh["shadow"],
+                "net":float(pnl or 0),
+                "winner":float(pnl or 0)>0,
+                "exit_reason":str(exit_reason or ""),
+                "tier":str(ef.get("sizing_tier","")),
+                "bucket":str(ef.get("vol_bucket","")),
+                "grade":str(sh["payload"].get("grade") or ""),
+                "hits":int(sh["payload"].get("hits") or sh["payload"].get("max_hits") or 0),
+                "confirm_ms":sh["payload"].get("confirm_ms"),
+            })
+
+        if rows_shadow:
+            total=len(rows_shadow)
+            wins=sum(1 for x in rows_shadow if x["winner"])
+            losses=total-wins
+            pass_rows=[x for x in rows_shadow if x["shadow"]=="PASS"]
+            rej_rows=[x for x in rows_shadow if x["shadow"]=="REJECT"]
+            win_pass=sum(1 for x in pass_rows if x["winner"])
+            loss_pass=sum(1 for x in pass_rows if not x["winner"])
+            win_rej=sum(1 for x in rej_rows if x["winner"])
+            loss_rej=sum(1 for x in rej_rows if not x["winner"])
+            winner_ret=(win_pass/wins*100.0) if wins else 0.0
+            loser_cut=(loss_rej/losses*100.0) if losses else 0.0
+            pass_wr=(win_pass/len(pass_rows)*100.0) if pass_rows else 0.0
+            pass_net=sum(x["net"] for x in pass_rows)
+            rej_net=sum(x["net"] for x in rej_rows)
+
+            st.subheader("H3T-D shadow — winner retention")
+            z=st.columns(8)
+            z[0].metric("Matched",total)
+            z[1].metric("Actual W/L",f"{wins}/{losses}")
+            z[2].metric("PASS",len(pass_rows))
+            z[3].metric("REJECT",len(rej_rows))
+            z[4].metric("Winner retention",f"{winner_ret:.1f}%")
+            z[5].metric("Losers rejected",f"{loser_cut:.1f}%")
+            z[6].metric("PASS WR",f"{pass_wr:.1f}%")
+            z[7].metric("PASS net $",f"{pass_net:.4f}")
+            st.caption(
+                f"Winners: PASS {win_pass}, REJECT {win_rej} · "
+                f"Losers: PASS {loss_pass}, REJECT {loss_rej} · "
+                f"REJECT net \${rej_net:.4f}"
+            )
+            shadow_table=[]
+            for label,grp in (("PASS",pass_rows),("REJECT",rej_rows)):
+                if not grp:
+                    continue
+                n=len(grp)
+                w=sum(1 for x in grp if x["winner"])
+                nets=[x["net"] for x in grp]
+                shadow_table.append({
+                    "shadow":label,
+                    "N":n,
+                    "W/L":f"{w}/{n-w}",
+                    "WR_%":round(100*w/n,1),
+                    "total_net_$":round(sum(nets),5),
+                    "avg_net_$":round(sum(nets)/n,6),
+                    "median_net_$":round(float(pd.Series(nets).median()),6),
+                })
+            st.dataframe(pd.DataFrame(shadow_table),hide_index=True,**_DF_KW)
+        else:
+            st.caption("H3T-D shadow analysis: no matched closed trades yet.")
+    except Exception as e:
+        st.caption(f"H3T-D shadow analysis unavailable: {e}")
+
     st.subheader("Strategy cells")
     cells=safe_json(meta.get("strategy_cells_json","{}"))
     if cells:
