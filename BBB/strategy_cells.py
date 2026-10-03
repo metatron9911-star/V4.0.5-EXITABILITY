@@ -333,7 +333,7 @@ def sniper_entry_quality(
     }
 
 def policies_json() -> str:
-    ladder="H3T-D: SNIPER CLEAR 1.5x / SUPER 2.5x after persistent confirmation"
+    ladder="H3T-C live sizing; H3T-D shadow PASS/REJECT only (no entry blocking or resize)"
     return json.dumps({p.cell:{
         "gate":p.gate,"tp_bps":p.take_profit_bps,"sl_bps":p.stop_loss_bps,
         "hold_ms":p.max_hold_ms,"spread_max_bps":p.max_spread_bps,
