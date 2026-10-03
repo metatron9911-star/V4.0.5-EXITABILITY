@@ -395,10 +395,11 @@ def board():
     # H3T-D shadow retention analysis (read-only)
     try:
         shadow_sid="PAPER-BBB-20261003-H3T-D-SHADOW"
+        shadow_like=shadow_sid+"%"
         sh_events=db.execute("""SELECT reason,payload_json FROM events
-                                WHERE session_id=? AND stage='SNIPER_SHADOW'
+                                WHERE session_id LIKE ? AND stage='SNIPER_SHADOW'
                                   AND reason IN ('PASS','REJECT')""",
-                             (shadow_sid,)).fetchall()
+                             (shadow_like,)).fetchall()
         sh_by_pid={}
         for reason,j in sh_events:
             pp=safe_json(j)
@@ -408,8 +409,8 @@ def board():
 
         sh_trades=db.execute("""SELECT position_id,net_pnl_usd,exit_reason,entry_features_json
                                 FROM trades
-                                WHERE session_id=? AND status='CLOSED'""",
-                             (shadow_sid,)).fetchall()
+                                WHERE session_id LIKE ? AND status='CLOSED'""",
+                             (shadow_like,)).fetchall()
         rows_shadow=[]
         for pid,pnl,exit_reason,efs in sh_trades:
             sh=sh_by_pid.get(str(pid))
@@ -511,6 +512,42 @@ def board():
                 f"At entry: CLEAR winners {entry_clear_w}/{wins}, losers {entry_clear_l}/{losses} · "
                 f"SUPER winners {entry_super_w}/{wins}, losers {entry_super_l}/{losses}"
             )
+
+            # Entry-condition retention/rejection matrix from stored entry features.
+            cond_specs = [
+                ("edge>=1.45", lambda ef: float(ef.get("edge_ratio",0) or 0) >= 1.45),
+                ("edge>=1.60", lambda ef: float(ef.get("edge_ratio",0) or 0) >= 1.60),
+                ("edge>=1.80", lambda ef: float(ef.get("edge_ratio",0) or 0) >= 1.80),
+                ("edge>=2.00", lambda ef: float(ef.get("edge_ratio",0) or 0) >= 2.00),
+                ("winner>=90", lambda ef: float(ef.get("winner_score",0) or 0) >= 90),
+                ("winner>=96", lambda ef: float(ef.get("winner_score",0) or 0) >= 96),
+                ("loser<=14", lambda ef: float(ef.get("loser_risk",999) or 999) <= 14),
+                ("loser<=10", lambda ef: float(ef.get("loser_risk",999) or 999) <= 10),
+                ("opposed=0", lambda ef: int(ef.get("opposing_count",99)) == 0),
+                ("violations=0", lambda ef: int(ef.get("sizing_violations",99)) == 0),
+                ("ret250 dir>0", lambda ef: float(ef.get("sniper_shadow_entry_d250",0) or 0) > 0),
+                ("ret1 dir>0", lambda ef: float(ef.get("sniper_shadow_entry_d1",0) or 0) > 0),
+                ("ret5 dir>0", lambda ef: float(ef.get("sniper_shadow_entry_d5",0) or 0) > 0),
+                ("flow dir>=0.05", lambda ef: float(ef.get("sniper_shadow_entry_dflow",0) or 0) >= 0.05),
+                ("imb dir>=0.05", lambda ef: float(ef.get("sniper_shadow_entry_dimb",0) or 0) >= 0.05),
+            ]
+            trade_efs=[]
+            for pid,pnl,exit_reason,efs in sh_trades:
+                trade_efs.append((float(pnl or 0)>0, safe_json(efs)))
+            cond_rows=[]
+            for name,fn in cond_specs:
+                wp=sum(1 for isw,ef in trade_efs if isw and fn(ef))
+                lp=sum(1 for isw,ef in trade_efs if (not isw) and fn(ef))
+                cond_rows.append({
+                    "condition":name,
+                    "winner_retention_%":round((100.0*wp/wins) if wins else 0.0,1),
+                    "loser_pass_%":round((100.0*lp/losses) if losses else 0.0,1),
+                    "losers_rejected_%":round((100.0*(losses-lp)/losses) if losses else 0.0,1),
+                    "pass_W/L":f"{wp}/{lp}",
+                })
+            st.caption("Entry-condition retention matrix")
+            st.dataframe(cond_rows,hide_index=True,**_DF_KW)
+
 
         else:
             st.caption("H3T-D shadow analysis: no matched closed trades yet.")
