@@ -11,7 +11,12 @@ from typing import Dict
 from engine import PaperBook, SignalSnapshot, HeadName, ProductClass, BYBIT_FEES, now_ms
 from orderbook import LocalBook
 from sanitizer import Sanitizer
-from strategy_cells import POLICIES, classify_regime, directional_scores, projected_edge_bps, size_decision, policies_json
+from strategy_cells import (
+    POLICIES, classify_regime, directional_scores, projected_edge_bps,
+    size_decision, policies_json,
+    classify_tail_accel, tail_milestones_hit, tail_active_floor_bps,
+    tail_trail_bps, tail_timeout_ms,
+)
 
 class PaperTrader:
     def __init__(self, cx: sqlite3.Connection, session_id: str, start_usd: float, launch_symbols:set[str]):
@@ -35,6 +40,8 @@ class PaperTrader:
         )
         self.sanitizer_rejects=0
         self.elc_shadows=[]
+        # H3T-B: post-arm tail state, keyed by position_id.
+        self.tail_state: Dict[str,dict]={}
         self._write_wallet_meta()
 
     def _product(self,symbol:str) -> ProductClass:
@@ -50,6 +57,13 @@ class PaperTrader:
         for p in self.book.positions.values():
             if p.symbol==symbol:return p
         return None
+
+    def _directional_momentum(self, side:str, f:dict) -> float:
+        sign=1.0 if side=="BUY" else -1.0
+        return (
+            sign*float(f.get("ret_1s_bps",0))
+            + 0.5*sign*float(f.get("ret_250ms_bps",0))
+        )
 
     def _write_wallet_meta(self):
         w=self.book.wallets
@@ -315,36 +329,70 @@ class PaperTrader:
         if (not p.tail_armed) and mfe_bps>=tail_arm_trigger and continuation:
             p.tail_armed=True
             p.tail_arm_ms=now
+            self.tail_state[p.position_id]={
+                "tail_peak_bps":mfe_bps,
+                "tail_arm_momentum":self._directional_momentum(p.side,f),
+                "tail_accel":"FLAT",
+                "tail_milestones_hit":[],
+            }
             self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
                                VALUES(?,?,?,?,?,?,?,?)""",
                             (now,book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,"TAIL_ARM","RIGHT_TAIL",
                              json.dumps({"side":p.side,"bucket":bucket,"mfe_bps":mfe_bps,
-                                         "move_bps":move_bps,"flow":current_flow,"imbalance":current_imb},
+                                         "move_bps":move_bps,"flow":current_flow,"imbalance":current_imb,
+                                         "tail_arm_momentum":self.tail_state[p.position_id]["tail_arm_momentum"]},
                                         separators=(",",":"))))
 
         from_peak_bps=mfe_bps-move_bps
-        tail_trail_bps=max(0.30*pol.take_profit_bps,0.26*max(mfe_bps,pol.take_profit_bps))
-        # Once armed, do not allow a captured winner to decay back through costs.
+        tp_bps=pol.take_profit_bps
         expected_cost=float(ef.get("required_cost_edge_bps",0) or 0)
-        tail_profit_floor_bps=max(0.18*pol.take_profit_bps,0.65*expected_cost)
-        tail_timeout=pol.max_hold_ms*3
+        base_floor_bps=max(0.18*tp_bps,0.65*expected_cost)
+
+        st=self.tail_state.get(p.position_id)
+        active_floor_bps=base_floor_bps
+        trail_bps_eff=0.30*max(mfe_bps,tp_bps)
+        timeout_ms_eff=pol.max_hold_ms*3
+        accel="FLAT"
+
+        if p.tail_armed and st is not None:
+            if mfe_bps>st["tail_peak_bps"]:
+                st["tail_peak_bps"]=mfe_bps
+            m_now=self._directional_momentum(p.side,f)
+            accel=classify_tail_accel(m_now,st["tail_arm_momentum"])
+            st["tail_accel"]=accel
+            hit=tail_milestones_hit(mfe_bps,tp_bps)
+            st["tail_milestones_hit"]=hit
+            active_floor_bps=tail_active_floor_bps(tp_bps,base_floor_bps,hit)
+            trail_bps_eff=tail_trail_bps(mfe_bps,tp_bps,accel,bucket)
+            timeout_ms_eff=tail_timeout_ms(pol.max_hold_ms,accel)
+
+        floor_fired=p.tail_armed and move_bps<=active_floor_bps
+        trail_fired=p.tail_armed and from_peak_bps>=trail_bps_eff
 
         reason=None
         if move_bps<=-pol.stop_loss_bps:
             reason="STOP_LOSS"
         elif early_loser_cut:
             reason="EARLY_LOSER_CUT"
-        elif p.tail_armed and move_bps<=tail_profit_floor_bps:
-            reason="RIGHT_TAIL_FLOOR"
-        elif p.tail_armed and from_peak_bps>=tail_trail_bps:
-            reason="RIGHT_TAIL_TRAIL"
-        elif (not p.tail_armed) and move_bps>=pol.take_profit_bps:
+        elif floor_fired:
+            reason="RIGHT_TAIL_MILESTONE" if (st and st.get("tail_milestones_hit")) else "RIGHT_TAIL_FLOOR"
+        elif trail_fired:
+            reason={
+                "ACCEL":"RIGHT_TAIL_ACCEL_TRAIL",
+                "FLAT":"RIGHT_TAIL_TRAIL",
+                "DECEL":"RIGHT_TAIL_DECEL_TRAIL",
+            }[accel]
+        elif (not p.tail_armed) and move_bps>=tp_bps:
             reason="TAKE_PROFIT"
-        elif p.tail_armed and age>=tail_timeout:
+        elif p.tail_armed and age>=timeout_ms_eff:
             reason="RIGHT_TAIL_TIME"
         elif (not p.tail_armed) and age>=pol.max_hold_ms:
             reason="TIME_EXIT"
         if not reason:return
+
+        secondary=None
+        if floor_fired and trail_fired:
+            secondary="TRAIL_ALSO"
 
         exit_side="SELL" if p.side=="BUY" else "BUY"
         exit_vwap,filled=book.walk_vwap(exit_side,p.notional_usd)
@@ -358,12 +406,32 @@ class PaperTrader:
                           mae_pct=?,mfe_pct=?,hold_ms=?,exit_reason=?,status='CLOSED',closed_ms=?
                           WHERE position_id=?""",
                        (exit_vwap,exit_fee,gross,net,p.mae_pct,p.mfe_pct,age,reason,now_ms(),p.position_id))
-        self._ledger("TRADING",p.head.value,p.position_id,"CLOSE",w.trading_cash_usd-before,w.trading_cash_usd,
-                     {"reason":reason,"exit_vwap":exit_vwap,"net_pnl":net,
-                      "mfe_bps":mfe_bps,"mae_bps":mae_bps,"move_bps":move_bps,
-                      "tail_armed":p.tail_armed,"tail_trail_bps":tail_trail_bps,
-                      "tail_profit_floor_bps":tail_profit_floor_bps,
-                      "early_loser_confirmed":early_loser_cut,"winner_veto":winner_veto})
+        detail={
+            "reason":reason,
+            "exit_vwap":exit_vwap,
+            "net_pnl":net,
+            "mfe_bps":mfe_bps,
+            "mae_bps":mae_bps,
+            "move_bps":move_bps,
+            "tail_armed":p.tail_armed,
+            "tail_trail_bps":trail_bps_eff,
+            "tail_profit_floor_bps":base_floor_bps,
+            "active_floor_bps":active_floor_bps,
+            "tail_peak_bps":st.get("tail_peak_bps") if st else None,
+            "tail_capture_ratio":(
+                move_bps/st["tail_peak_bps"]
+                if st and st.get("tail_peak_bps",0)>0 else None
+            ),
+            "tail_accel_final":accel if p.tail_armed else None,
+            "tail_milestones_hit":st.get("tail_milestones_hit",[]) if st else [],
+            "exit_trigger_secondary":secondary,
+            "floor_fired":floor_fired,
+            "trail_fired":trail_fired,
+            "early_loser_confirmed":early_loser_cut,
+            "winner_veto":winner_veto,
+        }
+        self._ledger("TRADING",p.head.value,p.position_id,"CLOSE",w.trading_cash_usd-before,w.trading_cash_usd,detail)
+        self.tail_state.pop(p.position_id,None)
         self.last_close_ms[p.symbol]=now_ms()
         if reason=="EARLY_LOSER_CUT":
             self.elc_shadows.append({
