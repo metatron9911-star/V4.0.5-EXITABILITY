@@ -15,7 +15,7 @@ from strategy_cells import (
     POLICIES, classify_regime, directional_scores, projected_edge_bps,
     size_decision, policies_json,
     classify_tail_accel, tail_milestones_hit, tail_active_floor_bps,
-    tail_trail_bps, tail_timeout_ms,
+    tail_trail_bps, tail_timeout_ms, sniper_entry_quality,
 )
 
 class PaperTrader:
@@ -42,6 +42,9 @@ class PaperTrader:
         self.elc_shadows=[]
         # H3T-B: post-arm tail state, keyed by position_id.
         self.tail_state: Dict[str,dict]={}
+        # H3T-D: candidate must remain ultra-clean across several snapshots
+        # before we pay fees and open a position.
+        self.sniper_pending: Dict[str,dict]={}
         self._write_wallet_meta()
 
     def _product(self,symbol:str) -> ProductClass:
@@ -165,15 +168,55 @@ class PaperTrader:
         history_penalty=self._historical_penalty(bucket,side,regime)
         sizing=size_decision(pol,side,score,regime,f,required_cost_edge,edge,history_penalty)
         if sizing["reject"]:
+            self.sniper_pending.pop(symbol,None)
             self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
                                VALUES(?,?,?,?,?,?,?,?)""",
                             (now_ms(),exchange_ts_ms,self.session_id,head,symbol,"SIZING_REJECT",
                              str(sizing.get("reject_reason") or "LOW_SIZING_SCORE"),
                              json.dumps({"side":side,"bucket":bucket,"regime":regime,**sizing},separators=(",",":"))))
             return
+
+        # H3T-D SNIPER: trade only fully aligned, persistent candidates.
+        sniper=sniper_entry_quality(sizing,regime,f)
+        if not sniper["sniper_clear"]:
+            self.sniper_pending.pop(symbol,None)
+            self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (now_ms(),exchange_ts_ms,self.session_id,head,symbol,"SNIPER_REJECT","QUALITY_GATE",
+                             json.dumps({"side":side,"bucket":bucket,"regime":regime,**sizing,**sniper},separators=(",",":"))))
+            return
+
+        tnow=now_ms()
+        cand=self.sniper_pending.get(symbol)
+        if (not cand or cand.get("side")!=side or cand.get("bucket")!=bucket
+                or tnow-int(cand.get("last_ms",0))>1500):
+            cand={"side":side,"bucket":bucket,"first_ms":tnow,"last_ms":tnow,"hits":1,
+                  "super_hits":1 if sniper["sniper_super"] else 0}
+            self.sniper_pending[symbol]=cand
+            return
+
+        cand["last_ms"]=tnow
+        cand["hits"]=int(cand.get("hits",0))+1
+        if sniper["sniper_super"]:
+            cand["super_hits"]=int(cand.get("super_hits",0))+1
+
+        confirm_ms=tnow-int(cand.get("first_ms",tnow))
+        if cand["hits"]<3 or confirm_ms<650:
+            return
+
+        # Confirmed winner candidate. CLEAR gets 1.5x; persistent SUPER gets 2.5x.
+        sniper_grade="SUPER" if (sniper["sniper_super"] and cand.get("super_hits",0)>=2) else "CLEAR"
         tier=str(sizing["tier"])
-        size_mult=float(sizing["size_multiplier"])
+        size_mult=2.50 if sniper_grade=="SUPER" else 1.50
         confidence=float(sizing["winner_score"])
+        sizing.update({
+            **sniper,
+            "sniper_grade":sniper_grade,
+            "sniper_confirm_ms":confirm_ms,
+            "sniper_hits":cand["hits"],
+            "size_multiplier":size_mult,
+        })
+        self.sniper_pending.pop(symbol,None)
         base_margin=max(1.0,self.start_usd*pol.margin_fraction)
         margin=max(1.0,base_margin*size_mult)
         # Never let one PAPER position consume more than 5% of the original bank.
@@ -197,7 +240,13 @@ class PaperTrader:
                       "sizing_score":sizing["sizing_score"],"edge_ratio":sizing["edge_ratio"],
                       "aligned_count":sizing["aligned_count"],"opposing_count":sizing["opposing_count"],
                       "spread_quality":sizing["spread_quality"],"depth_quality":sizing["depth_quality"],
-                      "history_penalty":sizing["history_penalty"],"sizing_violations":sizing["sizing_violations"]},
+                      "history_penalty":sizing["history_penalty"],"sizing_violations":sizing["sizing_violations"],
+                      "sniper_grade":sizing.get("sniper_grade"),"sniper_confirm_ms":sizing.get("sniper_confirm_ms"),
+                      "sniper_hits":sizing.get("sniper_hits"),"sniper_clear":sizing.get("sniper_clear"),
+                      "sniper_super":sizing.get("sniper_super"),
+                      "sniper_d250":sizing.get("sniper_d250"),"sniper_d1":sizing.get("sniper_d1"),
+                      "sniper_d5":sizing.get("sniper_d5"),"sniper_dflow":sizing.get("sniper_dflow"),
+                      "sniper_dimb":sizing.get("sniper_dimb")},
         )
         pid=str(uuid.uuid4())
         pos=self.book.open_position(pid,sig,side,self.leverage,margin,float(entry_vwap),maker=False)
