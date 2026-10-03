@@ -263,3 +263,66 @@ def policies_json() -> str:
         "cost_mult":p.cost_mult,"cost_buffer_bps":p.cost_buffer_bps,
         "regimes":list(p.allow_regimes),"sizing":ladder
     } for p in POLICIES.values()},separators=(",",":"))
+
+
+# ---------- H3T-B: Right Tail 2.0 ----------
+TAIL_MILESTONES = (
+    (1.0, 0.45),   # MFE >= 1.0*TP -> floor 0.45*TP
+    (1.5, 0.85),
+    (2.0, 1.30),
+    (3.0, 2.10),
+)
+
+TAIL_TRAIL_COEF = {"ACCEL": 0.40, "FLAT": 0.30, "DECEL": 0.19}
+TAIL_BUCKET_SCALE = {"CORE": 0.85, "FAST": 1.00, "EXTREME": 1.20}
+TAIL_TIMEOUT_MULT = {"ACCEL": 4.5, "FLAT": 3.0, "DECEL": 2.0}
+
+# Weak/negative arm baselines are treated against a fixed positive floor.
+# This intentionally allows genuine post-arm momentum expansion to classify as
+# ACCEL even when the arm moment itself was weak.
+TAIL_ARM_MOMENTUM_MIN = 0.75
+
+def classify_tail_accel(m_now: float, m_arm: float) -> str:
+    """Post-arm momentum classification.
+
+    Baseline is floored at TAIL_ARM_MOMENTUM_MIN to prevent false ACCEL
+    when arm momentum was weak or negative.
+    """
+    baseline = max(m_arm, TAIL_ARM_MOMENTUM_MIN)
+    if m_now <= 0:
+        return "DECEL"
+    if m_now > baseline * 1.25:
+        return "ACCEL"
+    if m_now < baseline * 0.5:
+        return "DECEL"
+    return "FLAT"
+
+def tail_milestones_hit(mfe_bps: float, tp_bps: float) -> list[int]:
+    return [
+        i for i, (mfe_mult, _) in enumerate(TAIL_MILESTONES)
+        if mfe_bps >= mfe_mult * tp_bps
+    ]
+
+def tail_active_floor_bps(
+    tp_bps: float,
+    base_floor_bps: float,
+    hit: list[int],
+) -> float:
+    """Max of base floor and all triggered milestone floors.
+
+    `hit` must be computed via tail_milestones_hit() by caller.
+    """
+    floors = [TAIL_MILESTONES[i][1] * tp_bps for i in hit]
+    return max([base_floor_bps] + floors)
+
+def tail_trail_bps(
+    mfe_bps: float,
+    tp_bps: float,
+    accel: str,
+    bucket: str,
+) -> float:
+    base = TAIL_TRAIL_COEF[accel] * max(mfe_bps, tp_bps)
+    return base * TAIL_BUCKET_SCALE.get(bucket, 1.00)
+
+def tail_timeout_ms(max_hold_ms: int, accel: str) -> int:
+    return int(max_hold_ms * TAIL_TIMEOUT_MULT[accel])
