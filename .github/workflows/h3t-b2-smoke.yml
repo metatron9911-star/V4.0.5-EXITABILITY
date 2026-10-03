@@ -17,8 +17,9 @@ jobs:
       - name: Compile
         run: python -m py_compile BBB/strategy_cells.py BBB/paper.py BBB/dashboard.py
       - name: Import sanity
+        working-directory: BBB
         env:
-          PYTHONPATH: BBB
+          PYTHONPATH: .
         run: |
           python - <<'PY'
           import inspect, paper
@@ -28,6 +29,7 @@ jobs:
           print("import sanity: OK")
           PY
       - name: H3T-B2 unit and scenario tests
+        working-directory: BBB
         env:
-          PYTHONPATH: BBB
-        run: python -m unittest -v BBB/test_h3t_b2.py
+          PYTHONPATH: .
+        run: python -m unittest -v test_h3t_b2.py
