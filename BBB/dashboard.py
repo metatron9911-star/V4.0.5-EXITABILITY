@@ -41,7 +41,7 @@ div[data-testid="stMetricDelta"] { font-size: .95rem !important; }
 """,unsafe_allow_html=True)
 
 st.title("BBB — BYBIT BOT BETA")
-st.caption("PAPER / SHADOW ONLY · H3T-C churn gate · dynamic VOL universe")
+st.caption("PAPER / SHADOW ONLY · H3T-D sniper confirmation · dynamic VOL universe")
 
 def cx():
     return sqlite3.connect(DB,check_same_thread=False) if DB.exists() else None
