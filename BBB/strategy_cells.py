@@ -333,7 +333,7 @@ def sniper_entry_quality(
     }
 
 def policies_json() -> str:
-    ladder="H3T-C: MICRO .20x(clean only) / CAUTIOUS .35x / BASE .65x / GOOD 1x / STRONG 1.5x / PRIME 1x cap / ELITE 1x cap"
+    ladder="H3T-D: SNIPER CLEAR 1.5x / SUPER 2.5x after persistent confirmation"
     return json.dumps({p.cell:{
         "gate":p.gate,"tp_bps":p.take_profit_bps,"sl_bps":p.stop_loss_bps,
         "hold_ms":p.max_hold_ms,"spread_max_bps":p.max_spread_bps,
