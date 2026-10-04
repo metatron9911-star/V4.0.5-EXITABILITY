@@ -14,8 +14,8 @@ from sanitizer import Sanitizer
 from strategy_cells import (
     POLICIES, classify_regime, directional_scores, projected_edge_bps,
     size_decision, policies_json,
-    classify_tail_accel, tail_milestones_hit, tail_active_floor_bps,
-    tail_trail_bps, tail_timeout_ms, sniper_entry_quality,
+    classify_tail_accel, classify_tail_accel_delta, tail_milestones_hit, tail_active_floor_bps,
+    tail_trail_bps, tail_trail_bps_binding, tail_timeout_ms, sniper_entry_quality,
 )
 
 class PaperTrader:
@@ -44,6 +44,9 @@ class PaperTrader:
         self.tail_state: Dict[str,dict]={}
         # H3T-D SHADOW: classify post-entry persistence without blocking H3T-C entries.
         self.sniper_shadow: Dict[str,dict]={}
+        # H3T-B2 SHADOW: same real PAPER entry/arming, hypothetical post-arm exit only.
+        # Never closes or resizes a real position.
+        self.b2_tail_shadow: Dict[str,dict]={}
         self._write_wallet_meta()
 
     def _product(self,symbol:str) -> ProductClass:
@@ -114,10 +117,125 @@ class PaperTrader:
         if wr<0.35: penalty+=8.0
         return penalty
 
+    def _emit_b2_pair(self, pid:str, st:dict):
+        payload={
+            "position_id":pid,
+            "symbol":st["symbol"],
+            "side":st["side"],
+            "bucket":st["bucket"],
+            "a_exit_reason":st.get("a_exit_reason"),
+            "a_exit_move_bps":st.get("a_exit_move_bps"),
+            "a_capture_ratio":st.get("a_capture_ratio"),
+            "a_exit_ms":st.get("a_exit_ms"),
+            "b2_exit_reason":st.get("b2_exit_reason"),
+            "b2_exit_move_bps":st.get("b2_exit_move_bps"),
+            "b2_capture_ratio":st.get("b2_capture_ratio"),
+            "b2_exit_ms":st.get("b2_exit_ms"),
+            "b2_peak_bps":st.get("peak_bps"),
+            "b2_accel_final":st.get("accel"),
+            "b2_accel_seen":sorted(st.get("accel_seen",set())),
+            "b2_accel_ticks":st.get("accel_ticks",{}),
+            "b2_transitions":st.get("transitions",0),
+            "b2_max_delta_m":st.get("max_delta_m",0.0),
+            "b2_milestones_hit":st.get("milestones_hit",[]),
+        }
+        self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (now_ms(),0,self.session_id,st["head"],st["symbol"],
+                         "B2_SHADOW_PAIR","PAIRED",json.dumps(payload,separators=(",",":"))))
+
+    def _finish_b2_shadow(self, pid:str, st:dict, reason:str, move_bps:float, book:LocalBook):
+        if st.get("b2_done"):
+            return
+        exit_side="SELL" if st["side"]=="BUY" else "BUY"
+        exit_vwap,filled=book.walk_vwap(exit_side,float(st["notional_usd"]))
+        if not exit_vwap or filled<float(st["notional_usd"])*0.999:
+            return
+        direction=1.0 if st["side"]=="BUY" else -1.0
+        vwap_move=direction*(float(exit_vwap)/float(st["entry_vwap"])-1.0)*10000.0
+        peak=float(st.get("peak_bps",0.0) or 0.0)
+        st["b2_done"]=True
+        st["b2_exit_reason"]=reason
+        st["b2_exit_move_bps"]=vwap_move
+        st["b2_capture_ratio"]=(vwap_move/peak) if peak>0 else None
+        st["b2_exit_ms"]=now_ms()
+        self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (now_ms(),book.exchange_ts_ms,self.session_id,st["head"],st["symbol"],
+                         "B2_SHADOW_EXIT",reason,
+                         json.dumps({
+                             "position_id":pid,"side":st["side"],"bucket":st["bucket"],
+                             "move_bps_mid":move_bps,"move_bps_vwap":vwap_move,
+                             "peak_bps":peak,"capture_ratio":st["b2_capture_ratio"],
+                             "accel_final":st.get("accel"),
+                             "accel_seen":sorted(st.get("accel_seen",set())),
+                             "accel_ticks":st.get("accel_ticks",{}),
+                             "transitions":st.get("transitions",0),
+                             "max_delta_m":st.get("max_delta_m",0.0),
+                             "milestones_hit":st.get("milestones_hit",[]),
+                             "trail_bps":st.get("trail_bps"),
+                             "active_floor_bps":st.get("active_floor_bps"),
+                         },separators=(",",":"))))
+        if st.get("a_done"):
+            self._emit_b2_pair(pid,st)
+            self.b2_tail_shadow.pop(pid,None)
+
+    def _update_b2_shadows(self, symbol:str, f:dict, book:LocalBook):
+        now=now_ms()
+        for pid,st in list(self.b2_tail_shadow.items()):
+            if st.get("symbol")!=symbol or st.get("b2_done"):
+                continue
+            mid=float(book.mid or st["entry_vwap"])
+            direction=1.0 if st["side"]=="BUY" else -1.0
+            move_bps=direction*(mid/float(st["entry_vwap"])-1.0)*10000.0
+            if move_bps>float(st.get("peak_bps",move_bps)):
+                st["peak_bps"]=move_bps
+            peak=float(st.get("peak_bps",move_bps))
+            m_now=self._directional_momentum(st["side"],f)
+            m_prev=float(st.get("m_prev",m_now))
+            delta=m_now-m_prev
+            accel=classify_tail_accel_delta(m_now,m_prev)
+            tick_total=sum(int(v) for v in st.get("accel_ticks",{}).values())
+            if st.get("accel")!=accel and tick_total>0:
+                st["transitions"]=int(st.get("transitions",0))+1
+            st["accel"]=accel
+            st.setdefault("accel_seen",set()).add(accel)
+            ticks=st.setdefault("accel_ticks",{"ACCEL":0,"FLAT":0,"DECEL":0})
+            ticks[accel]=int(ticks.get(accel,0))+1
+            st["m_prev"]=m_now
+            st["m_now"]=m_now
+            st["delta_m"]=delta
+            if abs(delta)>abs(float(st.get("max_delta_m",0.0))):
+                st["max_delta_m"]=delta
+
+            tp=float(st["tp_bps"])
+            hit=tail_milestones_hit(peak,tp)
+            st["milestones_hit"]=hit
+            active_floor=tail_active_floor_bps(tp,float(st["base_floor_bps"]),hit)
+            raw_trail=tail_trail_bps(peak,tp,accel,st["bucket"])
+            trail=tail_trail_bps_binding(raw_trail,peak,active_floor,hit)
+            st["active_floor_bps"]=active_floor
+            st["trail_bps"]=trail
+            age=now-int(st["opened_ms"])
+            timeout=tail_timeout_ms(int(st["max_hold_ms"]),accel)
+            from_peak=peak-move_bps
+
+            # B2 option B: milestone floor only caps giveback. It is not a second
+            # competing exit trigger. Real STOP/ELC remain owned by the A control.
+            if from_peak>=trail:
+                self._finish_b2_shadow(pid,st,{
+                    "ACCEL":"B2_RIGHT_TAIL_ACCEL_TRAIL",
+                    "FLAT":"B2_RIGHT_TAIL_TRAIL",
+                    "DECEL":"B2_RIGHT_TAIL_DECEL_TRAIL",
+                }[accel],move_bps,book)
+            elif age>=timeout:
+                self._finish_b2_shadow(pid,st,"B2_RIGHT_TAIL_TIME",move_bps,book)
+
     def on_snapshot(self,symbol:str,head:str,f:dict,book:LocalBook,exchange_ts_ms:int,receive_ts_ms:int,bucket:str="FAST",allow_new_entries:bool=True):
         if not self.enabled or not book.synced or not book.mid:
             return
         self._update_elc_shadows(symbol,book)
+        self._update_b2_shadows(symbol,f,book)
         p=self._position_for_symbol(symbol)
         if p:
             self._manage_open(p,f,book)
@@ -436,6 +554,26 @@ class PaperTrader:
                 "tail_accel":"FLAT",
                 "tail_milestones_hit":[],
             }
+            # Start B2 from the exact same arm event. It is observation-only.
+            m_arm=self._directional_momentum(p.side,f)
+            self.b2_tail_shadow[p.position_id]={
+                "symbol":p.symbol,"side":p.side,"head":p.head.value,"bucket":bucket,
+                "entry_vwap":float(p.entry_vwap),"notional_usd":float(p.notional_usd),
+                "opened_ms":int(p.opened_ms),"arm_ms":now,
+                "tp_bps":float(pol.take_profit_bps),"max_hold_ms":int(pol.max_hold_ms),
+                "base_floor_bps":max(0.18*float(pol.take_profit_bps),0.65*float(ef.get("required_cost_edge_bps",0) or 0)),
+                "peak_bps":float(mfe_bps),"m_prev":m_arm,"m_now":m_arm,"delta_m":0.0,
+                "max_delta_m":0.0,"accel":"FLAT","accel_seen":set(),
+                "accel_ticks":{"ACCEL":0,"FLAT":0,"DECEL":0},"transitions":0,
+                "milestones_hit":[],"a_done":False,"b2_done":False,
+            }
+            self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (now,book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
+                             "B2_SHADOW_ARM","RIGHT_TAIL",
+                             json.dumps({"position_id":p.position_id,"side":p.side,"bucket":bucket,
+                                         "mfe_bps":mfe_bps,"arm_momentum":m_arm},
+                                        separators=(",",":"))))
             self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
                                VALUES(?,?,?,?,?,?,?,?)""",
                             (now,book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,"TAIL_ARM","RIGHT_TAIL",
@@ -559,6 +697,32 @@ class PaperTrader:
             ),
         }
         self._ledger("TRADING",p.head.value,p.position_id,"CLOSE",w.trading_cash_usd-before,w.trading_cash_usd,detail)
+
+        b2=self.b2_tail_shadow.get(p.position_id)
+        if b2 is not None:
+            b2["a_done"]=True
+            b2["a_exit_reason"]=reason
+            b2["a_exit_move_bps"]=move_bps
+            b2["a_capture_ratio"]=(
+                move_bps/float(b2.get("peak_bps",0))
+                if float(b2.get("peak_bps",0) or 0)>0 else None
+            )
+            b2["a_exit_ms"]=now_ms()
+            # A/B differs only in tail-exit mechanics. If the control was forced
+            # out by STOP/ELC, B2 must inherit that same non-tail exit.
+            if not str(reason).startswith("RIGHT_TAIL"):
+                if not b2.get("b2_done"):
+                    b2["b2_done"]=True
+                    b2["b2_exit_reason"]="B2_FORCED_"+str(reason)
+                    b2["b2_exit_move_bps"]=move_bps
+                    b2["b2_capture_ratio"]=b2["a_capture_ratio"]
+                    b2["b2_exit_ms"]=b2["a_exit_ms"]
+                self._emit_b2_pair(p.position_id,b2)
+                self.b2_tail_shadow.pop(p.position_id,None)
+            elif b2.get("b2_done"):
+                self._emit_b2_pair(p.position_id,b2)
+                self.b2_tail_shadow.pop(p.position_id,None)
+
         self.tail_state.pop(p.position_id,None)
         self.sniper_shadow.pop(p.position_id,None)
         self.last_close_ms[p.symbol]=now_ms()
