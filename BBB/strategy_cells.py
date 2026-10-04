@@ -428,5 +428,20 @@ def tail_trail_bps_binding(
         return trail_by_accel
     return min(trail_by_accel, max(0.0, mfe_bps - active_floor_bps))
 
+def tail_ratchet_stop_bps(
+    prev_stop_bps: float | None,
+    peak_bps: float,
+    trail_bps: float,
+    active_floor_bps: float,
+) -> tuple[float, float]:
+    """Return (candidate, ratcheted) protected-profit levels in bps from entry.
+
+    The candidate can move with state/volatility. The ratcheted level is
+    monotonic and can never loosen once raised.
+    """
+    candidate=max(active_floor_bps, peak_bps-trail_bps)
+    ratcheted=candidate if prev_stop_bps is None else max(float(prev_stop_bps),candidate)
+    return candidate,ratcheted
+
 def tail_timeout_ms(max_hold_ms: int, accel: str) -> int:
     return int(max_hold_ms * TAIL_TIMEOUT_MULT[accel])
