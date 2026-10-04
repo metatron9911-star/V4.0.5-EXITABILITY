@@ -1,0 +1,23 @@
+name: H3T-B2 shadow v3 smoke
+
+on:
+  push:
+    branches:
+      - bbb-h3t-b2-shadow-v3
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile
+        run: python -m py_compile BBB/strategy_cells.py BBB/paper.py BBB/dashboard.py
+      - name: Unit and semantics smoke
+        working-directory: BBB
+        env:
+          PYTHONPATH: .
+        run: python -m unittest -v test_b2_shadow_v3.py
