@@ -223,7 +223,11 @@ async def main():
                         scan_meta={x.symbol:x for x in fresh}
                         universe=fresh
                         held={p.symbol for p in trader.book.positions.values()}
-                        feed.set_symbols(set(new_symbols)|held)
+                        # Keep counterfactual tail symbols subscribed even after
+                        # the real A position has closed. Otherwise universe
+                        # rotation can starve B2 of snapshots and corrupt exits.
+                        shadow_held={str(st.get("symbol","")).upper() for st in trader.b2_tail_shadow.values() if st.get("symbol")}
+                        feed.set_symbols(set(new_symbols)|held|shadow_held)
                         symbols=new_symbols
                         setmeta(cx,"symbols",",".join(new_symbols))
                         setmeta(cx,"vol_universe_json",universe_json(fresh))
