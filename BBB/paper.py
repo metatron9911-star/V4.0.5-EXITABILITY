@@ -15,7 +15,7 @@ from strategy_cells import (
     POLICIES, classify_regime, directional_scores, projected_edge_bps,
     size_decision, policies_json,
     classify_tail_accel, classify_tail_accel_delta, tail_milestones_hit, tail_active_floor_bps,
-    tail_trail_bps, tail_trail_bps_binding, tail_timeout_ms, sniper_entry_quality,
+    tail_trail_bps, tail_trail_bps_binding, tail_ratchet_stop_bps, tail_timeout_ms, sniper_entry_quality,
 )
 
 class PaperTrader:
@@ -286,9 +286,8 @@ class PaperTrader:
             # B2-v4 profit-lock ratchet:
             # state/volatility may change the candidate trail width, but the
             # protected profit level can NEVER move backwards after arm.
-            candidate_stop_bps=max(active_floor,peak-trail)
             prev_stop=st.get("ratchet_stop_bps")
-            ratchet_stop=candidate_stop_bps if prev_stop is None else max(float(prev_stop),candidate_stop_bps)
+            candidate_stop_bps,ratchet_stop=tail_ratchet_stop_bps(prev_stop,peak,trail,active_floor)
             if prev_stop is not None and ratchet_stop>float(prev_stop)+1e-12:
                 st["ratchet_raises"]=int(st.get("ratchet_raises",0))+1
             st["ratchet_stop_bps"]=ratchet_stop
