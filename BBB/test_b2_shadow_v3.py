@@ -11,6 +11,12 @@ class B2ShadowV3Tests(unittest.TestCase):
         self.assertEqual(classify_tail_accel_delta(5.0, 4.9), "FLAT")
         self.assertEqual(classify_tail_accel_delta(5.0, 6.0), "DECEL")
 
+    def test_d2_classifier_any_sign(self):
+        self.assertEqual(classify_tail_accel_delta(-1.0, -2.0), "ACCEL")
+        self.assertEqual(classify_tail_accel_delta(-3.0, -1.5), "DECEL")
+        self.assertEqual(classify_tail_accel_delta(0.2, 0.0), "FLAT")
+        self.assertEqual(classify_tail_accel_delta(-0.2, 0.2), "DECEL")
+
     def test_v3_semantics_present(self):
         src=inspect.getsource(paper.PaperTrader)
         self.assertIn('"impl":"b2-shadow-v3"', src)
