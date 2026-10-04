@@ -369,9 +369,9 @@ TAIL_ACCEL_EPS = 0.30
 def classify_tail_accel_delta(m_now: float, m_prev: float) -> str:
     """H3T-B2 shadow: classify tail state from delta directional momentum."""
     delta = m_now - m_prev
-    if delta > TAIL_ACCEL_EPS and m_now > 0:
+    if delta > TAIL_ACCEL_EPS:
         return "ACCEL"
-    if delta < -TAIL_ACCEL_EPS or m_now <= 0:
+    if delta < -TAIL_ACCEL_EPS:
         return "DECEL"
     return "FLAT"
 
