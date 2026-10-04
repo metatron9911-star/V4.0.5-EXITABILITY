@@ -119,7 +119,7 @@ class PaperTrader:
 
     def _emit_b2_pair(self, pid:str, st:dict):
         payload={
-            "impl":"b2-shadow-v3",
+            "impl":"b2-shadow-v4-ratchet",
             "position_id":pid,
             "symbol":st["symbol"],
             "side":st["side"],
@@ -139,6 +139,8 @@ class PaperTrader:
             "b2_accel_ticks":st.get("accel_ticks",{}),
             "b2_transitions":st.get("transitions",0),
             "b2_max_delta_m":st.get("max_delta_m",0.0),
+            "b2_ratchet_stop_bps":st.get("ratchet_stop_bps"),
+            "b2_ratchet_raises":st.get("ratchet_raises",0),
             "b2_raw_accel_final":st.get("raw_accel"),
             "b2_warmup_ticks":st.get("warmup_ticks",0),
             "b2_decel_streak":st.get("decel_streak",0),
@@ -165,7 +167,7 @@ class PaperTrader:
         st["b2_capture"]=(vwap_move/peak) if peak>0 else None
         st["b2_exit_ms"]=now_ms()
         payload={
-            "impl":"b2-shadow-v3",
+            "impl":"b2-shadow-v4-ratchet",
             "position_id":pid,
             "side":st["side"],
             "bucket":st["bucket"],
@@ -194,6 +196,9 @@ class PaperTrader:
             "active_floor_bps":st.get("active_floor_bps"),
             "raw_trail_bps":st.get("raw_trail_bps"),
             "binding_trail_bps":st.get("trail_bps"),
+            "candidate_stop_bps":st.get("candidate_stop_bps"),
+            "ratchet_stop_bps":st.get("ratchet_stop_bps"),
+            "ratchet_raises":st.get("ratchet_raises",0),
             "binding_applied":st.get("binding_applied",False),
             "a_exited_before_b2":bool(st.get("a_exit_ms") and int(st["a_exit_ms"])<=int(st["b2_exit_ms"])),
             "a_exit_reason":st.get("a_exit_reason"),
@@ -277,9 +282,21 @@ class PaperTrader:
             active_floor=tail_active_floor_bps(tp,float(st["base_floor_bps"]),hit)
             raw_trail=tail_trail_bps(peak,tp,accel,st["bucket"])
             trail=tail_trail_bps_binding(raw_trail,peak,active_floor,hit)
+
+            # B2-v4 profit-lock ratchet:
+            # state/volatility may change the candidate trail width, but the
+            # protected profit level can NEVER move backwards after arm.
+            candidate_stop_bps=max(active_floor,peak-trail)
+            prev_stop=st.get("ratchet_stop_bps")
+            ratchet_stop=candidate_stop_bps if prev_stop is None else max(float(prev_stop),candidate_stop_bps)
+            if prev_stop is not None and ratchet_stop>float(prev_stop)+1e-12:
+                st["ratchet_raises"]=int(st.get("ratchet_raises",0))+1
+            st["ratchet_stop_bps"]=ratchet_stop
+
             st["active_floor_bps"]=active_floor
             st["raw_trail_bps"]=raw_trail
             st["trail_bps"]=trail
+            st["candidate_stop_bps"]=candidate_stop_bps
             st["binding_applied"]=bool(trail < raw_trail - 1e-12)
 
             from_peak=peak-move_bps
@@ -290,11 +307,11 @@ class PaperTrader:
             reason=None
             if move_bps<=-float(st["sl_bps"]):
                 reason="B2_SHADOW_SL"
-            elif from_peak>=trail:
+            elif move_bps<=ratchet_stop:
                 reason={
-                    "ACCEL":"B2_SHADOW_ACCEL_TRAIL",
-                    "FLAT":"B2_SHADOW_TRAIL",
-                    "DECEL":"B2_SHADOW_DECEL_TRAIL",
+                    "ACCEL":"B2_SHADOW_ACCEL_RATCHET",
+                    "FLAT":"B2_SHADOW_RATCHET",
+                    "DECEL":"B2_SHADOW_DECEL_RATCHET",
                 }[accel]
             elif since_arm>=timeout:
                 reason="B2_SHADOW_TIME"
@@ -640,13 +657,14 @@ class PaperTrader:
                 "max_delta_m":0.0,"accel":"FLAT","raw_accel":"FLAT","accel_seen":set(),
                 "accel_ticks":{"ACCEL":0,"FLAT":0,"DECEL":0},"transitions":0,
                 "warmup_ticks":0,"warmup_target":3,"decel_streak":0,
-                "milestones_hit":[],"a_done":False,"b2_done":False,
+                "milestones_hit":[],"ratchet_stop_bps":None,"ratchet_raises":0,
+                "a_done":False,"b2_done":False,
             }
             self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
                                VALUES(?,?,?,?,?,?,?,?)""",
                             (now,book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
                              "B2_SHADOW_ARM","RIGHT_TAIL",
-                             json.dumps({"impl":"b2-shadow-v3","position_id":p.position_id,
+                             json.dumps({"impl":"b2-shadow-v4-ratchet","position_id":p.position_id,
                                          "side":p.side,"bucket":bucket,"entry_vwap":float(p.entry_vwap),
                                          "arm_mfe_bps":mfe_bps,"arm_momentum":m_arm},
                                         separators=(",",":"))))
