@@ -5,7 +5,7 @@ Goal: improve net expectancy (PESB proxy) while preserving winners.
 This module never submits exchange orders.
 """
 from __future__ import annotations
-import json, math, sqlite3
+import json, math, os, sqlite3
 from dataclasses import dataclass, asdict
 from statistics import quantiles
 from typing import Any
@@ -53,6 +53,26 @@ class Sanitizer:
         self.min_losers_removed=min_losers_removed
         self.rules:dict[tuple[str,str],list[Rule]]={}
         self.rebuild()
+        # Optional frozen rules for clean A/B experiments on an isolated DB.
+        # When set, this reproduces the benchmark sanitizer without sharing data.
+        raw_static=os.getenv("BBB_SANITIZER_STATIC_RULES_JSON","").strip()
+        if raw_static:
+            try:
+                fixed=json.loads(raw_static)
+                rules={}
+                for x in fixed:
+                    r=Rule(
+                        head=str(x["head"]), side=str(x["side"]),
+                        feature=str(x["feature"]), op=str(x["op"]),
+                        threshold=float(x["threshold"]),
+                        sample_n=0,winners_before=0,losers_before=0,
+                        winners_removed=0,losers_removed=0,winner_retention=1.0,
+                        pnl_before=0.0,pnl_after=0.0,pesb_before=0.0,pesb_after=0.0,delta_pesb=0.0,
+                    )
+                    rules.setdefault((r.head,r.side),[]).append(r)
+                self.rules=rules
+            except Exception as e:
+                raise RuntimeError(f"invalid BBB_SANITIZER_STATIC_RULES_JSON: {e}")
 
     def _rows(self):
         if not self.training_sessions:return []
