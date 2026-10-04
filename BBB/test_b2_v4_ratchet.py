@@ -2,7 +2,7 @@ import inspect
 import unittest
 
 import paper
-import worker
+from pathlib import Path
 from strategy_cells import (
     tail_ratchet_stop_bps,
     classify_tail_accel_delta,
@@ -35,7 +35,7 @@ class B2V4RatchetTests(unittest.TestCase):
         self.assertEqual(classify_tail_accel_delta(-3.0, -1.5), "DECEL")
 
     def test_shadow_feed_is_pinned(self):
-        src=inspect.getsource(worker)
+        src=Path("worker.py").read_text()
         self.assertIn("shadow_held", src)
         self.assertIn("feed.set_symbols(set(new_symbols)|held|shadow_held)", src)
 
