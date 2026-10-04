@@ -443,5 +443,20 @@ def tail_ratchet_stop_bps(
     ratcheted=candidate if prev_stop_bps is None else max(float(prev_stop_bps),candidate)
     return candidate,ratcheted
 
+EXTREME_MAX_GIVEBACK_FRAC = {"ACCEL": 0.30, "FLAT": 0.22, "DECEL": 0.15}
+
+def tail_extreme_giveback_cap_bps(
+    peak_bps: float,
+    accel: str,
+    trail_bps: float,
+    bucket: str,
+) -> tuple[float, bool]:
+    """Cap EXTREME giveback as a fraction of peak; leave other buckets untouched."""
+    if bucket != "EXTREME" or peak_bps <= 0:
+        return trail_bps, False
+    cap = max(0.0, float(peak_bps) * EXTREME_MAX_GIVEBACK_FRAC[accel])
+    capped = min(float(trail_bps), cap)
+    return capped, capped < float(trail_bps) - 1e-12
+
 def tail_timeout_ms(max_hold_ms: int, accel: str) -> int:
     return int(max_hold_ms * TAIL_TIMEOUT_MULT[accel])
