@@ -119,7 +119,7 @@ class PaperTrader:
 
     def _emit_b2_pair(self, pid:str, st:dict):
         payload={
-            "impl":"b2-shadow-v2",
+            "impl":"b2-shadow-v3",
             "position_id":pid,
             "symbol":st["symbol"],
             "side":st["side"],
@@ -139,6 +139,9 @@ class PaperTrader:
             "b2_accel_ticks":st.get("accel_ticks",{}),
             "b2_transitions":st.get("transitions",0),
             "b2_max_delta_m":st.get("max_delta_m",0.0),
+            "b2_raw_accel_final":st.get("raw_accel"),
+            "b2_warmup_ticks":st.get("warmup_ticks",0),
+            "b2_decel_streak":st.get("decel_streak",0),
             "b2_milestones_hit":st.get("milestones_hit",[]),
         }
         self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
@@ -162,7 +165,7 @@ class PaperTrader:
         st["b2_capture"]=(vwap_move/peak) if peak>0 else None
         st["b2_exit_ms"]=now_ms()
         payload={
-            "impl":"b2-shadow-v2",
+            "impl":"b2-shadow-v3",
             "position_id":pid,
             "side":st["side"],
             "bucket":st["bucket"],
@@ -180,6 +183,10 @@ class PaperTrader:
             "accel_ticks":st.get("accel_ticks",{}),
             "transitions":st.get("transitions",0),
             "max_delta_m":st.get("max_delta_m",0.0),
+            "raw_accel_final":st.get("raw_accel"),
+            "warmup_ticks":st.get("warmup_ticks",0),
+            "warmup_target":st.get("warmup_target",3),
+            "decel_streak":st.get("decel_streak",0),
             "m_prev":st.get("m_prev"),
             "m_now":st.get("m_now"),
             "delta_m":st.get("delta_m"),
@@ -219,7 +226,38 @@ class PaperTrader:
             m_now=self._directional_momentum(st["side"],f)
             m_prev=float(st.get("m_prev",m_now))
             delta=m_now-m_prev
-            accel=classify_tail_accel_delta(m_now,m_prev)
+            raw_accel=classify_tail_accel_delta(m_now,m_prev)
+            st["raw_accel"]=raw_accel
+
+            # B2-v3 start-condition fix:
+            # 1) first 3 post-arm ticks are forced FLAT (warm-up)
+            # 2) after warm-up, DECEL requires 2 consecutive raw DECEL ticks
+            # 3) a single negative tick never tightens the trail immediately
+            warmup_ticks=int(st.get("warmup_ticks",0))
+            warmup_target=int(st.get("warmup_target",3))
+            decel_streak=int(st.get("decel_streak",0))
+
+            if warmup_ticks < warmup_target:
+                accel="FLAT"
+                st["warmup_ticks"]=warmup_ticks+1
+                st["decel_streak"]=0
+            else:
+                if raw_accel=="DECEL":
+                    decel_streak += 1
+                else:
+                    decel_streak = 0
+                st["decel_streak"]=decel_streak
+
+                if raw_accel=="ACCEL":
+                    accel="ACCEL"
+                elif raw_accel=="DECEL" and decel_streak>=2:
+                    accel="DECEL"
+                else:
+                    # Hold the prior effective state through one isolated negative
+                    # raw tick; FLAT is the neutral fallback.
+                    prior=str(st.get("accel","FLAT"))
+                    accel=prior if prior in {"ACCEL","FLAT"} else "FLAT"
+
             tick_total=sum(int(v) for v in st.get("accel_ticks",{}).values())
             if st.get("accel")!=accel and tick_total>0:
                 st["transitions"]=int(st.get("transitions",0))+1
@@ -599,15 +637,16 @@ class PaperTrader:
                 "max_hold_ms":int(pol.max_hold_ms),"hard_cap_ms":int(pol.max_hold_ms)*6,
                 "base_floor_bps":max(0.18*float(pol.take_profit_bps),0.65*float(ef.get("required_cost_edge_bps",0) or 0)),
                 "peak_bps":float(mfe_bps),"m_prev":m_arm,"m_now":m_arm,"delta_m":0.0,
-                "max_delta_m":0.0,"accel":"FLAT","accel_seen":set(),
+                "max_delta_m":0.0,"accel":"FLAT","raw_accel":"FLAT","accel_seen":set(),
                 "accel_ticks":{"ACCEL":0,"FLAT":0,"DECEL":0},"transitions":0,
+                "warmup_ticks":0,"warmup_target":3,"decel_streak":0,
                 "milestones_hit":[],"a_done":False,"b2_done":False,
             }
             self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
                                VALUES(?,?,?,?,?,?,?,?)""",
                             (now,book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
                              "B2_SHADOW_ARM","RIGHT_TAIL",
-                             json.dumps({"impl":"b2-shadow-v2","position_id":p.position_id,
+                             json.dumps({"impl":"b2-shadow-v3","position_id":p.position_id,
                                          "side":p.side,"bucket":bucket,"entry_vwap":float(p.entry_vwap),
                                          "arm_mfe_bps":mfe_bps,"arm_momentum":m_arm},
                                         separators=(",",":"))))
