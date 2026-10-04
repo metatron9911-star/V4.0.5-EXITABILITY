@@ -15,7 +15,7 @@ from strategy_cells import (
     POLICIES, classify_regime, directional_scores, projected_edge_bps,
     size_decision, policies_json,
     classify_tail_accel, classify_tail_accel_delta, tail_milestones_hit, tail_active_floor_bps,
-    tail_trail_bps, tail_trail_bps_binding, tail_ratchet_stop_bps, tail_timeout_ms, sniper_entry_quality,
+    tail_trail_bps, tail_trail_bps_binding, tail_extreme_giveback_cap_bps, tail_ratchet_stop_bps, tail_timeout_ms, sniper_entry_quality,
 )
 
 class PaperTrader:
@@ -119,7 +119,7 @@ class PaperTrader:
 
     def _emit_b2_pair(self, pid:str, st:dict):
         payload={
-            "impl":"b2-shadow-v4-ratchet",
+            "impl":"b2-shadow-v4.1-extreme-cap",
             "position_id":pid,
             "symbol":st["symbol"],
             "side":st["side"],
@@ -141,6 +141,7 @@ class PaperTrader:
             "b2_max_delta_m":st.get("max_delta_m",0.0),
             "b2_ratchet_stop_bps":st.get("ratchet_stop_bps"),
             "b2_ratchet_raises":st.get("ratchet_raises",0),
+            "b2_extreme_cap_applied":st.get("extreme_cap_applied",False),
             "b2_raw_accel_final":st.get("raw_accel"),
             "b2_warmup_ticks":st.get("warmup_ticks",0),
             "b2_decel_streak":st.get("decel_streak",0),
@@ -167,7 +168,7 @@ class PaperTrader:
         st["b2_capture"]=(vwap_move/peak) if peak>0 else None
         st["b2_exit_ms"]=now_ms()
         payload={
-            "impl":"b2-shadow-v4-ratchet",
+            "impl":"b2-shadow-v4.1-extreme-cap",
             "position_id":pid,
             "side":st["side"],
             "bucket":st["bucket"],
@@ -195,7 +196,9 @@ class PaperTrader:
             "milestones_hit":st.get("milestones_hit",[]),
             "active_floor_bps":st.get("active_floor_bps"),
             "raw_trail_bps":st.get("raw_trail_bps"),
+            "trail_before_extreme_cap_bps":st.get("trail_before_extreme_cap_bps"),
             "binding_trail_bps":st.get("trail_bps"),
+            "extreme_cap_applied":st.get("extreme_cap_applied",False),
             "candidate_stop_bps":st.get("candidate_stop_bps"),
             "ratchet_stop_bps":st.get("ratchet_stop_bps"),
             "ratchet_raises":st.get("ratchet_raises",0),
@@ -282,8 +285,12 @@ class PaperTrader:
             active_floor=tail_active_floor_bps(tp,float(st["base_floor_bps"]),hit)
             raw_trail=tail_trail_bps(peak,tp,accel,st["bucket"])
             trail=tail_trail_bps_binding(raw_trail,peak,active_floor,hit)
+            trail_before_extreme_cap=trail
+            trail,extreme_cap_applied=tail_extreme_giveback_cap_bps(
+                peak,accel,trail,st["bucket"]
+            )
 
-            # B2-v4 profit-lock ratchet:
+            # B2-v4.1 profit-lock ratchet:
             # state/volatility may change the candidate trail width, but the
             # protected profit level can NEVER move backwards after arm.
             prev_stop=st.get("ratchet_stop_bps")
@@ -294,9 +301,11 @@ class PaperTrader:
 
             st["active_floor_bps"]=active_floor
             st["raw_trail_bps"]=raw_trail
+            st["trail_before_extreme_cap_bps"]=trail_before_extreme_cap
             st["trail_bps"]=trail
+            st["extreme_cap_applied"]=extreme_cap_applied
             st["candidate_stop_bps"]=candidate_stop_bps
-            st["binding_applied"]=bool(trail < raw_trail - 1e-12)
+            st["binding_applied"]=bool(trail_before_extreme_cap < raw_trail - 1e-12)
 
             from_peak=peak-move_bps
             since_arm=now-int(st["arm_ms"])
@@ -663,7 +672,7 @@ class PaperTrader:
                                VALUES(?,?,?,?,?,?,?,?)""",
                             (now,book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
                              "B2_SHADOW_ARM","RIGHT_TAIL",
-                             json.dumps({"impl":"b2-shadow-v4-ratchet","position_id":p.position_id,
+                             json.dumps({"impl":"b2-shadow-v4.1-extreme-cap","position_id":p.position_id,
                                          "side":p.side,"bucket":bucket,"entry_vwap":float(p.entry_vwap),
                                          "arm_mfe_bps":mfe_bps,"arm_momentum":m_arm},
                                         separators=(",",":"))))
