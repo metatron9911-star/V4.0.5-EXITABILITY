@@ -1,0 +1,23 @@
+name: Late rescue shadow smoke
+
+on:
+  push:
+    branches:
+      - bbb-h3t-late-rescue-shadow
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile
+        run: python -m py_compile BBB/paper.py BBB/strategy_cells.py BBB/worker.py
+      - name: Unit tests
+        working-directory: BBB
+        env:
+          PYTHONPATH: .
+        run: python -m unittest -v test_late_rescue_shadow.py
