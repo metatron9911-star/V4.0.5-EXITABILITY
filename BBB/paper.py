@@ -50,6 +50,9 @@ class PaperTrader:
         # Late-rescue SHADOW: observation-only bridge for aging non-tail winners.
         # Never closes, resizes, or otherwise changes the real PAPER position.
         self.late_rescue_shadow: Dict[str,dict]={}
+        # Entry-filter SHADOW: OOS-surviving winner_score threshold.
+        # Observation only: never blocks, resizes, or changes a PAPER entry.
+        self.entry_filter_shadow: Dict[str,dict]={}
         self._write_wallet_meta()
 
     def _product(self,symbol:str) -> ProductClass:
@@ -433,6 +436,28 @@ class PaperTrader:
         )
         pid=str(uuid.uuid4())
         pos=self.book.open_position(pid,sig,side,self.leverage,margin,float(entry_vwap),maker=False)
+
+        # Chronological OOS survivor: winner_score < 83.08.
+        # Shadow-only: the real entry ALWAYS proceeds unchanged.
+        entry_filter_threshold=83.08
+        entry_filter_score=float(sizing["winner_score"])
+        entry_filter_would_reject=entry_filter_score < entry_filter_threshold
+        self.entry_filter_shadow[pid]={
+            "impl":"entry-filter-shadow-ws8308-v1",
+            "position_id":pid,"symbol":symbol,"side":side,"bucket":bucket,"regime":regime,
+            "winner_score":entry_filter_score,"threshold":entry_filter_threshold,
+            "would_reject":entry_filter_would_reject,"opened_ms":pos.opened_ms,
+        }
+        self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (now_ms(),exchange_ts_ms,self.session_id,head,symbol,
+                         "ENTRY_FILTER_SHADOW_REJECT" if entry_filter_would_reject else "ENTRY_FILTER_SHADOW_PASS",
+                         "WINNER_SCORE_LT_83_08" if entry_filter_would_reject else "WINNER_SCORE_OK",
+                         json.dumps({"impl":"entry-filter-shadow-ws8308-v1","position_id":pid,
+                                     "side":side,"bucket":bucket,"regime":regime,
+                                     "winner_score":entry_filter_score,"threshold":entry_filter_threshold,
+                                     "would_reject":entry_filter_would_reject},
+                                    separators=(",",":"))))
         self.cx.execute("""INSERT INTO trades(
             session_id,position_id,head,venue,product_class,symbol,side,leverage,margin_usd,notional_usd,
             signal_exchange_ts_ms,receive_ts_ms,signal_ts_ms,order_ts_ms,fill_ts_ms,
@@ -955,6 +980,33 @@ class PaperTrader:
                                          "rescue_arm_votes":rescue.get("arm_votes")},
                                         separators=(",",":"))))
             self.late_rescue_shadow.pop(p.position_id,None)
+
+        entry_filter=self.entry_filter_shadow.pop(p.position_id,None)
+        if entry_filter is not None:
+            would_reject=bool(entry_filter.get("would_reject"))
+            # Counterfactual hard-gate impact: rejected trade would contribute zero
+            # trade PnL and avoid this trade's fees. The primary comparable metric
+            # is therefore -actual net_pnl_usd for would-reject trades.
+            saved_net_if_rejected=(-float(net)) if would_reject else 0.0
+            self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (now_ms(),book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
+                             "ENTRY_FILTER_SHADOW_OUTCOME",
+                             "WOULD_REJECT" if would_reject else "WOULD_PASS",
+                             json.dumps({"impl":entry_filter.get("impl","entry-filter-shadow-ws8308-v1"),
+                                         "position_id":p.position_id,"side":p.side,
+                                         "bucket":entry_filter.get("bucket"),"regime":entry_filter.get("regime"),
+                                         "winner_score":entry_filter.get("winner_score"),
+                                         "threshold":entry_filter.get("threshold"),
+                                         "would_reject":would_reject,
+                                         "actual_exit_reason":reason,
+                                         "actual_net_pnl_usd":float(net),
+                                         "actual_gross_pnl_usd":float(gross),
+                                         "actual_mfe_bps":float(mfe_bps),
+                                         "actual_mae_bps":float(mae_bps),
+                                         "saved_net_if_rejected_usd":saved_net_if_rejected,
+                                         "actual_winner":bool(float(net)>0)},
+                                        separators=(",",":"))))
 
         self.tail_state.pop(p.position_id,None)
         self.sniper_shadow.pop(p.position_id,None)
