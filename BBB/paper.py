@@ -47,6 +47,9 @@ class PaperTrader:
         # H3T-B2 SHADOW: same real PAPER entry/arming, hypothetical post-arm exit only.
         # Never closes or resizes a real position.
         self.b2_tail_shadow: Dict[str,dict]={}
+        # Late-rescue SHADOW: observation-only bridge for aging non-tail winners.
+        # Never closes, resizes, or otherwise changes the real PAPER position.
+        self.late_rescue_shadow: Dict[str,dict]={}
         self._write_wallet_meta()
 
     def _product(self,symbol:str) -> ProductClass:
@@ -509,6 +512,115 @@ class PaperTrader:
             if age<=60_000: keep.append(s)
         self.elc_shadows=keep
 
+    def _late_rescue_votes(self, side:str, f:dict) -> int:
+        sign=1.0 if side=="BUY" else -1.0
+        checks=(
+            sign*float(f.get("ret_1s_bps",0) or 0)<=0,
+            sign*float(f.get("ret_250ms_bps",0) or 0)<=0,
+            sign*float(f.get("ret_5s_bps",0) or 0)<=0,
+            sign*(float(f.get("buy_ratio_1s",0.5) or 0.5)-0.5)*2.0<0,
+            sign*float(f.get("book_imbalance_5",0) or 0)<0,
+        )
+        return sum(1 for x in checks if x)
+
+    def _update_late_rescue_shadow(self,p,f,book,bucket:str,pol,age:int,mfe_bps:float,move_bps:float):
+        """Observation-only late rescue.
+
+        Pre-registered replay winner:
+          - arm no earlier than 70% of normal max_hold
+          - require prior MFE >= 30 bps
+          - require >=3/5 live deterioration votes
+          - after arming, exit shadow only on a *later* down-cross through +5 bps
+          - existing real tail-arm always has priority / cancels rescue
+        """
+        pid=p.position_id
+        st=self.late_rescue_shadow.get(pid)
+        if st is None:
+            st={
+                "impl":"late-rescue-shadow-v1",
+                "position_id":pid,"symbol":p.symbol,"side":p.side,"head":p.head.value,
+                "bucket":bucket,"entry_vwap":float(p.entry_vwap),"notional_usd":float(p.notional_usd),
+                "opened_ms":int(p.opened_ms),"max_hold_ms":int(pol.max_hold_ms),
+                "peak_bps":float(mfe_bps),"prev_move_bps":float(move_bps),
+                "armed":False,"done":False,"handoff":False,
+                "floor_bps":5.0,"arm_age_frac":0.70,"mfe_threshold_bps":30.0,
+                "votes_required":3,
+            }
+            self.late_rescue_shadow[pid]=st
+
+        st["peak_bps"]=max(float(st.get("peak_bps",mfe_bps)),float(mfe_bps))
+
+        # Tail owns the trade once the real strategy arms. Rescue must never
+        # compete with, pre-empt, or alter a real right-tail winner.
+        if p.tail_armed:
+            if not st.get("handoff"):
+                st["handoff"]=True
+                self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                                   VALUES(?,?,?,?,?,?,?,?)""",
+                                (now_ms(),book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
+                                 "LATE_RESCUE_SHADOW_HANDOFF","TAIL_ARM",
+                                 json.dumps({"impl":st["impl"],"position_id":pid,"bucket":bucket,
+                                             "peak_bps":st["peak_bps"],"armed":st.get("armed",False)},
+                                            separators=(",",":"))))
+            st["prev_move_bps"]=float(move_bps)
+            return
+
+        if st.get("done") or st.get("handoff"):
+            st["prev_move_bps"]=float(move_bps)
+            return
+
+        if not st.get("armed"):
+            votes=self._late_rescue_votes(p.side,f)
+            if (
+                age>=int(float(st["arm_age_frac"])*int(pol.max_hold_ms))
+                and float(st["peak_bps"])>=float(st["mfe_threshold_bps"])
+                and votes>=int(st["votes_required"])
+            ):
+                st["armed"]=True
+                st["armed_ms"]=now_ms()
+                st["arm_age_ms"]=age
+                st["arm_peak_bps"]=float(st["peak_bps"])
+                st["arm_move_bps"]=float(move_bps)
+                st["arm_votes"]=votes
+                self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                                   VALUES(?,?,?,?,?,?,?,?)""",
+                                (now_ms(),book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
+                                 "LATE_RESCUE_SHADOW_ARM","MFE30_DETERIORATING",
+                                 json.dumps({"impl":st["impl"],"position_id":pid,"side":p.side,"bucket":bucket,
+                                             "age_ms":age,"peak_bps":st["peak_bps"],"move_bps":move_bps,
+                                             "floor_bps":st["floor_bps"],"votes":votes},
+                                            separators=(",",":"))))
+                # Crossing must happen on a later tick, never on the arm tick.
+                st["prev_move_bps"]=float(move_bps)
+                return
+            st["prev_move_bps"]=float(move_bps)
+            return
+
+        prev=float(st.get("prev_move_bps",move_bps))
+        floor=float(st["floor_bps"])
+        if prev>floor and float(move_bps)<=floor:
+            exit_side="SELL" if p.side=="BUY" else "BUY"
+            exit_vwap,filled=book.walk_vwap(exit_side,float(p.notional_usd))
+            if exit_vwap and filled>=float(p.notional_usd)*0.999:
+                direction=1.0 if p.side=="BUY" else -1.0
+                shadow_move=direction*(float(exit_vwap)/float(p.entry_vwap)-1.0)*10000.0
+                st["done"]=True
+                st["exit_ms"]=now_ms()
+                st["exit_move_bps"]=shadow_move
+                st["exit_mid_move_bps"]=float(move_bps)
+                st["exit_vwap"]=float(exit_vwap)
+                self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                                   VALUES(?,?,?,?,?,?,?,?)""",
+                                (now_ms(),book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
+                                 "LATE_RESCUE_SHADOW_EXIT","DOWNCROSS_FLOOR",
+                                 json.dumps({"impl":st["impl"],"position_id":pid,"side":p.side,"bucket":bucket,
+                                             "floor_bps":floor,"peak_bps":st["peak_bps"],
+                                             "arm_age_ms":st.get("arm_age_ms"),"arm_peak_bps":st.get("arm_peak_bps"),
+                                             "arm_votes":st.get("arm_votes"),"exit_move_bps":shadow_move,
+                                             "exit_mid_move_bps":move_bps},
+                                            separators=(",",":"))))
+        st["prev_move_bps"]=float(move_bps)
+
     def _manage_open(self,p,f,book):
         mid=float(book.mid or p.entry_vwap)
         direction=1.0 if p.side=="BUY" else -1.0
@@ -684,6 +796,10 @@ class PaperTrader:
                                          "tail_arm_momentum":self.tail_state[p.position_id]["tail_arm_momentum"]},
                                         separators=(",",":"))))
 
+        # Observation-only late rescue is evaluated after the real tail-arm decision,
+        # so a newly armed real tail always wins priority on the same tick.
+        self._update_late_rescue_shadow(p,f,book,bucket,pol,age,mfe_bps,move_bps)
+
         from_peak_bps=mfe_bps-move_bps
         tp_bps=pol.take_profit_bps
         expected_cost=float(ef.get("required_cost_edge_bps",0) or 0)
@@ -815,6 +931,30 @@ class PaperTrader:
             if b2.get("b2_done"):
                 self._emit_b2_pair(p.position_id,b2)
                 self.b2_tail_shadow.pop(p.position_id,None)
+
+        rescue=self.late_rescue_shadow.get(p.position_id)
+        if rescue is not None:
+            rescue_done=bool(rescue.get("done"))
+            rescue_move=rescue.get("exit_move_bps")
+            delta=(float(rescue_move)-float(move_bps)) if rescue_done and rescue_move is not None else None
+            self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (now_ms(),book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
+                             "LATE_RESCUE_SHADOW_PAIR","PAIRED",
+                             json.dumps({"impl":rescue.get("impl","late-rescue-shadow-v1"),
+                                         "position_id":p.position_id,"side":p.side,"bucket":bucket,
+                                         "a_exit_reason":reason,"a_exit_move_bps":move_bps,
+                                         "a_mfe_bps":mfe_bps,"rescue_armed":bool(rescue.get("armed")),
+                                         "rescue_handoff":bool(rescue.get("handoff")),
+                                         "rescue_done":rescue_done,
+                                         "rescue_exit_move_bps":rescue_move,
+                                         "rescue_delta_vs_a_bps":delta,
+                                         "rescue_floor_bps":rescue.get("floor_bps"),
+                                         "rescue_arm_age_ms":rescue.get("arm_age_ms"),
+                                         "rescue_arm_peak_bps":rescue.get("arm_peak_bps"),
+                                         "rescue_arm_votes":rescue.get("arm_votes")},
+                                        separators=(",",":"))))
+            self.late_rescue_shadow.pop(p.position_id,None)
 
         self.tail_state.pop(p.position_id,None)
         self.sniper_shadow.pop(p.position_id,None)
