@@ -40,6 +40,10 @@ class PaperTrader:
         )
         self.sanitizer_rejects=0
         self.elc_shadows=[]
+        # ELC-v2 SHADOW candidate from 3-fold walk-forward:
+        # when the real ELC fires with shallow MAE (> -32.223 bps), shadow says "skip the cut"
+        # and compares the actual cut against the existing 60s counterfactual. Real A is unchanged.
+        self.elc_v2_mae_skip_threshold_bps=-32.223
         # H3T-B: post-arm tail state, keyed by position_id.
         self.tail_state: Dict[str,dict]={}
         # H3T-D SHADOW: classify post-entry persistence without blocking H3T-C entries.
@@ -534,6 +538,24 @@ class PaperTrader:
                                                  "cf_max_after_bps":s["max_after_bps"],
                                                  "cf_min_after_bps":s["min_after_bps"],
                                                  "recovered":recovered},separators=(",",":"))))
+                    if sec==60 and s.get("elc_v2_shadow_skip"):
+                        delta_bps=float(ret)-float(s["cut_move_bps"])
+                        approx_saved_usd=float(s.get("notional_usd",0) or 0)*delta_bps/10000.0
+                        self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                                           VALUES(?,?,?,?,?,?,?,?)""",
+                                        (now,book.exchange_ts_ms,self.session_id,"VOL",symbol,
+                                         "ELC_V2_SHADOW_OUTCOME","SKIP_TO_60S",
+                                         json.dumps({"impl":"elc-v2-shallow-mae-skip-v1",
+                                                     "position_id":s["position_id"],"side":s["side"],
+                                                     "bucket":s.get("bucket"),
+                                                     "threshold_mae_bps":s.get("threshold_mae_bps"),
+                                                     "mae_bps_at_cut":s["mae_bps_at_cut"],
+                                                     "cut_move_bps":s["cut_move_bps"],
+                                                     "cf_return_bps_60s":ret,
+                                                     "delta_bps_vs_cut":delta_bps,
+                                                     "approx_saved_usd":approx_saved_usd,
+                                                     "recovered":recovered},
+                                                    separators=(",",":"))))
             if age<=60_000: keep.append(s)
         self.elc_shadows=keep
 
@@ -1012,11 +1034,26 @@ class PaperTrader:
         self.sniper_shadow.pop(p.position_id,None)
         self.last_close_ms[p.symbol]=now_ms()
         if reason=="EARLY_LOSER_CUT":
+            elc_v2_shadow_skip=float(mae_bps)>float(self.elc_v2_mae_skip_threshold_bps)
+            if elc_v2_shadow_skip:
+                self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                                   VALUES(?,?,?,?,?,?,?,?)""",
+                                (now_ms(),book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
+                                 "ELC_V2_SHADOW_SKIP","MAE_SHALLOW",
+                                 json.dumps({"impl":"elc-v2-shallow-mae-skip-v1",
+                                             "position_id":p.position_id,"side":p.side,"bucket":bucket,
+                                             "mae_bps_at_cut":mae_bps,"mfe_bps_at_cut":mfe_bps,
+                                             "cut_move_bps":move_bps,
+                                             "threshold_mae_bps":self.elc_v2_mae_skip_threshold_bps},
+                                            separators=(",",":"))))
             self.elc_shadows.append({
                 "position_id":p.position_id,"symbol":p.symbol,"side":p.side,
-                "entry_vwap":p.entry_vwap,"cut_ms":now_ms(),
+                "entry_vwap":p.entry_vwap,"notional_usd":p.notional_usd,"bucket":bucket,
+                "cut_ms":now_ms(),
                 "cut_move_bps":move_bps,"mfe_bps_at_cut":mfe_bps,"mae_bps_at_cut":mae_bps,
                 "max_after_bps":move_bps,"min_after_bps":move_bps,"mask":0,
+                "elc_v2_shadow_skip":elc_v2_shadow_skip,
+                "threshold_mae_bps":self.elc_v2_mae_skip_threshold_bps,
             })
 
         # RHB-style reserve wallet: skim half of trading cash above start+trigger.
