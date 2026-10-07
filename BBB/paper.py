@@ -44,6 +44,8 @@ class PaperTrader:
         # when the real ELC fires with shallow MAE (> -32.223 bps), shadow says "skip the cut"
         # and compares the actual cut against the existing 60s counterfactual. Real A is unchanged.
         self.elc_v2_mae_skip_threshold_bps=-32.223
+        # Track positions where the hard shallow-MAE override has fired to avoid event spam.
+        self.elc_v2_hard_skipped: set[str]=set()
         # H3T-B: post-arm tail state, keyed by position_id.
         self.tail_state: Dict[str,dict]={}
         # H3T-D SHADOW: classify post-entry persistence without blocking H3T-C entries.
@@ -786,7 +788,27 @@ class PaperTrader:
             and mae_bps<=-0.55*pol.stop_loss_bps
             and flow_deteriorating
         )
-        early_loser_cut=(not winner_veto) and r2_confirm
+        early_loser_cut_raw=(not winner_veto) and r2_confirm
+        elc_v2_hard_skip=(
+            early_loser_cut_raw
+            and float(mae_bps)>float(self.elc_v2_mae_skip_threshold_bps)
+        )
+        if elc_v2_hard_skip and p.position_id not in self.elc_v2_hard_skipped:
+            self.elc_v2_hard_skipped.add(p.position_id)
+            self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (now,book.exchange_ts_ms,self.session_id,p.head.value,p.symbol,
+                             "ELC_V2_HARD_SKIP","MAE_SHALLOW",
+                             json.dumps({"impl":"elc-v2-shallow-mae-hard-v1",
+                                         "position_id":p.position_id,"side":p.side,"bucket":bucket,
+                                         "mae_bps_at_cut_candidate":mae_bps,
+                                         "mfe_bps_at_cut_candidate":mfe_bps,
+                                         "move_bps_at_cut_candidate":move_bps,
+                                         "threshold_mae_bps":self.elc_v2_mae_skip_threshold_bps,
+                                         "winner_veto":winner_veto,
+                                         "flow_deteriorating":flow_deteriorating},
+                                        separators=(",",":"))))
+        early_loser_cut=early_loser_cut_raw and not elc_v2_hard_skip
 
         # Right-tail collector. Arm before nominal TP when direction remains strongly
         # aligned, then protect a positive floor and trail the right tail.
@@ -943,6 +965,9 @@ class PaperTrader:
             "floor_fired":floor_fired,
             "trail_fired":trail_fired,
             "early_loser_confirmed":early_loser_cut,
+            "early_loser_confirmed_raw":early_loser_cut_raw,
+            "elc_v2_hard_skip":elc_v2_hard_skip,
+            "elc_v2_mae_threshold_bps":self.elc_v2_mae_skip_threshold_bps,
             "winner_veto":winner_veto,
             "sniper_shadow_outcome":(
                 self.sniper_shadow.get(p.position_id,{}).get("outcome")
@@ -1032,6 +1057,7 @@ class PaperTrader:
 
         self.tail_state.pop(p.position_id,None)
         self.sniper_shadow.pop(p.position_id,None)
+        self.elc_v2_hard_skipped.discard(p.position_id)
         self.last_close_ms[p.symbol]=now_ms()
         if reason=="EARLY_LOSER_CUT":
             elc_v2_shadow_skip=float(mae_bps)>float(self.elc_v2_mae_skip_threshold_bps)
