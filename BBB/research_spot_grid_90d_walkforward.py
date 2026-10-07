@@ -9,6 +9,7 @@ INTERVAL="15"
 DAYS=90
 LIMIT=1000
 ROUNDTRIP_FEE=0.002  # 0.1% in + 0.1% out conservative baseline
+CACHE="/data/bbb_spot90d_cache.json"
 
 cx=sqlite3.connect("/data/bbb.sqlite3")
 
@@ -95,18 +96,52 @@ def ema(cl,n):
     for v in cl[-n+1:]:e=a*v+(1-a)*e
     return e
 
-print("FETCHING",len(symbols),"exact Bybit SPOT USDT symbols",flush=True)
 BARS={}
-for i,s in enumerate(symbols,1):
-    b=fetch_klines(s)
-    if len(b)>=500:
-        BARS[s]=b
-        print("SPOT_OK",i,"/",len(symbols),s,"bars",len(b),flush=True)
-    else:
-        print("SPOT_SKIP",i,"/",len(symbols),s,"bars",len(b),flush=True)
+try:
+    with open(CACHE,"r") as fh:
+        raw=json.load(fh)
+    for sym,rows in raw.items():
+        if sym in symbols:
+            BARS[sym]=[tuple(x) for x in rows]
+    print("CACHE_LOADED",len(BARS),"symbols",flush=True)
+except Exception:
+    pass
+
+missing=[s for s in symbols if s not in BARS]
+if missing:
+    print("FETCHING",len(missing),"exact Bybit SPOT USDT symbols",flush=True)
+    for i,sym in enumerate(missing,1):
+        b=fetch_klines(sym)
+        if len(b)>=500:
+            BARS[sym]=b
+            print("SPOT_OK",i,"/",len(missing),sym,"bars",len(b),flush=True)
+        else:
+            print("SPOT_SKIP",i,"/",len(missing),sym,"bars",len(b),flush=True)
+    try:
+        with open(CACHE,"w") as fh:
+            json.dump({k:[list(x) for x in v] for k,v in BARS.items()},fh)
+        print("CACHE_SAVED",CACHE,flush=True)
+    except Exception as e:
+        print("CACHE_SAVE_FAIL",e,flush=True)
+
 print("USABLE_SPOT_SYMBOLS",len(BARS),sorted(BARS),flush=True)
 if not BARS:
     raise SystemExit("No usable Bybit spot symbols")
+
+# Precompute indicators once per bar so the matrix does not recalculate RSI/ATR/BB/EMA
+# tens of thousands of times.
+IND={}
+for sym,bs in BARS.items():
+    arr=[]
+    closes=[]
+    for i,row in enumerate(bs):
+        closes.append(row[4])
+        if i<30:
+            arr.append(None); continue
+        hist=bs[:i+1]
+        arr.append((rsi(closes),atr(hist),bb(closes),ema(closes,8),ema(closes,21)))
+    IND[sym]=arr
+print("INDICATORS_PRECOMPUTED",sum(len(v) for v in IND.values()),flush=True)
 
 def simulate(sym,bs,cfg,lo_ts=None,hi_ts=None):
     rsi_th,atr_min,step_mult,tp_mult,stop_frac,max_levels,size_mode,trend_guard,max_age=cfg
@@ -115,8 +150,10 @@ def simulate(sym,bs,cfg,lo_ts=None,hi_ts=None):
         t,o,h,l,c,v,turn=bs[i]
         if lo_ts is not None and t<lo_ts: continue
         if hi_ts is not None and t>=hi_ts: break
-        hist=bs[:i+1];cl=[x[4] for x in hist]
-        rv=rsi(cl);av=atr(hist);bands=bb(cl);e8=ema(cl,8);e21=ema(cl,21)
+        ind=IND[sym][i]
+        if ind is None: continue
+        rv,av,bands,e8,e21=ind
+        cl=[x[4] for x in bs[max(0,i-4):i+1]]
         if pos is None:
             if rv is None or av is None or bands is None or e8 is None or e21 is None: continue
             blo,bhi=bands
@@ -161,32 +198,50 @@ allts=sorted({r[0] for b in BARS.values() for r in b})
 q=[allts[int((len(allts)-1)*x)] for x in (0.0,0.5,0.7,0.85,1.0)]
 # Train first 50%, validate next 20%, test next 15%, final holdout last 15%.
 
-cfgs=[]
+# Stage 1: compact coarse grid. Risk settings fixed conservatively.
+base_cfgs=[]
 for rsi_th in (25,30,35):
  for atr_min in (0.002,0.004,0.006,0.008):
   for step in (1.5,2.0,2.5,3.0):
    for tp in (0.8,1.0,1.2,1.5):
-    for stop in (0.06,0.08,0.10,0.12):
-     for levels in (2,3):
-      for size_mode in (0,1): # no 2x martingale in robust search
-       for guard in (0,1,2):
-        for age in (16,32,48):
-         cfgs.append((rsi_th,atr_min,step,tp,stop,levels,size_mode,guard,age))
+    for guard in (0,1,2):
+     base_cfgs.append((rsi_th,atr_min,step,tp,0.08,2,0,guard,32))
 
-# Coarse stage: evaluate train+validation only, keep best candidates.
 coarse=[]
-for i,cfg in enumerate(cfgs,1):
+for i,cfg in enumerate(base_cfgs,1):
     train=[];val=[]
-    for s,b in BARS.items():
-        train+=simulate(s,b,cfg,q[0],q[1]); val+=simulate(s,b,cfg,q[1],q[2])
+    for sym,br in BARS.items():
+        train+=simulate(sym,br,cfg,q[0],q[1]); val+=simulate(sym,br,cfg,q[1],q[2])
     a=st(train);b=st(val)
-    if a["N"]>=30 and b["N"]>=10 and a["NET"]>0 and b["NET"]>0 and a["PF"]>1.1 and b["PF"]>1.1:
+    if a["N"]>=25 and b["N"]>=8 and a["NET"]>0 and b["NET"]>0 and a["PF"]>1.05 and b["PF"]>1.05:
         score=(min(a["PF"],b["PF"]),min(a["EXP"],b["EXP"]),-max(a["DD"],b["DD"]))
         coarse.append((score,cfg,a,b))
-    if i%1000==0: print("COARSE",i,"/",len(cfgs),"survivors",len(coarse),flush=True)
+    if i%100==0 or i==len(base_cfgs):
+        print("COARSE",i,"/",len(base_cfgs),"survivors",len(coarse),flush=True)
 
-coarse=sorted(coarse,reverse=True)[:80]
-print("COARSE_TOP",len(coarse),flush=True)
+# Stage 2: refine only neighborhoods of the best 12 coarse entry configs.
+seed=sorted(coarse,reverse=True)[:12]
+refined=[]
+seen=set()
+for _,cfg0,_,_ in seed:
+    rsi_th,atr_min,step,tp,_,_,_,guard,_=cfg0
+    for stop in (0.06,0.08,0.10,0.12):
+     for levels in (2,3):
+      for size_mode in (0,1):
+       for age in (16,32,48):
+        cfg=(rsi_th,atr_min,step,tp,stop,levels,size_mode,guard,age)
+        if cfg in seen: continue
+        seen.add(cfg)
+        train=[];val=[]
+        for sym,br in BARS.items():
+            train+=simulate(sym,br,cfg,q[0],q[1]); val+=simulate(sym,br,cfg,q[1],q[2])
+        a=st(train);b=st(val)
+        if a["N"]>=25 and b["N"]>=8 and a["NET"]>0 and b["NET"]>0 and a["PF"]>1.05 and b["PF"]>1.05:
+            score=(min(a["PF"],b["PF"]),min(a["EXP"],b["EXP"]),-max(a["DD"],b["DD"]))
+            refined.append((score,cfg,a,b))
+
+coarse=sorted(refined,reverse=True)[:80]
+print("REFINED_TOP",len(coarse),flush=True)
 
 final=[]
 for score,cfg,a,b in coarse:
