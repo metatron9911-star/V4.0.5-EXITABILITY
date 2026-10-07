@@ -11,13 +11,6 @@ LIMIT=1000
 ROUNDTRIP_FEE=0.002  # 0.1% in + 0.1% out conservative baseline
 
 cx=sqlite3.connect("/data/bbb.sqlite3")
-candidate_symbols=sorted(set(r[0] for r in cx.execute("SELECT DISTINCT symbol FROM feature_samples ORDER BY symbol")))
-spot_symbols=fetch_spot_symbols()
-symbols=[s for s in candidate_symbols if s in spot_symbols]
-unsupported=[s for s in candidate_symbols if s not in spot_symbols]
-print("CANDIDATES",len(candidate_symbols),"EXACT_SPOT_MATCH",len(symbols),"UNSUPPORTED",len(unsupported),flush=True)
-if unsupported:
-    print("UNSUPPORTED_SAMPLE",unsupported[:25],flush=True)
 
 def api(path,params):
     url=BASE+path+"?"+urllib.parse.urlencode(params)
@@ -44,6 +37,14 @@ def fetch_spot_symbols():
         cursor=str(res.get("nextPageCursor") or "")
         if not cursor: break
     return out
+
+candidate_symbols=sorted(set(r[0] for r in cx.execute("SELECT DISTINCT symbol FROM feature_samples ORDER BY symbol")))
+spot_symbols=fetch_spot_symbols()
+symbols=[sym for sym in candidate_symbols if sym in spot_symbols]
+unsupported=[sym for sym in candidate_symbols if sym not in spot_symbols]
+print("CANDIDATES",len(candidate_symbols),"EXACT_SPOT_MATCH",len(symbols),"UNSUPPORTED",len(unsupported),flush=True)
+if unsupported:
+    print("UNSUPPORTED_SAMPLE",unsupported[:25],flush=True)
 
 def fetch_klines(symbol,days=DAYS):
     end=int(time.time()*1000)
