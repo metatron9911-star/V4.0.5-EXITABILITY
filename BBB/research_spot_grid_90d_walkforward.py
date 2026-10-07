@@ -11,8 +11,13 @@ LIMIT=1000
 ROUNDTRIP_FEE=0.002  # 0.1% in + 0.1% out conservative baseline
 
 cx=sqlite3.connect("/data/bbb.sqlite3")
-symbols=[r[0] for r in cx.execute("SELECT DISTINCT symbol FROM feature_samples ORDER BY symbol")]
-symbols=sorted(set(symbols))
+candidate_symbols=sorted(set(r[0] for r in cx.execute("SELECT DISTINCT symbol FROM feature_samples ORDER BY symbol")))
+spot_symbols=fetch_spot_symbols()
+symbols=[s for s in candidate_symbols if s in spot_symbols]
+unsupported=[s for s in candidate_symbols if s not in spot_symbols]
+print("CANDIDATES",len(candidate_symbols),"EXACT_SPOT_MATCH",len(symbols),"UNSUPPORTED",len(unsupported),flush=True)
+if unsupported:
+    print("UNSUPPORTED_SAMPLE",unsupported[:25],flush=True)
 
 def api(path,params):
     url=BASE+path+"?"+urllib.parse.urlencode(params)
@@ -22,6 +27,23 @@ def api(path,params):
     if int(obj.get("retCode",0))!=0:
         raise RuntimeError(obj)
     return obj
+
+def fetch_spot_symbols():
+    out=set(); cursor=""
+    for _ in range(20):
+        params={"category":"spot","limit":1000}
+        if cursor: params["cursor"]=cursor
+        obj=api("/v5/market/instruments-info",params)
+        res=obj.get("result",{}) or {}
+        for it in res.get("list",[]) or []:
+            sym=str(it.get("symbol") or "")
+            status=str(it.get("status") or "")
+            quote=str(it.get("quoteCoin") or "")
+            if sym and quote=="USDT" and status in ("Trading","Available",""):
+                out.add(sym)
+        cursor=str(res.get("nextPageCursor") or "")
+        if not cursor: break
+    return out
 
 def fetch_klines(symbol,days=DAYS):
     end=int(time.time()*1000)
@@ -72,7 +94,7 @@ def ema(cl,n):
     for v in cl[-n+1:]:e=a*v+(1-a)*e
     return e
 
-print("FETCHING",len(symbols),"candidate symbols",flush=True)
+print("FETCHING",len(symbols),"exact Bybit SPOT USDT symbols",flush=True)
 BARS={}
 for i,s in enumerate(symbols,1):
     b=fetch_klines(s)
