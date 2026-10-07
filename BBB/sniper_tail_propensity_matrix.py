@@ -3,9 +3,19 @@ import sqlite3,json,statistics,itertools
 
 DB="/data/bbb.sqlite3"
 cx=sqlite3.connect(DB); cx.row_factory=sqlite3.Row
-sid=cx.execute("SELECT value FROM meta WHERE key='session_id'").fetchone()[0]
+current_sid=cx.execute("SELECT value FROM meta WHERE key='session_id'").fetchone()[0]
+row=cx.execute("""SELECT session_id,COUNT(*) AS n
+FROM trades
+WHERE status='CLOSED' AND session_id LIKE 'PAPER-BBB-%'
+GROUP BY session_id
+ORDER BY n DESC, MAX(closed_ms) DESC
+LIMIT 1""").fetchone()
+if not row:
+    raise SystemExit("No historical CLOSED PAPER trades found")
+sid=row["session_id"]
 rs=cx.execute("""SELECT side,net_pnl_usd,entry_fee_usd,exit_fee_usd,exit_reason,closed_ms,entry_features_json
 FROM trades WHERE session_id=? AND status='CLOSED' ORDER BY closed_ms""",(sid,)).fetchall()
+print("CURRENT_SESSION",current_sid,"ANALYSIS_SESSION",sid,"CLOSED",len(rs))
 
 def J(s):
     try:return json.loads(s or "{}")
@@ -100,4 +110,7 @@ for r in out[:20]:
         print(" FOLD",i,"N",q["N"],"WR",round(q["WR"],1),"TAIL",round(q["TAIL"],1),
               "NET",round(q["NET"],4),"PF",round(q["PF"],2),"DD",round(q["DD"],4))
 print("=== BEST ===")
-print(out[0][5],out[0][7] if out else "NONE")
+if out:
+    print(out[0][5],out[0][7])
+else:
+    print("NONE")
