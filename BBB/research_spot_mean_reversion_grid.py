@@ -50,6 +50,15 @@ def bb(closes,n=20,k=2):
     return m-k*sd,m+k*sd
 
 symbols=[r[0] for r in cx.execute("SELECT DISTINCT symbol FROM feature_samples ORDER BY symbol")]
+
+# Precompute bars ONCE. The original version rebuilt bars inside every config,
+# causing thousands of full DB scans and making the research job look hung.
+BAR_CACHE={}
+for sym in symbols:
+    for tf in (300000,900000):
+        BAR_CACHE[(sym,tf)]=bars(sym,tf)
+print("PRECOMPUTED",len(BAR_CACHE),"symbol/timeframe series")
+
 configs=[]
 for tf in (300000,900000):
   for rsi_th in (25,30,35):
@@ -62,7 +71,7 @@ def run(cfg):
     tf,rsi_th,atr_min,step_mult,tp_mult=cfg
     pnl=[]; trades=0; wins=0
     for sym in symbols:
-        bs=bars(sym,tf)
+        bs=BAR_CACHE.get((sym,tf),[])
         if len(bs)<40: continue
         pos=None
         for i in range(25,len(bs)):
@@ -99,10 +108,12 @@ def run(cfg):
     return dict(N=trades,WR=100*wins/trades if trades else 0,NET=sum(pnl),EXP=statistics.mean(pnl),PF=gp/gl if gl else 999,MED=statistics.median(pnl),WORST=min(pnl))
 
 out=[]
-for cfg in configs:
+for i,cfg in enumerate(configs,1):
     s=run(cfg)
     if s and s["N"]>=20:
         out.append((s["EXP"],s["PF"],s["WR"],cfg,s))
+    if i%25==0 or i==len(configs):
+        print("PROGRESS",i,"/",len(configs),"candidates",len(out),flush=True)
 out.sort(reverse=True)
 
 print("=== TOP 5m/15m MEAN-REVERSION GRID CONFIGS ===")
