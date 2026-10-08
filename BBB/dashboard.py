@@ -126,6 +126,17 @@ def board():
 
     st.subheader("Dynamic scalp shadow")
     st.caption("Forward PAPER-shadow · old BBB entries may remain OFF · conservative cost model")
+    if meta.get("dynamic_scalp_paper_enabled","0")=="1":
+        st.caption(
+            "Dynamic PAPER wallet: USD "
+            + str(round(float(meta.get("dynamic_scalp_cash_usd","0") or 0),2))
+            + " · realized USD "
+            + str(round(float(meta.get("dynamic_scalp_realized_usd","0") or 0),4))
+            + " · fees USD "
+            + str(round(float(meta.get("dynamic_scalp_fees_usd","0") or 0),4))
+            + " · open "
+            + str(meta.get("dynamic_scalp_open_positions","0"))
+        )
     ds_exits=db.execute("""SELECT symbol,reason,payload_json FROM events
                            WHERE session_id=? AND stage='DYNAMIC_SCALP_SHADOW_EXIT'
                            ORDER BY id""",(session,)).fetchall()
@@ -145,11 +156,12 @@ def board():
         z["n"]+=1; z["net"]+=x; z["gross"]+=g; z["cost"]+=c; z["rets"].append(x)
         if x>0:z["wins"]+=1
         z["reasons"][str(reason or "—")]+=1
-    c1=st.columns(4)
-    c1[0].metric("Shadow entries",len(ds_entries))
-    c1[1].metric("Shadow exits",len(ds_exits))
-    c1[2].metric("DOM wall arms",ds_wall_arms)
-    c1[3].metric("Shadow open est.",max(0,len(ds_entries)-len(ds_exits)))
+    c1=st.columns(5)
+    c1[0].metric("Dynamic PAPER","ON" if meta.get("dynamic_scalp_paper_enabled","0")=="1" else "OFF")
+    c1[1].metric("Shadow entries",len(ds_entries))
+    c1[2].metric("Shadow exits",len(ds_exits))
+    c1[3].metric("DOM wall arms",ds_wall_arms)
+    c1[4].metric("Shadow open est.",max(0,len(ds_entries)-len(ds_exits)))
     ds_report=[]
     for mod in ("HYPE","LIQUID","UNKNOWN"):
         z=ds_stats.get(mod)
