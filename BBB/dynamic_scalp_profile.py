@@ -41,6 +41,14 @@ class HypeSettings:
     tape_speed_ratio_min: float = 3.0
     min_trade_count_1s: int = 4
 
+    # Breakout must persist after the first print-through; do not buy one-tick spikes.
+    breakout_confirm_ms: int = 3_000
+    breakout_min_confirm_samples: int = 2
+    breakout_hold_buffer_bps: float = 2.0
+    breakout_max_retest_bps: float = 2.0
+    breakout_min_continue_bps: float = 3.0
+    breakout_min_tape_ratio_after_arm: float = 1.5
+
     # Entry quality.
     min_directional_ret_250ms_bps: float = 0.5
     min_directional_ret_1s_bps: float = 2.0
