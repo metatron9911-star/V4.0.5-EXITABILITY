@@ -11,16 +11,86 @@ from typing import Dict
 
 from dynamic_scalp_profile import HYPE, LIQUID, RISK, classify_segment, directional_hype_trigger
 from engine import now_ms
+import os, uuid
 
 
 class DynamicScalpShadow:
     def __init__(self, cx, session_id: str):
         self.cx=cx
         self.session_id=session_id
+        self.paper_enabled=os.getenv("BBB_DYNAMIC_SCALP_PAPER","0").lower() in {"1","true","yes","on"}
+        self.start_usd=float(os.getenv("BBB_DYNAMIC_SCALP_START_USD",os.getenv("BBB_PAPER_START_USD","500")))
+        self.paper_cash=self.start_usd
+        self.paper_realized=0.0
+        self.paper_fees=0.0
+        self.paper_positions={}
+        self._write_meta()
         self.hist: Dict[str, deque] = defaultdict(lambda: deque(maxlen=180))
         self.wall_arms: Dict[tuple[str,str],dict] = {}
         self.positions: Dict[str,dict] = {}
         self.cooldown_until: Dict[str,int] = {}
+
+    def _write_meta(self):
+        meta={
+            "dynamic_scalp_paper_enabled":"1" if self.paper_enabled else "0",
+            "dynamic_scalp_cash_usd":f"{self.paper_cash:.8f}",
+            "dynamic_scalp_realized_usd":f"{self.paper_realized:.8f}",
+            "dynamic_scalp_fees_usd":f"{self.paper_fees:.8f}",
+            "dynamic_scalp_open_positions":str(len(self.paper_positions)),
+        }
+        for k,v in meta.items():
+            self.cx.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",(k,v))
+
+    def _paper_open(self,symbol,module,side,entry_px,f,exchange_ts_ms,extra):
+        if not self.paper_enabled or symbol in self.paper_positions:
+            return
+        # Fixed 2% notional of starting bank for first validation pass, 1x only.
+        margin=max(1.0,self.start_usd*0.02)
+        notional=min(margin,self.paper_cash)
+        if notional<=0:
+            return
+        fee=notional*0.001
+        if self.paper_cash < notional+fee:
+            return
+        pid=str(uuid.uuid4())
+        self.paper_cash-=notional+fee
+        self.paper_fees+=fee
+        self.paper_positions[symbol]={
+            "position_id":pid,"module":module,"side":side,"entry_px":float(entry_px),
+            "notional":notional,"margin":notional,"entry_fee":fee,"opened_ms":now_ms(),
+        }
+        features={**dict(f),"dynamic_module":module,**(extra or {})}
+        self.cx.execute("""INSERT INTO trades(
+            session_id,position_id,head,venue,product_class,symbol,side,leverage,margin_usd,notional_usd,
+            signal_exchange_ts_ms,receive_ts_ms,signal_ts_ms,order_ts_ms,fill_ts_ms,
+            signal_mid,signal_bid,signal_ask,expected_entry_vwap,entry_vwap,
+            entry_fee_usd,source_age_ms,processing_ms,signal_to_fill_ms,
+            entry_score,entry_gate,risk_state,entry_features_json,status,opened_ms)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (self.session_id,pid,"VOL","BYBIT","STANDARD",symbol,side,1.0,notional,notional,
+             int(exchange_ts_ms or 0),now_ms(),now_ms(),now_ms(),now_ms(),
+             float(f.get("mid") or entry_px),float(f.get("bid") or entry_px),float(f.get("ask") or entry_px),
+             float(entry_px),float(entry_px),fee,0,0,0,0.0,0.0,f"DYNAMIC_{module}",
+             json.dumps(features,separators=(",",":")),"OPEN",now_ms()))
+        self._write_meta()
+
+    def _paper_close(self,symbol,reason,exit_px):
+        pp=self.paper_positions.pop(symbol,None)
+        if not pp:
+            return
+        side=pp["side"]; entry=float(pp["entry_px"]); notional=float(pp["notional"])
+        sign=1.0 if side=="BUY" else -1.0
+        gross_ret=sign*(float(exit_px)/entry-1.0)
+        gross_pnl=notional*gross_ret
+        exit_fee=notional*0.001
+        net=gross_pnl-float(pp["entry_fee"])-exit_fee
+        self.paper_cash += notional + gross_pnl - exit_fee
+        self.paper_fees += exit_fee
+        self.paper_realized += net
+        self.cx.execute("""UPDATE trades SET status='CLOSED',exit_vwap=?,exit_fee_usd=?,gross_pnl_usd=?,net_pnl_usd=?,
+                          exit_reason=?,closed_ms=? WHERE session_id=? AND position_id=?""",
+                        (float(exit_px),exit_fee,gross_pnl,net,reason,now_ms(),self.session_id,pp["position_id"]))
+        self._write_meta()
 
     def _event(self, symbol, stage, reason, payload, exchange_ts_ms=0):
         self.cx.execute(
@@ -47,6 +117,7 @@ class DynamicScalpShadow:
         }
         if extra: p.update(extra)
         self.positions[symbol]=p
+        self._paper_open(symbol,module,side,entry_px,f,exchange_ts_ms,extra or {})
         self._event(symbol,"DYNAMIC_SCALP_SHADOW_ENTRY",module,{
             **p,
             "segment":f.get("dynamic_segment"),
@@ -65,6 +136,7 @@ class DynamicScalpShadow:
         # This intentionally penalizes the shadow rather than assuming perfect maker fills.
         cost=20.0+float(p.get("entry_spread_bps",0) or 0)
         net=gross-cost
+        self._paper_close(symbol,reason,exit_px)
         self._event(symbol,"DYNAMIC_SCALP_SHADOW_EXIT",reason,{
             **p,"exit_px":float(exit_px),"gross_bps":gross,"cost_bps":cost,"net_bps":net,
             "age_ms":now_ms()-int(p["opened_ms"]),
