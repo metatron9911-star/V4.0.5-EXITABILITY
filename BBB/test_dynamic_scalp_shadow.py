@@ -10,6 +10,21 @@ class DummyBook:
         self.mid=mid;self.best_bid=bid or mid*.9999;self.best_ask=ask or mid*1.0001
 
 class DynamicShadowTests(unittest.TestCase):
+    def test_hype_requires_confirmation_not_single_spike(self):
+        s=DynamicScalpShadow(DummyCX(),"S")
+        b=DummyBook(100)
+        # Build enough history around a local high.
+        for i in range(15):
+            s.hist["X"].append({"ts":i*1000,"mid":99.9+(0.01 if i%3==0 else 0),"tc1":1,"tc5":5})
+        f={"dynamic_segment":"HYPE_TREND","trade_count_1s":10,"trade_count_5s":30,
+           "ret_250ms_bps":2,"ret_1s_bps":5,"buy_ratio_1s":.7,"spread_bps":2}
+        # First print-through only arms the setup.
+        b.mid=100.1;b.best_bid=100.09;b.best_ask=100.11
+        s._hype_signal("X",f,b,0)
+        self.assertNotIn("X",s.positions)
+        self.assertIn("X",s.hype_arms)
+
+
     def test_net_cost_is_conservative(self):
         s=DynamicScalpShadow(DummyCX(),"S")
         b=DummyBook(100)
