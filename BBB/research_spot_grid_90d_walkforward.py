@@ -3,6 +3,8 @@
 # Public REST only. No API key, no orders, no trading-state mutation.
 import sqlite3, urllib.request, urllib.parse, json, time, statistics, math, itertools, sys
 
+BEST_ONLY="--best-only" in sys.argv
+
 BASE="https://api.bybit.com"
 CATEGORY="spot"
 INTERVAL="15"
@@ -43,8 +45,8 @@ candidate_symbols=sorted(set(r[0] for r in cx.execute("SELECT DISTINCT symbol FR
 spot_symbols=fetch_spot_symbols()
 symbols=[sym for sym in candidate_symbols if sym in spot_symbols]
 unsupported=[sym for sym in candidate_symbols if sym not in spot_symbols]
-print("CANDIDATES",len(candidate_symbols),"EXACT_SPOT_MATCH",len(symbols),"UNSUPPORTED",len(unsupported),flush=True)
-if unsupported:
+if not BEST_ONLY: print("CANDIDATES",len(candidate_symbols),"EXACT_SPOT_MATCH",len(symbols),"UNSUPPORTED",len(unsupported),flush=True)
+if unsupported and not BEST_ONLY:
     print("UNSUPPORTED_SAMPLE",unsupported[:25],flush=True)
 
 def fetch_klines(symbol,days=DAYS):
@@ -103,28 +105,28 @@ try:
     for sym,rows in raw.items():
         if sym in symbols:
             BARS[sym]=[tuple(x) for x in rows]
-    print("CACHE_LOADED",len(BARS),"symbols",flush=True)
+    if not BEST_ONLY: print("CACHE_LOADED",len(BARS),"symbols",flush=True)
 except Exception:
     pass
 
 missing=[s for s in symbols if s not in BARS]
 if missing:
-    print("FETCHING",len(missing),"exact Bybit SPOT USDT symbols",flush=True)
+    if not BEST_ONLY: print("FETCHING",len(missing),"exact Bybit SPOT USDT symbols",flush=True)
     for i,sym in enumerate(missing,1):
         b=fetch_klines(sym)
         if len(b)>=500:
             BARS[sym]=b
-            print("SPOT_OK",i,"/",len(missing),sym,"bars",len(b),flush=True)
+            if not BEST_ONLY: print("SPOT_OK",i,"/",len(missing),sym,"bars",len(b),flush=True)
         else:
-            print("SPOT_SKIP",i,"/",len(missing),sym,"bars",len(b),flush=True)
+            if not BEST_ONLY: print("SPOT_SKIP",i,"/",len(missing),sym,"bars",len(b),flush=True)
     try:
         with open(CACHE,"w") as fh:
             json.dump({k:[list(x) for x in v] for k,v in BARS.items()},fh)
-        print("CACHE_SAVED",CACHE,flush=True)
+        if not BEST_ONLY: print("CACHE_SAVED",CACHE,flush=True)
     except Exception as e:
         print("CACHE_SAVE_FAIL",e,flush=True)
 
-print("USABLE_SPOT_SYMBOLS",len(BARS),sorted(BARS),flush=True)
+if not BEST_ONLY: print("USABLE_SPOT_SYMBOLS",len(BARS),sorted(BARS),flush=True)
 if not BARS:
     raise SystemExit("No usable Bybit spot symbols")
 
@@ -141,7 +143,7 @@ for sym,bs in BARS.items():
         hist=bs[:i+1]
         arr.append((rsi(closes),atr(hist),bb(closes),ema(closes,8),ema(closes,21)))
     IND[sym]=arr
-print("INDICATORS_PRECOMPUTED",sum(len(v) for v in IND.values()),flush=True)
+if not BEST_ONLY: print("INDICATORS_PRECOMPUTED",sum(len(v) for v in IND.values()),flush=True)
 
 def simulate(sym,bs,cfg,lo_ts=None,hi_ts=None):
     rsi_th,atr_min,step_mult,tp_mult,stop_frac,max_levels,size_mode,trend_guard,max_age=cfg
@@ -216,7 +218,7 @@ for i,cfg in enumerate(base_cfgs,1):
     if a["N"]>=25 and b["N"]>=8 and a["NET"]>0 and b["NET"]>0 and a["PF"]>1.05 and b["PF"]>1.05:
         score=(min(a["PF"],b["PF"]),min(a["EXP"],b["EXP"]),-max(a["DD"],b["DD"]))
         coarse.append((score,cfg,a,b))
-    if i%100==0 or i==len(base_cfgs):
+    if (not BEST_ONLY) and (i%100==0 or i==len(base_cfgs)):
         print("COARSE",i,"/",len(base_cfgs),"survivors",len(coarse),flush=True)
 
 # Stage 2: refine only neighborhoods of the best 12 coarse entry configs.
@@ -241,7 +243,7 @@ for _,cfg0,_,_ in seed:
             refined.append((score,cfg,a,b))
 
 coarse=sorted(refined,reverse=True)[:80]
-print("REFINED_TOP",len(coarse),flush=True)
+if not BEST_ONLY: print("REFINED_TOP",len(coarse),flush=True)
 
 final=[]
 for score,cfg,a,b in coarse:
@@ -261,11 +263,34 @@ for score,cfg,a,b in coarse:
     final.append(((min(a["PF"],b["PF"],c["PF"],d["PF"]),min(a["EXP"],b["EXP"],c["EXP"],d["EXP"]),-whole["DD"]),cfg,a,b,c,d,e,whole))
 
 final.sort(reverse=True)
-print("=== 90D WALK-FORWARD ROBUST SPOT CANDIDATES ===")
-for row in final[:20]:
-    score,cfg,a,b,c,d,e,w=row
-    print("\nCFG",cfg)
-    print(" TRAIN",a);print(" VAL",b);print(" TEST",c);print(" HOLDOUT",d);print(" HOLDOUT_STRESS+20bps",e);print(" ALL90D",w)
-print("=== BEST ===")
-if final: print(final[0][1],final[0][-1])
-else: print("NONE")
+result_path="/data/spot_grid_90d_best.json"
+if final:
+    score,cfg,a,b,c,d,e,w=final[0]
+    payload={"cfg":cfg,"train":a,"val":b,"test":c,"holdout":d,"holdout_stress_20bps":e,"all90d":w}
+    try:
+        with open(result_path,"w") as fh: json.dump(payload,fh,indent=2)
+    except Exception:
+        pass
+else:
+    payload=None
+    try:
+        with open(result_path,"w") as fh: json.dump({"best":None},fh,indent=2)
+    except Exception:
+        pass
+
+if BEST_ONLY:
+    print("=== BEST ===")
+    if payload:
+        print(json.dumps(payload,separators=(",",":")))
+    else:
+        print("NONE")
+else:
+    print("=== 90D WALK-FORWARD ROBUST SPOT CANDIDATES ===")
+    for row in final[:20]:
+        score,cfg,a,b,c,d,e,w=row
+        print("\nCFG",cfg)
+        print(" TRAIN",a);print(" VAL",b);print(" TEST",c);print(" HOLDOUT",d);print(" HOLDOUT_STRESS+20bps",e);print(" ALL90D",w)
+    print("=== BEST ===")
+    if final: print(final[0][1],final[0][-1])
+    else: print("NONE")
+    print("BEST_SAVED",result_path)
