@@ -27,6 +27,7 @@ class DynamicScalpShadow:
         self._write_meta()
         self.hist: Dict[str, deque] = defaultdict(lambda: deque(maxlen=180))
         self.wall_arms: Dict[tuple[str,str],dict] = {}
+        self.hype_arms: Dict[str,dict] = {}
         self.positions: Dict[str,dict] = {}
         self.cooldown_until: Dict[str,int] = {}
 
@@ -187,7 +188,82 @@ class DynamicScalpShadow:
                 self._close(symbol,"LIQUID_TIMEOUT",mid,f,exchange_ts_ms);return
 
     def _hype_signal(self, symbol, f, book, exchange_ts_ms):
-        if f.get("dynamic_segment")!="HYPE_TREND" or symbol in self.positions:
+        if symbol in self.positions:
+            self.hype_arms.pop(symbol,None)
+            return
+
+        now=now_ms()
+        seg=f.get("dynamic_segment")
+        arm=self.hype_arms.get(symbol)
+
+        # Existing armed breakout: require persistence/continuation before entry.
+        if arm is not None:
+            side=str(arm["side"])
+            level=float(arm["level"])
+            cur=float(book.mid or 0)
+            sign=1.0 if side=="BUY" else -1.0
+            beyond_bps=sign*(cur/level-1.0)*10000.0 if level>0 and cur>0 else -999.0
+
+            # Recompute current tape ratio against recent local baseline.
+            h=self.hist[symbol]
+            prior=list(h)[:-1]
+            tc_hist=[max(1,int(x["tc1"])) for x in prior[-20:]]
+            slow=statistics.median(tc_hist) if tc_hist else 1.0
+            speed_ratio=float(f.get("trade_count_1s",0) or 0)/max(1.0,slow)
+
+            # Hard invalidate: breakout lost beyond allowed retest, regime disappeared,
+            # or directional tape flipped before confirmation.
+            if (
+                seg!="HYPE_TREND"
+                or beyond_bps < -HYPE.breakout_max_retest_bps
+                or not directional_hype_trigger(side,f)
+            ):
+                self._event(symbol,"DYNAMIC_SCALP_HYPE_REJECT","BREAKOUT_FAILED",{
+                    **arm,"age_ms":now-int(arm["armed_ms"]),
+                    "beyond_bps":beyond_bps,"tape_speed_ratio_now":speed_ratio,
+                    "segment":seg,
+                },exchange_ts_ms)
+                self.hype_arms.pop(symbol,None)
+                return
+
+            if beyond_bps >= HYPE.breakout_hold_buffer_bps:
+                arm["confirm_samples"]=int(arm.get("confirm_samples",0))+1
+                arm["best_beyond_bps"]=max(float(arm.get("best_beyond_bps",beyond_bps)),beyond_bps)
+            arm["min_beyond_bps"]=min(float(arm.get("min_beyond_bps",beyond_bps)),beyond_bps)
+
+            elapsed=now-int(arm["armed_ms"])
+            continued=float(arm.get("best_beyond_bps",0.0))>=HYPE.breakout_min_continue_bps
+            tape_alive=speed_ratio>=HYPE.breakout_min_tape_ratio_after_arm
+            enough_samples=int(arm.get("confirm_samples",0))>=HYPE.breakout_min_confirm_samples
+
+            if elapsed>=HYPE.breakout_confirm_ms:
+                if enough_samples and continued and tape_alive:
+                    px=float(book.best_ask if side=="BUY" else book.best_bid)
+                    if px>0:
+                        self._event(symbol,"DYNAMIC_SCALP_HYPE_CONFIRM","PERSISTENT_BREAKOUT",{
+                            **arm,"age_ms":elapsed,"beyond_bps":beyond_bps,
+                            "tape_speed_ratio_now":speed_ratio,
+                        },exchange_ts_ms)
+                        self._open(symbol,"HYPE",side,px,f,exchange_ts_ms,{
+                            "level":level,
+                            "touches":arm["touches"],
+                            "tape_speed_ratio_arm":arm["tape_speed_ratio_arm"],
+                            "tape_speed_ratio_confirm":speed_ratio,
+                            "breakout_confirm_ms":elapsed,
+                            "breakout_confirm_samples":arm.get("confirm_samples",0),
+                            "breakout_best_beyond_bps":arm.get("best_beyond_bps",0.0),
+                            "breakout_min_beyond_bps":arm.get("min_beyond_bps",0.0),
+                        })
+                else:
+                    self._event(symbol,"DYNAMIC_SCALP_HYPE_REJECT","NO_PERSISTENCE",{
+                        **arm,"age_ms":elapsed,"beyond_bps":beyond_bps,
+                        "tape_speed_ratio_now":speed_ratio,
+                        "enough_samples":enough_samples,"continued":continued,"tape_alive":tape_alive,
+                    },exchange_ts_ms)
+                self.hype_arms.pop(symbol,None)
+            return
+
+        if seg!="HYPE_TREND":
             return
         h=self.hist[symbol]
         if len(h)<12:return
@@ -210,12 +286,25 @@ class DynamicScalpShadow:
         slow=statistics.median(tc_hist) if tc_hist else 1.0
         speed_ratio=float(f.get("trade_count_1s",0) or 0)/max(1.0,slow)
 
+        side=None;level=None;touches=0
         if hi_touches>=HYPE.min_level_touches and cur>hi and speed_ratio>=HYPE.tape_speed_ratio_min and directional_hype_trigger("BUY",f):
-            px=float(book.best_ask or cur)
-            self._open(symbol,"HYPE","BUY",px,f,exchange_ts_ms,{"level":hi,"touches":hi_touches,"tape_speed_ratio":speed_ratio})
+            side="BUY";level=hi;touches=hi_touches
         elif lo_touches>=HYPE.min_level_touches and cur<lo and speed_ratio>=HYPE.tape_speed_ratio_min and directional_hype_trigger("SELL",f):
-            px=float(book.best_bid or cur)
-            self._open(symbol,"HYPE","SELL",px,f,exchange_ts_ms,{"level":lo,"touches":lo_touches,"tape_speed_ratio":speed_ratio})
+            side="SELL";level=lo;touches=lo_touches
+
+        if side:
+            sign=1.0 if side=="BUY" else -1.0
+            beyond_bps=sign*(cur/float(level)-1.0)*10000.0
+            self.hype_arms[symbol]={
+                "side":side,"level":float(level),"touches":int(touches),
+                "armed_ms":now,"tape_speed_ratio_arm":speed_ratio,
+                "confirm_samples":1 if beyond_bps>=HYPE.breakout_hold_buffer_bps else 0,
+                "best_beyond_bps":beyond_bps,
+                "min_beyond_bps":beyond_bps,
+            }
+            self._event(symbol,"DYNAMIC_SCALP_HYPE_ARM","BREAKOUT_PRINT_THROUGH",{
+                **self.hype_arms[symbol],"beyond_bps":beyond_bps,
+            },exchange_ts_ms)
 
     def _liquid_signal(self, symbol, f, book, exchange_ts_ms):
         if f.get("dynamic_segment")!="LIQUID_FLAT" or symbol in self.positions:
