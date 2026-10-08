@@ -124,6 +124,51 @@ def board():
     a[9].metric("ELC CF 60s",len(cf60))
     a[10].metric("CF recovered",cf60_rec)
 
+    st.subheader("Dynamic scalp shadow")
+    st.caption("Forward PAPER-shadow · old BBB entries may remain OFF · conservative cost model")
+    ds_exits=db.execute("""SELECT symbol,reason,payload_json FROM events
+                           WHERE session_id=? AND stage='DYNAMIC_SCALP_SHADOW_EXIT'
+                           ORDER BY id""",(session,)).fetchall()
+    ds_entries=db.execute("""SELECT symbol,reason,payload_json FROM events
+                             WHERE session_id=? AND stage='DYNAMIC_SCALP_SHADOW_ENTRY'
+                             ORDER BY id""",(session,)).fetchall()
+    ds_wall_arms=db.execute("""SELECT COUNT(*) FROM events
+                               WHERE session_id=? AND stage='DYNAMIC_SCALP_WALL_ARM'""",(session,)).fetchone()[0]
+    ds_stats=defaultdict(lambda:{"n":0,"wins":0,"net":0.0,"gross":0.0,"cost":0.0,"rets":[],"reasons":defaultdict(int)})
+    for sym,reason,j in ds_exits:
+        p=safe_json(j)
+        mod=str(p.get("module") or "UNKNOWN")
+        x=float(p.get("net_bps",0) or 0)
+        g=float(p.get("gross_bps",0) or 0)
+        c=float(p.get("cost_bps",0) or 0)
+        z=ds_stats[mod]
+        z["n"]+=1; z["net"]+=x; z["gross"]+=g; z["cost"]+=c; z["rets"].append(x)
+        if x>0:z["wins"]+=1
+        z["reasons"][str(reason or "—")]+=1
+    c1=st.columns(4)
+    c1[0].metric("Shadow entries",len(ds_entries))
+    c1[1].metric("Shadow exits",len(ds_exits))
+    c1[2].metric("DOM wall arms",ds_wall_arms)
+    c1[3].metric("Shadow open est.",max(0,len(ds_entries)-len(ds_exits)))
+    ds_report=[]
+    for mod in ("HYPE","LIQUID","UNKNOWN"):
+        z=ds_stats.get(mod)
+        if not z or not z["n"]: continue
+        n=z["n"]; w=z["wins"]; gl=-sum(min(0,x) for x in z["rets"]); gp=sum(max(0,x) for x in z["rets"])
+        ds_report.append({
+            "module":mod,"N":n,"W/L":f"{w}/{n-w}","WR_%":round(100*w/n,1),
+            "NET_bps":round(z["net"],2),"EXP_bps":round(z["net"]/n,2),
+            "PF":round(gp/gl,3) if gl>0 else 999.0,
+            "GROSS_bps":round(z["gross"],2),"COST_bps":round(z["cost"],2),
+            "MEDIAN_bps":round(statistics.median(z["rets"]),2),
+            "WORST_bps":round(min(z["rets"]),2),
+            "reasons":"; ".join(f"{k}:{v}" for k,v in sorted(z["reasons"].items())),
+        })
+    if ds_report:
+        st.dataframe(ds_report,hide_index=True,**_DF_KW)
+    else:
+        st.caption("Collecting first HYPE / LIQUID shadow exits…")
+
     st.subheader("Machine state")
     m=st.columns(6)
     m[0].metric("Mode",meta.get("mode","PAPER"))
