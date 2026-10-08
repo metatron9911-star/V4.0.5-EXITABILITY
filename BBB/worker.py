@@ -13,6 +13,7 @@ from features import FeatureEngine, classify_head, baseline_score
 from paper import PaperTrader
 from universe import scan_vol_universe, fallback_vol_universe, universe_json
 from dynamic_scalp_profile import classify_segment, directional_hype_trigger, settings_json
+from dynamic_scalp_shadow import DynamicScalpShadow
 
 ROOT=Path(__file__).resolve().parent
 DATA_DIR=Path(os.getenv("DATA_DIR",str(ROOT/"data")))
@@ -135,6 +136,7 @@ async def main():
                   WHERE status='OPEN' AND session_id<>?""",(now_ms(),session))
     cx.commit()
     trader=PaperTrader(cx,session,float(os.getenv("BBB_PAPER_START_USD","500")),launch_symbols)
+    dynamic_shadow=DynamicScalpShadow(cx,session)
 
     q=asyncio.Queue(maxsize=int(os.getenv("BBB_MAX_QUEUE","100000")))
     stop=asyncio.Event(); books={s:LocalBook(s) for s in symbols}; fx=FeatureEngine()
@@ -222,6 +224,12 @@ async def main():
 
                     score=baseline_score(snap); gate=65.0
                     state=f"{bucket}|{'ACTIVE' if trade_now else 'WAIT'}"
+
+                    # Always run the new dual-module strategy in PAPER-shadow.
+                    # This remains active even when BBB_PAPER_ENTRIES=false, so we can
+                    # collect clean forward evidence without opening old BBB positions.
+                    dynamic_shadow.on_snapshot(symbol,snap,books[symbol],books[symbol].exchange_ts_ms)
+
                     trader.on_snapshot(symbol,head,snap,books[symbol],books[symbol].exchange_ts_ms,recv,bucket=bucket,allow_new_entries=trade_now)
                     cx.execute("""INSERT INTO feature_samples(
                       ts_ms,exchange_ts_ms,session_id,symbol,head,mid,bid,ask,spread_bps,
