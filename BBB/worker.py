@@ -12,6 +12,7 @@ from orderbook import LocalBook
 from features import FeatureEngine, classify_head, baseline_score
 from paper import PaperTrader
 from universe import scan_vol_universe, fallback_vol_universe, universe_json
+from dynamic_scalp_profile import classify_segment, directional_hype_trigger, settings_json
 
 ROOT=Path(__file__).resolve().parent
 DATA_DIR=Path(os.getenv("DATA_DIR",str(ROOT/"data")))
@@ -128,6 +129,7 @@ async def main():
     setmeta(cx,"vol_universe_source",universe_source)
     setmeta(cx,"runtime_base_session",requested_session)
     setmeta(cx,"paper_start_usd",os.getenv("BBB_PAPER_START_USD","500"))
+    setmeta(cx,"dynamic_scalp_settings_json",settings_json())
     # Any open rows from an older paper session are bookkeeping leftovers after a deliberate reset.
     cx.execute("""UPDATE trades SET status='ABANDONED', exit_reason='SESSION_RESET', closed_ms=?
                   WHERE status='OPEN' AND session_id<>?""",(now_ms(),session))
@@ -192,6 +194,32 @@ async def main():
                     snap["rest_bucket"]=rest_bucket
                     snap["live_activity_score"]=activity_score
                     snap["live_trade_ok"]=1 if trade_now else 0
+
+                    # Dynamic dual-module scalping telemetry (shadow only).
+                    # This does not authorize entries; BBB_PAPER_ENTRIES remains the master switch.
+                    snap["dynamic_segment"]=classify_segment(snap)
+                    snap["hype_buy_trigger"]=1 if directional_hype_trigger("BUY",snap) else 0
+                    snap["hype_sell_trigger"]=1 if directional_hype_trigger("SELL",snap) else 0
+
+                    # DOM wall proxy: largest L20 level notional / median L20 level notional.
+                    # Persist both sides so LIQUID_FLAT wall/rejection logic can be replayed.
+                    for _side,_key in (("bid","dom_bid"),("ask","dom_ask")):
+                        _levels=books[symbol].top(_side,20)
+                        _notionals=[float(p)*float(q) for p,q in _levels if p>0 and q>0]
+                        if _notionals:
+                            _med=statistics.median(_notionals)
+                            _mx=max(_notionals)
+                            _idx=_notionals.index(_mx)
+                            _px=float(_levels[_idx][0])
+                            _mid=float(snap.get("mid") or 0)
+                            snap[_key+"_wall_ratio"]=(_mx/_med) if _med>0 else 0.0
+                            snap[_key+"_wall_price"]=_px
+                            snap[_key+"_wall_distance_bps"]=(abs(_px-_mid)/_mid*10000.0) if _mid>0 else 0.0
+                        else:
+                            snap[_key+"_wall_ratio"]=0.0
+                            snap[_key+"_wall_price"]=0.0
+                            snap[_key+"_wall_distance_bps"]=0.0
+
                     score=baseline_score(snap); gate=65.0
                     state=f"{bucket}|{'ACTIVE' if trade_now else 'WAIT'}"
                     trader.on_snapshot(symbol,head,snap,books[symbol],books[symbol].exchange_ts_ms,recv,bucket=bucket,allow_new_entries=trade_now)
