@@ -63,6 +63,55 @@ def board():
     now=int(time.time()*1000)
     meta=dict(db.execute("SELECT key,value FROM meta").fetchall())
     session=meta.get("session_id","")
+    if meta.get("strategy_mode")=="ROCKET_V1":
+        st.subheader("ROCKET V1 — live PAPER")
+        now=int(time.time()*1000)
+        hb=int(meta.get("heartbeat_ms","0") or 0)
+        feed_state=meta.get("feed_state","STARTING")
+        st.caption(("🟢 " if hb and now-hb<10000 and feed_state=="CONNECTED" else "🔴 ")+feed_state+" · LIVE WS + L50 VWAP")
+        closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state='ROCKET_V1'",(session,)).fetchone()[0]
+        wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state='ROCKET_V1' AND net_pnl_usd>0",(session,)).fetchone()[0]
+        losses=closed-wins
+        open_n=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='OPEN' AND risk_state='ROCKET_V1'",(session,)).fetchone()[0]
+        arms=db.execute("SELECT COUNT(*) FROM events WHERE session_id=? AND stage='ROCKET_ARM'",(session,)).fetchone()[0]
+        confirms=db.execute("SELECT COUNT(*) FROM events WHERE session_id=? AND stage='ROCKET_CONFIRM'",(session,)).fetchone()[0]
+        rejects=db.execute("SELECT COUNT(*) FROM events WHERE session_id=? AND stage='ROCKET_REJECT'",(session,)).fetchone()[0]
+        fills=db.execute("SELECT COUNT(*) FROM events WHERE session_id=? AND stage='ROCKET_FILL' AND reason='ENTRY'",(session,)).fetchone()[0]
+        a=st.columns(8)
+        a[0].metric("ROCKET PAPER","ON")
+        a[1].metric("Closed",closed)
+        a[2].metric("W/L",str(wins)+" / "+str(losses))
+        a[3].metric("WR",("%.1f%%"%(100*wins/closed)) if closed else "0.0%")
+        a[4].metric("Realized $","%.4f"%float(meta.get("rocket_realized_usd","0") or 0))
+        a[5].metric("Fees $","%.4f"%float(meta.get("rocket_fees_usd","0") or 0))
+        a[6].metric("Open",open_n)
+        a[7].metric("Cash $","%.2f"%float(meta.get("rocket_cash_usd","500") or 0))
+        b=st.columns(4)
+        b[0].metric("Breakout arms",arms)
+        b[1].metric("Confirmed",confirms)
+        b[2].metric("Rejected",rejects)
+        b[3].metric("Entry fills",fills)
+        st.subheader("High-volatility universe")
+        try: uni=json.loads(meta.get("vol_universe_json","[]"))
+        except Exception: uni=[]
+        if uni:
+            st.dataframe([{"symbol":x.get("symbol"),"range24h_%":round(float(x.get("range_bps") or 0)/100,2),"change24h_%":round(float(x.get("abs_change_bps") or 0)/100,2),"turnover24h_$":round(float(x.get("turnover24h") or 0),0)} for x in uni],hide_index=True,**_DF_KW)
+        rows=db.execute("""SELECT symbol,ts_ms,spread_bps,trade_count_1s,trade_count_5s,buy_ratio_1s,ret_1s_bps,ret_5s_bps,realized_vol_5s_bps,payload_json FROM feature_samples WHERE session_id=? AND id IN (SELECT MAX(id) FROM feature_samples WHERE session_id=? GROUP BY symbol) ORDER BY symbol""",(session,session)).fetchall()
+        st.subheader("Live gate")
+        rr=[]
+        for r in rows:
+            p=safe_json(r[9])
+            rr.append({"symbol":r[0],"age_ms":now-r[1],"spread_bps":round(float(r[2] or 0),2),"trades_1s":r[3],"trades_5s":r[4],"buy_ratio":round(float(r[5] or 0),3),"ret1s_bps":round(float(r[6] or 0),2),"ret5s_bps":round(float(r[7] or 0),2),"rv5s_bps":round(float(r[8] or 0),2),"range24h_%":round(float(p.get("range24h_bps") or 0)/100,2)})
+        if rr: st.dataframe(rr,hide_index=True,**_DF_KW)
+        tr=db.execute("""SELECT symbol,side,status,entry_vwap,exit_vwap,net_pnl_usd,exit_reason,opened_ms,closed_ms,entry_features_json FROM trades WHERE session_id=? AND risk_state='ROCKET_V1' ORDER BY id DESC LIMIT 50""",(session,)).fetchall()
+        st.subheader("ROCKET trades")
+        out=[]
+        for r in tr:
+            e=safe_json(r[9])
+            out.append({"symbol":r[0],"side":r[1],"status":r[2],"entry":r[3],"exit":r[4],"net_$":round(float(r[5] or 0),5),"reason":r[6],"arm_tape_x":round(float(e.get("arm_tape_ratio",0) or 0),2),"confirm_tape_x":round(float(e.get("confirm_tape_ratio",0) or 0),2),"best_beyond_bps":round(float(e.get("best_beyond_bps",0) or 0),2)})
+        if out: st.dataframe(out,hide_index=True,**_DF_KW)
+        else: st.caption("No ROCKET fills yet.")
+        return
     session_start_ms=int(meta.get("session_start_ms","0") or 0)
     elapsed_ms=max(0,now-session_start_ms) if session_start_ms else 0
     elapsed_s=elapsed_ms//1000
