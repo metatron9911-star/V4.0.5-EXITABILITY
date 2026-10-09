@@ -10,7 +10,7 @@ import json, statistics
 from typing import Dict
 
 from dynamic_scalp_profile import HYPE, LIQUID, RISK, classify_segment, directional_hype_trigger
-from engine import now_ms
+from engine import now_ms, BYBIT_FEES, ProductClass
 import os, uuid
 
 
@@ -24,6 +24,8 @@ class DynamicScalpShadow:
         self.paper_realized=0.0
         self.paper_fees=0.0
         self.paper_positions={}
+        self.pending_limits={}
+        self.limit_ttl_ms=int(os.getenv("BBB_DYNAMIC_LIMIT_TTL_MS","5000"))
         self._write_meta()
         self.hist: Dict[str, deque] = defaultdict(lambda: deque(maxlen=180))
         self.wall_arms: Dict[tuple[str,str],dict] = {}
@@ -38,29 +40,33 @@ class DynamicScalpShadow:
             "dynamic_scalp_realized_usd":f"{self.paper_realized:.8f}",
             "dynamic_scalp_fees_usd":f"{self.paper_fees:.8f}",
             "dynamic_scalp_open_positions":str(len(self.paper_positions)),
+            "dynamic_scalp_pending_limits":str(len(self.pending_limits)),
+            "dynamic_scalp_execution_mode":"LIVE_WS_L50_EMULATION",
         }
         for k,v in meta.items():
             self.cx.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",(k,v))
 
-    def _paper_open(self,symbol,module,side,entry_px,f,exchange_ts_ms,extra):
-        if not self.paper_enabled or symbol in self.paper_positions:
-            return
-        # Fixed 2% notional of starting bank for first validation pass, 1x only.
+    def _paper_commit_open(self,symbol,module,side,entry_px,f,exchange_ts_ms,extra,fee_bps,order_type):
+        if symbol in self.paper_positions:
+            return False
         margin=max(1.0,self.start_usd*0.02)
         notional=min(margin,self.paper_cash)
         if notional<=0:
-            return
-        fee=notional*0.001
+            return False
+        fee=notional*float(fee_bps)/10000.0
         if self.paper_cash < notional+fee:
-            return
+            return False
         pid=str(uuid.uuid4())
+        opened=now_ms()
         self.paper_cash-=notional+fee
         self.paper_fees+=fee
         self.paper_positions[symbol]={
             "position_id":pid,"module":module,"side":side,"entry_px":float(entry_px),
-            "notional":notional,"margin":notional,"entry_fee":fee,"opened_ms":now_ms(),
+            "notional":notional,"margin":notional,"entry_fee":fee,"opened_ms":opened,
+            "order_type":order_type,"fee_bps_entry":float(fee_bps),
         }
-        features={**dict(f),"dynamic_module":module,**(extra or {})}
+        features={**dict(f),"dynamic_module":module,"paper_execution_mode":"LIVE_WS_L50_EMULATION",
+                  "paper_order_type":order_type,**(extra or {})}
         self.cx.execute("""INSERT INTO trades(
             session_id,position_id,head,venue,product_class,symbol,side,leverage,margin_usd,notional_usd,
             signal_exchange_ts_ms,receive_ts_ms,signal_ts_ms,order_ts_ms,fill_ts_ms,
@@ -69,28 +75,110 @@ class DynamicScalpShadow:
             entry_score,entry_gate,risk_state,entry_features_json,status,opened_ms)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (self.session_id,pid,"VOL","BYBIT","STANDARD",symbol,side,1.0,notional,notional,
-             int(exchange_ts_ms or 0),now_ms(),now_ms(),now_ms(),now_ms(),
+             int(exchange_ts_ms or 0),opened,opened,opened,opened,
              float(f.get("mid") or entry_px),float(f.get("bid") or entry_px),float(f.get("ask") or entry_px),
              float(entry_px),float(entry_px),fee,0,0,0,0.0,0.0,f"DYNAMIC_{module}",
-             json.dumps(features,separators=(",",":")),"OPEN",now_ms()))
+             json.dumps(features,separators=(",",":")),"OPEN",opened))
+        self._event(symbol,"DYNAMIC_PAPER_FILL","ENTRY",{
+            "module":module,"side":side,"entry_vwap":float(entry_px),"notional_usd":notional,
+            "fee_bps":float(fee_bps),"fee_usd":fee,"order_type":order_type,
+        },exchange_ts_ms)
+        self._write_meta()
+        return True
+
+    def _paper_open(self,symbol,module,side,entry_px,f,book,exchange_ts_ms,extra):
+        if not self.paper_enabled or symbol in self.paper_positions or symbol in self.pending_limits:
+            return
+
+        margin=max(1.0,self.start_usd*0.02)
+        notional=min(margin,self.paper_cash)
+        if notional<=0:
+            return
+
+        if module=="HYPE":
+            # HYPE uses a market order: consume the real live L50 snapshot.
+            vwap,filled=book.walk_vwap(side,notional)
+            if not vwap or filled<notional*0.999:
+                self._event(symbol,"DYNAMIC_PAPER_REJECT","INSUFFICIENT_L50",{
+                    "module":module,"side":side,"requested_usd":notional,"filled_usd":filled,
+                },exchange_ts_ms)
+                return
+            fee_bps=BYBIT_FEES[ProductClass.INNOVATION].taker_bps
+            self._paper_commit_open(symbol,module,side,float(vwap),f,exchange_ts_ms,extra,fee_bps,"MARKET_L50")
+            return
+
+        # LIQUID uses a passive limit in front of the book and waits for the live
+        # stream to actually trade through/cross it. No instant fictional fill.
+        limit_px=float(book.best_bid if side=="BUY" else book.best_ask)
+        if limit_px<=0:
+            return
+        self.pending_limits[symbol]={
+            "module":module,"side":side,"limit_px":limit_px,"placed_ms":now_ms(),
+            "exchange_ts_ms":int(exchange_ts_ms or 0),"extra":dict(extra or {}),"features":dict(f),
+        }
+        self._event(symbol,"DYNAMIC_PAPER_LIMIT_PLACED","LIQUID_PASSIVE",{
+            "side":side,"limit_px":limit_px,"ttl_ms":self.limit_ttl_ms,
+            "wall_price":float((extra or {}).get("wall_price",0) or 0),
+        },exchange_ts_ms)
         self._write_meta()
 
-    def _paper_close(self,symbol,reason,exit_px):
-        pp=self.paper_positions.pop(symbol,None)
+    def _process_pending_limit(self,symbol,f,book,exchange_ts_ms):
+        po=self.pending_limits.get(symbol)
+        if not po:
+            return
+        age=now_ms()-int(po["placed_ms"])
+        if age>=self.limit_ttl_ms:
+            self.pending_limits.pop(symbol,None)
+            self._event(symbol,"DYNAMIC_PAPER_LIMIT_CANCEL","TTL",{
+                "side":po["side"],"limit_px":po["limit_px"],"age_ms":age,
+            },exchange_ts_ms)
+            self._write_meta()
+            return
+        side=po["side"]; limit_px=float(po["limit_px"])
+        crossed=(side=="BUY" and float(book.best_ask or 1e99)<=limit_px) or (
+                 side=="SELL" and float(book.best_bid or 0)>=limit_px)
+        if not crossed:
+            return
+        self.pending_limits.pop(symbol,None)
+        fee_bps=BYBIT_FEES[ProductClass.STANDARD].maker_bps
+        merged={**po.get("features",{}),**dict(f)}
+        self._paper_commit_open(symbol,po["module"],side,limit_px,merged,exchange_ts_ms,
+                                po.get("extra",{}),fee_bps,"LIMIT_LIVE_CROSS")
+        self._write_meta()
+
+    def _paper_close(self,symbol,reason,book,exchange_ts_ms):
+        pp=self.paper_positions.get(symbol)
         if not pp:
             return
-        side=pp["side"]; entry=float(pp["entry_px"]); notional=float(pp["notional"])
+        side=pp["side"]; notional=float(pp["notional"])
+        exit_side="SELL" if side=="BUY" else "BUY"
+        vwap,filled=book.walk_vwap(exit_side,notional)
+        if not vwap or filled<notional*0.999:
+            self._event(symbol,"DYNAMIC_PAPER_REJECT","EXIT_INSUFFICIENT_L50",{
+                "reason":reason,"requested_usd":notional,"filled_usd":filled,
+            },exchange_ts_ms)
+            return
+        pp=self.paper_positions.pop(symbol)
+        entry=float(pp["entry_px"])
         sign=1.0 if side=="BUY" else -1.0
-        gross_ret=sign*(float(exit_px)/entry-1.0)
+        gross_ret=sign*(float(vwap)/entry-1.0)
         gross_pnl=notional*gross_ret
-        exit_fee=notional*0.001
+        product=ProductClass.INNOVATION if pp["module"]=="HYPE" else ProductClass.STANDARD
+        exit_fee_bps=BYBIT_FEES[product].taker_bps
+        exit_fee=notional*exit_fee_bps/10000.0
         net=gross_pnl-float(pp["entry_fee"])-exit_fee
         self.paper_cash += notional + gross_pnl - exit_fee
         self.paper_fees += exit_fee
         self.paper_realized += net
+        hold_ms=max(0,now_ms()-int(pp["opened_ms"]))
         self.cx.execute("""UPDATE trades SET status='CLOSED',exit_vwap=?,exit_fee_usd=?,gross_pnl_usd=?,net_pnl_usd=?,
-                          exit_reason=?,closed_ms=? WHERE session_id=? AND position_id=?""",
-                        (float(exit_px),exit_fee,gross_pnl,net,reason,now_ms(),self.session_id,pp["position_id"]))
+                          exit_reason=?,hold_ms=?,closed_ms=? WHERE session_id=? AND position_id=?""",
+                        (float(vwap),exit_fee,gross_pnl,net,reason,hold_ms,now_ms(),self.session_id,pp["position_id"]))
+        self._event(symbol,"DYNAMIC_PAPER_FILL","EXIT",{
+            "module":pp["module"],"side":exit_side,"exit_vwap":float(vwap),"notional_usd":notional,
+            "fee_bps":exit_fee_bps,"fee_usd":exit_fee,"reason":reason,"net_pnl_usd":net,
+            "hold_ms":hold_ms,
+        },exchange_ts_ms)
         self._write_meta()
 
     def _event(self, symbol, stage, reason, payload, exchange_ts_ms=0):
@@ -106,7 +194,7 @@ class DynamicScalpShadow:
         sign=1.0 if side=="BUY" else -1.0
         return sign*(float(px)/float(entry)-1.0)*10000.0
 
-    def _open(self, symbol, module, side, entry_px, f, exchange_ts_ms, extra=None):
+    def _open(self, symbol, module, side, entry_px, f, book, exchange_ts_ms, extra=None):
         if symbol in self.positions or now_ms()<self.cooldown_until.get(symbol,0):
             return
         if len(self.positions)>=RISK.max_total_open_positions:
@@ -118,7 +206,7 @@ class DynamicScalpShadow:
         }
         if extra: p.update(extra)
         self.positions[symbol]=p
-        self._paper_open(symbol,module,side,entry_px,f,exchange_ts_ms,extra or {})
+        self._paper_open(symbol,module,side,entry_px,f,book,exchange_ts_ms,extra or {})
         self._event(symbol,"DYNAMIC_SCALP_SHADOW_ENTRY",module,{
             **p,
             "segment":f.get("dynamic_segment"),
@@ -129,7 +217,7 @@ class DynamicScalpShadow:
             "buy_ratio_1s":float(f.get("buy_ratio_1s",.5) or .5),
         },exchange_ts_ms)
 
-    def _close(self, symbol, reason, exit_px, f, exchange_ts_ms):
+    def _close(self, symbol, reason, exit_px, f, book, exchange_ts_ms):
         p=self.positions.pop(symbol,None)
         if not p:return
         gross=self._move_bps(p["side"],p["entry_px"],exit_px)
@@ -137,7 +225,8 @@ class DynamicScalpShadow:
         # This intentionally penalizes the shadow rather than assuming perfect maker fills.
         cost=20.0+float(p.get("entry_spread_bps",0) or 0)
         net=gross-cost
-        self._paper_close(symbol,reason,exit_px)
+        self.pending_limits.pop(symbol,None)
+        self._paper_close(symbol,reason,book,exchange_ts_ms)
         self._event(symbol,"DYNAMIC_SCALP_SHADOW_EXIT",reason,{
             **p,"exit_px":float(exit_px),"gross_bps":gross,"cost_bps":cost,"net_bps":net,
             "age_ms":now_ms()-int(p["opened_ms"]),
@@ -163,11 +252,11 @@ class DynamicScalpShadow:
             if p["peak_bps"]>=HYPE.trail_arm_bps:
                 stop=max(stop,p["peak_bps"]-HYPE.trail_giveback_bps)
             if move<=stop:
-                self._close(symbol,"HYPE_STOP_OR_TRAIL",mid,f,exchange_ts_ms);return
+                self._close(symbol,"HYPE_STOP_OR_TRAIL",mid,f,book,exchange_ts_ms);return
             if move>=HYPE.take_profit_bps:
-                self._close(symbol,"HYPE_TP",mid,f,exchange_ts_ms);return
+                self._close(symbol,"HYPE_TP",mid,f,book,exchange_ts_ms);return
             if age>=HYPE.timeout_ms:
-                self._close(symbol,"HYPE_TIMEOUT",mid,f,exchange_ts_ms);return
+                self._close(symbol,"HYPE_TIMEOUT",mid,f,book,exchange_ts_ms);return
         else:
             if move>=LIQUID.breakeven_arm_bps:
                 p["breakeven"]=True
@@ -175,17 +264,17 @@ class DynamicScalpShadow:
             if p["side"]=="BUY":
                 wall_stop=wall*(1-LIQUID.stop_buffer_bps/10000)
                 if mid<=wall_stop:
-                    self._close(symbol,"LIQUID_WALL_BROKEN",mid,f,exchange_ts_ms);return
+                    self._close(symbol,"LIQUID_WALL_BROKEN",mid,f,book,exchange_ts_ms);return
             else:
                 wall_stop=wall*(1+LIQUID.stop_buffer_bps/10000)
                 if mid>=wall_stop:
                     self._close(symbol,"LIQUID_WALL_BROKEN",mid,f,exchange_ts_ms);return
             if move>=LIQUID.take_profit_bps:
-                self._close(symbol,"LIQUID_TP",mid,f,exchange_ts_ms);return
+                self._close(symbol,"LIQUID_TP",mid,f,book,exchange_ts_ms);return
             if p["breakeven"] and move<=0:
-                self._close(symbol,"LIQUID_BREAKEVEN",mid,f,exchange_ts_ms);return
+                self._close(symbol,"LIQUID_BREAKEVEN",mid,f,book,exchange_ts_ms);return
             if age>=LIQUID.timeout_ms:
-                self._close(symbol,"LIQUID_TIMEOUT",mid,f,exchange_ts_ms);return
+                self._close(symbol,"LIQUID_TIMEOUT",mid,f,book,exchange_ts_ms);return
 
     def _hype_signal(self, symbol, f, book, exchange_ts_ms):
         if symbol in self.positions:
@@ -234,17 +323,18 @@ class DynamicScalpShadow:
             elapsed=now-int(arm["armed_ms"])
             continued=float(arm.get("best_beyond_bps",0.0))>=HYPE.breakout_min_continue_bps
             tape_alive=speed_ratio>=HYPE.breakout_min_tape_ratio_after_arm
+            tape_accelerating=speed_ratio>=float(arm.get("tape_speed_ratio_arm",speed_ratio))*HYPE.breakout_min_tape_accel_vs_arm
             enough_samples=int(arm.get("confirm_samples",0))>=HYPE.breakout_min_confirm_samples
 
             if elapsed>=HYPE.breakout_confirm_ms:
-                if enough_samples and continued and tape_alive:
+                if enough_samples and continued and tape_alive and tape_accelerating:
                     px=float(book.best_ask if side=="BUY" else book.best_bid)
                     if px>0:
                         self._event(symbol,"DYNAMIC_SCALP_HYPE_CONFIRM","PERSISTENT_BREAKOUT",{
                             **arm,"age_ms":elapsed,"beyond_bps":beyond_bps,
                             "tape_speed_ratio_now":speed_ratio,
                         },exchange_ts_ms)
-                        self._open(symbol,"HYPE",side,px,f,exchange_ts_ms,{
+                        self._open(symbol,"HYPE",side,px,f,book,exchange_ts_ms,{
                             "level":level,
                             "touches":arm["touches"],
                             "tape_speed_ratio_arm":arm["tape_speed_ratio_arm"],
@@ -258,7 +348,7 @@ class DynamicScalpShadow:
                     self._event(symbol,"DYNAMIC_SCALP_HYPE_REJECT","NO_PERSISTENCE",{
                         **arm,"age_ms":elapsed,"beyond_bps":beyond_bps,
                         "tape_speed_ratio_now":speed_ratio,
-                        "enough_samples":enough_samples,"continued":continued,"tape_alive":tape_alive,
+                        "enough_samples":enough_samples,"continued":continued,"tape_alive":tape_alive,"tape_accelerating":tape_accelerating,
                     },exchange_ts_ms)
                 self.hype_arms.pop(symbol,None)
             return
@@ -337,7 +427,7 @@ class DynamicScalpShadow:
             # Conservative shadow fill: cross the spread rather than assume a perfect maker fill.
             px=float(book.best_ask if side=="BUY" else book.best_bid)
             if px>0:
-                self._open(symbol,"LIQUID",side,px,f,exchange_ts_ms,{
+                self._open(symbol,"LIQUID",side,px,f,book,exchange_ts_ms,{
                     "wall_price":wall,"wall_ratio":ratio,"wall_retained_frac":retained,
                 })
                 self.wall_arms.pop(k,None)
@@ -346,6 +436,7 @@ class DynamicScalpShadow:
     def on_snapshot(self, symbol, f, book, exchange_ts_ms=0):
         if not book.synced or not book.mid:
             return
+        self._process_pending_limit(symbol,f,book,exchange_ts_ms)
         self._manage(symbol,f,book,exchange_ts_ms)
         self.hist[symbol].append({
             "ts":now_ms(),"mid":float(book.mid),"tc1":int(f.get("trade_count_1s",0) or 0),
