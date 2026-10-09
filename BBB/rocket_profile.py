@@ -29,6 +29,7 @@ class RocketSettings:
     arm_tape_ratio_min: float = 2.5
     confirm_ms: int = 2_000
     confirm_samples: int = 2
+    confirm_quorum_votes: int = 3  # require 3 of DIR_250MS / DIR_1S / FLOW / TAPE
     min_beyond_level_bps: float = 2.0
     max_retest_bps: float = 2.0
     confirm_tape_ratio_min: float = 2.0
