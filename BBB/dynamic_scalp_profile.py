@@ -42,13 +42,13 @@ class HypeSettings:
     min_trade_count_1s: int = 4
 
     # Breakout must persist after the first print-through; do not buy one-tick spikes.
-    breakout_confirm_ms: int = 3_000
+    breakout_confirm_ms: int = 2_000
     breakout_min_confirm_samples: int = 2
-    breakout_hold_buffer_bps: float = 2.0
+    breakout_hold_buffer_bps: float = 1.0
     breakout_max_retest_bps: float = 2.0
-    breakout_min_continue_bps: float = 3.0
-    breakout_min_tape_ratio_after_arm: float = 2.0
-    breakout_min_tape_accel_vs_arm: float = 1.10
+    breakout_min_continue_bps: float = 2.0
+    breakout_min_tape_ratio_after_arm: float = 1.5
+    breakout_min_tape_accel_vs_arm: float = 0.75
 
     # Entry quality.
     min_directional_ret_250ms_bps: float = 0.5
@@ -72,14 +72,14 @@ class HypeSettings:
 class LiquidSettings:
     # DOM wall: compare candidate level notional to median top-level notional.
     # This is a live-book proxy for "very large density"; it is testable with L50.
-    wall_ratio_min: float = 10.0
+    wall_ratio_min: float = 8.0
     wall_top_levels: int = 20
-    wall_max_distance_bps: float = 8.0
+    wall_max_distance_bps: float = 10.0
 
     # Price touches wall but does not eat it during this interval.
-    rejection_confirm_ms: int = 6_000
-    max_wall_consumed_frac: float = 0.25
-    min_book_imbalance_abs: float = 0.12
+    rejection_confirm_ms: int = 4_000
+    max_wall_consumed_frac: float = 0.40
+    min_book_imbalance_abs: float = 0.08
 
     # PAPER risk profile.
     paper_leverage: float = 1.0
