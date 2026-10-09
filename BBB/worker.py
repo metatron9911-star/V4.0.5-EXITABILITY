@@ -10,10 +10,9 @@ from pathlib import Path
 from market_bybit import BybitPublicFeed, now_ms
 from orderbook import LocalBook
 from features import FeatureEngine, classify_head, baseline_score
-from paper import PaperTrader
 from universe import scan_vol_universe, fallback_vol_universe, universe_json
-from dynamic_scalp_profile import classify_segment, directional_hype_trigger, settings_json
-from dynamic_scalp_shadow import DynamicScalpShadow
+from rocket_profile import settings_json as rocket_settings_json
+from rocket_paper import RocketPaper
 
 ROOT=Path(__file__).resolve().parent
 DATA_DIR=Path(os.getenv("DATA_DIR",str(ROOT/"data")))
@@ -22,6 +21,34 @@ DB=DATA_DIR/"bbb.sqlite3"
 DEFAULT_SYMBOLS=["SOLUSDT","ETHUSDT","BTCUSDT"]
 GATES={"LIQUID":60.0,"VOL":65.0,"LAUNCH":70.0}
 
+
+def purge_legacy_data_once():
+    epoch=os.getenv("BBB_DATA_EPOCH","").strip()
+    if not epoch:
+        return
+    marker=DATA_DIR/(".epoch_"+epoch)
+    if marker.exists():
+        return
+    before=0
+    try:
+        for p in DATA_DIR.rglob("*"):
+            if p.is_file():
+                try: before+=p.stat().st_size
+                except Exception: pass
+        # Old research packages, caches and the old multi-strategy DB are not
+        # part of the new ROCKET machine. Start the new epoch from a clean volume.
+        for p in sorted(DATA_DIR.iterdir(),key=lambda x:len(str(x)),reverse=True):
+            try:
+                if p.is_dir():
+                    import shutil; shutil.rmtree(p)
+                else:
+                    p.unlink(missing_ok=True)
+            except Exception as e:
+                print("PURGE_FAIL",str(p),repr(e),flush=True)
+        marker.write_text(epoch,encoding="utf-8")
+        print("DATA_EPOCH_PURGED",epoch,"freed_bytes",before,flush=True)
+    except Exception as e:
+        print("DATA_EPOCH_PURGE_FATAL",repr(e),flush=True)
 
 def runtime_storage_audit():
     try:
@@ -76,6 +103,7 @@ def live_vol_state(snap:dict,rest_bucket:str) -> tuple[str,bool,float]:
 
 
 async def main():
+    purge_legacy_data_once()
     runtime_storage_audit()
     cx=connect()
     old=dict(cx.execute("SELECT key,value FROM meta").fetchall()).get("session_id")
@@ -111,6 +139,7 @@ async def main():
     setmeta(cx,"funding_usd",0)
     setmeta(cx,"slippage_impact_usd",0)
     setmeta(cx,"paper_open_positions",0)
+    setmeta(cx,"strategy_mode","ROCKET_V1")
     setmeta(cx,"sanitizer_rejects",0)
     cx.commit()
 
@@ -143,13 +172,12 @@ async def main():
     setmeta(cx,"vol_universe_source",universe_source)
     setmeta(cx,"runtime_base_session",requested_session)
     setmeta(cx,"paper_start_usd",os.getenv("BBB_PAPER_START_USD","500"))
-    setmeta(cx,"dynamic_scalp_settings_json",settings_json())
+    setmeta(cx,"rocket_settings_json",rocket_settings_json())
     # Any open rows from an older paper session are bookkeeping leftovers after a deliberate reset.
     cx.execute("""UPDATE trades SET status='ABANDONED', exit_reason='SESSION_RESET', closed_ms=?
                   WHERE status='OPEN' AND session_id<>?""",(now_ms(),session))
     cx.commit()
-    trader=PaperTrader(cx,session,float(os.getenv("BBB_PAPER_START_USD","500")),launch_symbols)
-    dynamic_shadow=DynamicScalpShadow(cx,session)
+    rocket=RocketPaper(cx,session,float(os.getenv("BBB_PAPER_START_USD","500")))
 
     q=asyncio.Queue(maxsize=int(os.getenv("BBB_MAX_QUEUE","100000")))
     stop=asyncio.Event(); books={s:LocalBook(s) for s in symbols}; fx=FeatureEngine()
@@ -210,40 +238,11 @@ async def main():
                     snap["live_activity_score"]=activity_score
                     snap["live_trade_ok"]=1 if trade_now else 0
 
-                    # Dynamic dual-module scalping telemetry (shadow only).
-                    # This does not authorize entries; BBB_PAPER_ENTRIES remains the master switch.
-                    snap["dynamic_segment"]=classify_segment(snap)
-                    snap["hype_buy_trigger"]=1 if directional_hype_trigger("BUY",snap) else 0
-                    snap["hype_sell_trigger"]=1 if directional_hype_trigger("SELL",snap) else 0
-
-                    # DOM wall proxy: largest L20 level notional / median L20 level notional.
-                    # Persist both sides so LIQUID_FLAT wall/rejection logic can be replayed.
-                    for _side,_key in (("bid","dom_bid"),("ask","dom_ask")):
-                        _levels=books[symbol].top(_side,20)
-                        _notionals=[float(p)*float(q) for p,q in _levels if p>0 and q>0]
-                        if _notionals:
-                            _med=statistics.median(_notionals)
-                            _mx=max(_notionals)
-                            _idx=_notionals.index(_mx)
-                            _px=float(_levels[_idx][0])
-                            _mid=float(snap.get("mid") or 0)
-                            snap[_key+"_wall_ratio"]=(_mx/_med) if _med>0 else 0.0
-                            snap[_key+"_wall_price"]=_px
-                            snap[_key+"_wall_distance_bps"]=(abs(_px-_mid)/_mid*10000.0) if _mid>0 else 0.0
-                        else:
-                            snap[_key+"_wall_ratio"]=0.0
-                            snap[_key+"_wall_price"]=0.0
-                            snap[_key+"_wall_distance_bps"]=0.0
-
+                    # ROCKET_V1 is the only active trading machine.
                     score=baseline_score(snap); gate=65.0
                     state=f"{bucket}|{'ACTIVE' if trade_now else 'WAIT'}"
 
-                    # Always run the new dual-module strategy in PAPER-shadow.
-                    # This remains active even when BBB_PAPER_ENTRIES=false, so we can
-                    # collect clean forward evidence without opening old BBB positions.
-                    dynamic_shadow.on_snapshot(symbol,snap,books[symbol],books[symbol].exchange_ts_ms)
-
-                    trader.on_snapshot(symbol,head,snap,books[symbol],books[symbol].exchange_ts_ms,recv,bucket=bucket,allow_new_entries=trade_now)
+                    rocket.on_snapshot(symbol,snap,books[symbol],books[symbol].exchange_ts_ms)
                     cx.execute("""INSERT INTO feature_samples(
                       ts_ms,exchange_ts_ms,session_id,symbol,head,mid,bid,ask,spread_bps,
                       depth_bid_5_usd,depth_ask_5_usd,book_imbalance_5,trade_count_1s,trade_count_5s,
@@ -271,12 +270,8 @@ async def main():
                         bucket_map={x.symbol:x.bucket for x in fresh}
                         scan_meta={x.symbol:x for x in fresh}
                         universe=fresh
-                        held={p.symbol for p in trader.book.positions.values()}
-                        # Keep counterfactual tail symbols subscribed even after
-                        # the real A position has closed. Otherwise universe
-                        # rotation can starve B2 of snapshots and corrupt exits.
-                        shadow_held={str(st.get("symbol","")).upper() for st in trader.b2_tail_shadow.values() if st.get("symbol")}
-                        feed.set_symbols(set(new_symbols)|held|shadow_held)
+                        held=set(rocket.positions.keys())|set(rocket.arms.keys())
+                        feed.set_symbols(set(new_symbols)|held)
                         symbols=new_symbols
                         setmeta(cx,"symbols",",".join(new_symbols))
                         setmeta(cx,"vol_universe_json",universe_json(fresh))
