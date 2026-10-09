@@ -160,6 +160,12 @@ def board():
                              ORDER BY id""",(session,)).fetchall()
     ds_wall_arms=db.execute("""SELECT COUNT(*) FROM events
                                WHERE session_id=? AND stage='DYNAMIC_SCALP_WALL_ARM'""",(session,)).fetchone()[0]
+    hype_arms=db.execute("SELECT COUNT(*) FROM events WHERE session_id=? AND stage='DYNAMIC_SCALP_HYPE_ARM'",(session,)).fetchone()[0]
+    hype_confirms=db.execute("SELECT COUNT(*) FROM events WHERE session_id=? AND stage='DYNAMIC_SCALP_HYPE_CONFIRM'",(session,)).fetchone()[0]
+    hype_rejects=db.execute("SELECT COUNT(*) FROM events WHERE session_id=? AND stage='DYNAMIC_SCALP_HYPE_REJECT'",(session,)).fetchone()[0]
+    limit_placed=db.execute("SELECT COUNT(*) FROM events WHERE session_id=? AND stage='DYNAMIC_PAPER_LIMIT_PLACED'",(session,)).fetchone()[0]
+    limit_fills=db.execute("SELECT COUNT(*) FROM events WHERE session_id=? AND stage='DYNAMIC_PAPER_FILL' AND reason='ENTRY'",(session,)).fetchone()[0]
+    limit_cancels=db.execute("SELECT COUNT(*) FROM events WHERE session_id=? AND stage='DYNAMIC_PAPER_LIMIT_CANCEL'",(session,)).fetchone()[0]
     ds_stats=defaultdict(lambda:{"n":0,"wins":0,"net":0.0,"gross":0.0,"cost":0.0,"rets":[],"reasons":defaultdict(int)})
     for sym,reason,j in ds_exits:
         p=safe_json(j)
@@ -171,12 +177,19 @@ def board():
         z["n"]+=1; z["net"]+=x; z["gross"]+=g; z["cost"]+=c; z["rets"].append(x)
         if x>0:z["wins"]+=1
         z["reasons"][str(reason or "—")]+=1
-    c1=st.columns(5)
+    c1=st.columns(7)
     c1[0].metric("Dynamic PAPER","ON" if meta.get("dynamic_scalp_paper_enabled","0")=="1" else "OFF")
-    c1[1].metric("Shadow entries",len(ds_entries))
-    c1[2].metric("Shadow exits",len(ds_exits))
-    c1[3].metric("DOM wall arms",ds_wall_arms)
-    c1[4].metric("Shadow open est.",max(0,len(ds_entries)-len(ds_exits)))
+    c1[1].metric("HYPE arm",hype_arms)
+    c1[2].metric("HYPE confirm",hype_confirms)
+    c1[3].metric("HYPE reject",hype_rejects)
+    c1[4].metric("DOM wall arms",ds_wall_arms)
+    c1[5].metric("Limit placed",limit_placed)
+    c1[6].metric("Limit cancel",limit_cancels)
+    c2=st.columns(4)
+    c2[0].metric("Shadow entries",len(ds_entries))
+    c2[1].metric("Shadow exits",len(ds_exits))
+    c2[2].metric("Paper entry fills",limit_fills)
+    c2[3].metric("Shadow open est.",max(0,len(ds_entries)-len(ds_exits)))
     ds_report=[]
     for mod in ("HYPE","LIQUID","UNKNOWN"):
         z=ds_stats.get(mod)
