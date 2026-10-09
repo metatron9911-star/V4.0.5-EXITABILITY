@@ -47,7 +47,8 @@ class HypeSettings:
     breakout_hold_buffer_bps: float = 2.0
     breakout_max_retest_bps: float = 2.0
     breakout_min_continue_bps: float = 3.0
-    breakout_min_tape_ratio_after_arm: float = 1.5
+    breakout_min_tape_ratio_after_arm: float = 2.0
+    breakout_min_tape_accel_vs_arm: float = 1.10
 
     # Entry quality.
     min_directional_ret_250ms_bps: float = 0.5
@@ -71,20 +72,20 @@ class HypeSettings:
 class LiquidSettings:
     # DOM wall: compare candidate level notional to median top-level notional.
     # This is a live-book proxy for "very large density"; it is testable with L50.
-    wall_ratio_min: float = 5.0
+    wall_ratio_min: float = 10.0
     wall_top_levels: int = 20
-    wall_max_distance_bps: float = 12.0
+    wall_max_distance_bps: float = 8.0
 
     # Price touches wall but does not eat it during this interval.
-    rejection_confirm_ms: int = 4_000
-    max_wall_consumed_frac: float = 0.50
-    min_book_imbalance_abs: float = 0.05
+    rejection_confirm_ms: int = 6_000
+    max_wall_consumed_frac: float = 0.25
+    min_book_imbalance_abs: float = 0.12
 
     # PAPER risk profile.
     paper_leverage: float = 1.0
     risk_per_trade_frac: float = 0.003
     stop_buffer_bps: float = 5.0
-    take_profit_bps: float = 40.0
+    take_profit_bps: float = 60.0
     timeout_ms: int = 180_000
     breakeven_arm_bps: float = 18.0
 
