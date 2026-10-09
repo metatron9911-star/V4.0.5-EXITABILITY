@@ -23,6 +23,18 @@ DEFAULT_SYMBOLS=["SOLUSDT","ETHUSDT","BTCUSDT"]
 GATES={"LIQUID":60.0,"VOL":65.0,"LAUNCH":70.0}
 
 
+def runtime_storage_audit():
+    try:
+        rows=[]; total=0
+        for p in DATA_DIR.rglob("*"):
+            if p.is_file():
+                z=p.stat().st_size; total+=z; rows.append((z,p))
+        print("RUNTIME_STORAGE_TOTAL_BYTES",total,flush=True)
+        for z,p in sorted(rows,reverse=True)[:40]:
+            print("RUNTIME_STORAGE_FILE",z,str(p),flush=True)
+    except Exception as e:
+        print("RUNTIME_STORAGE_AUDIT_FAIL",repr(e),flush=True)
+
 def connect():
     cx=sqlite3.connect(DB,check_same_thread=False,timeout=15)
     cx.execute("PRAGMA journal_mode=WAL")
@@ -64,6 +76,7 @@ def live_vol_state(snap:dict,rest_bucket:str) -> tuple[str,bool,float]:
 
 
 async def main():
+    runtime_storage_audit()
     cx=connect()
     old=dict(cx.execute("SELECT key,value FROM meta").fetchall()).get("session_id")
     requested_session=os.getenv("BBB_SESSION_ID") or old or str(uuid.uuid4())
