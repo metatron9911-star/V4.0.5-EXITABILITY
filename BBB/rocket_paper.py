@@ -137,66 +137,95 @@ class RocketPaper:
             prior=list(self.hist[symbol])[:-1]
             base=statistics.median([max(1,int(x["tc1"])) for x in prior[-20:]]) if prior else 1
             tape=float(f.get("trade_count_1s",0) or 0)/max(1.0,base)
-            live_ok=live_eligible(f)
-            dir_ok=directional_trigger(side,f)
-            if (not live_ok) or beyond<-ROCKET.max_retest_bps or not dir_ok:
-                spread=float(f.get("spread_bps",999) or 999)
-                t1=int(f.get("trade_count_1s",0) or 0)
-                t5=int(f.get("trade_count_5s",0) or 0)
-                rv=abs(float(f.get("realized_vol_5s_bps",0) or 0))
-                r1=abs(float(f.get("ret_1s_bps",0) or 0))
-                r5=abs(float(f.get("ret_5s_bps",0) or 0))
-                sign=1.0 if side=="BUY" else -1.0
-                d250=sign*float(f.get("ret_250ms_bps",0) or 0)
-                d1=sign*float(f.get("ret_1s_bps",0) or 0)
-                flow=sign*((float(f.get("buy_ratio_1s",0.5) or 0.5)-0.5)*2.0)
-                failed=[]
-                if spread>ROCKET.max_spread_bps: failed.append("SPREAD")
-                if t1<ROCKET.min_trade_count_1s: failed.append("TRADES_1S")
-                if t5<ROCKET.min_trade_count_5s: failed.append("TRADES_5S")
-                if rv<ROCKET.min_realized_vol_5s_bps: failed.append("RV5S")
-                if r1<ROCKET.min_abs_ret_1s_bps and r5<ROCKET.min_abs_ret_5s_bps: failed.append("ABS_RETURN")
-                if beyond<-ROCKET.max_retest_bps: failed.append("RETEST")
-                if d250<ROCKET.min_directional_ret_250ms_bps: failed.append("DIR_250MS")
-                if d1<ROCKET.min_directional_ret_1s_bps: failed.append("DIR_1S")
-                if flow<ROCKET.min_directional_flow: failed.append("FLOW")
-                self._event(symbol,"ROCKET_REJECT","ARM_FAILED",{
+
+            spread=float(f.get("spread_bps",999) or 999)
+            t1=int(f.get("trade_count_1s",0) or 0)
+            t5=int(f.get("trade_count_5s",0) or 0)
+            rv=abs(float(f.get("realized_vol_5s_bps",0) or 0))
+            r1=abs(float(f.get("ret_1s_bps",0) or 0))
+            r5=abs(float(f.get("ret_5s_bps",0) or 0))
+            d250=sign*float(f.get("ret_250ms_bps",0) or 0)
+            d1=sign*float(f.get("ret_1s_bps",0) or 0)
+            flow=sign*((float(f.get("buy_ratio_1s",0.5) or 0.5)-0.5)*2.0)
+
+            # After ARM we allow normal micro-pauses during the confirmation window.
+            # Only a real thesis break kills the arm immediately.
+            hard_failed=[]
+            if beyond < -ROCKET.max_retest_bps:
+                hard_failed.append("RETEST")
+            if spread > ROCKET.max_spread_bps * 2.0:
+                hard_failed.append("SPREAD_BLOWOUT")
+            opposite_impulse=(
+                d250 <= -ROCKET.min_directional_ret_250ms_bps
+                and d1 <= -ROCKET.min_directional_ret_1s_bps
+                and flow <= -ROCKET.min_directional_flow
+            )
+            if opposite_impulse:
+                hard_failed.append("OPPOSITE_IMPULSE")
+
+            if hard_failed:
+                self._event(symbol,"ROCKET_REJECT","ARM_BROKEN",{
                     "side":side,"beyond_bps":beyond,"tape_ratio":tape,
-                    "failed_checks":failed,
+                    "failed_checks":hard_failed,
                     "spread_bps":spread,"trades_1s":t1,"trades_5s":t5,
                     "rv5s_bps":rv,"abs_ret1_bps":r1,"abs_ret5_bps":r5,
-                    "dir250_bps":d250,"dir1_bps":d1,"directional_flow":flow
+                    "dir250_bps":d250,"dir1_bps":d1,"directional_flow":flow,
+                    "samples":int(arm.get("samples",0))
                 },exchange_ts_ms)
                 self.arms.pop(symbol,None); self._meta(); return
-            if beyond>=ROCKET.min_beyond_level_bps:
+
+            live_ok=live_eligible(f)
+            dir_ok=directional_trigger(side,f)
+            good_snapshot=(
+                beyond >= ROCKET.min_beyond_level_bps
+                and live_ok
+                and dir_ok
+                and tape >= ROCKET.confirm_tape_ratio_min
+                and tape >= float(arm["arm_tape_ratio"])*ROCKET.confirm_tape_vs_arm_min
+            )
+            arm["total_snapshots"]=int(arm.get("total_snapshots",0))+1
+            arm["best_beyond"]=max(float(arm.get("best_beyond",beyond)),beyond)
+            arm["best_tape"]=max(float(arm.get("best_tape",0.0)),tape)
+            if good_snapshot:
                 arm["samples"]=int(arm.get("samples",0))+1
-                arm["best_beyond"]=max(float(arm.get("best_beyond",beyond)),beyond)
+
             elapsed=now-int(arm["armed_ms"])
-            ok=(elapsed>=ROCKET.confirm_ms and int(arm.get("samples",0))>=ROCKET.confirm_samples
-                and tape>=ROCKET.confirm_tape_ratio_min
-                and tape>=float(arm["arm_tape_ratio"])*ROCKET.confirm_tape_vs_arm_min)
             if elapsed>=ROCKET.confirm_ms:
+                samples=int(arm.get("samples",0))
+                total=int(arm.get("total_snapshots",0))
+                ok=samples>=ROCKET.confirm_samples
                 if ok:
-                    self._event(symbol,"ROCKET_CONFIRM","CONTINUATION",{"side":side,"level":level,
-                                "beyond_bps":beyond,"tape_ratio":tape,"samples":arm.get("samples",0)},exchange_ts_ms)
-                    self._open(symbol,side,f,book,exchange_ts_ms,{"level":level,"arm_tape_ratio":arm["arm_tape_ratio"],
-                               "confirm_tape_ratio":tape,"best_beyond_bps":arm.get("best_beyond",0)})
+                    self._event(symbol,"ROCKET_CONFIRM","CONTINUATION",{
+                                "side":side,"level":level,
+                                "beyond_bps":beyond,"tape_ratio":tape,
+                                "samples":samples,"total_snapshots":total,
+                                "best_beyond_bps":arm.get("best_beyond",0),
+                                "best_tape_ratio":arm.get("best_tape",0)
+                                },exchange_ts_ms)
+                    self._open(symbol,side,f,book,exchange_ts_ms,{
+                               "level":level,
+                               "arm_tape_ratio":arm["arm_tape_ratio"],
+                               "confirm_tape_ratio":arm.get("best_tape",tape),
+                               "confirm_samples":samples,
+                               "confirm_total_snapshots":total,
+                               "best_beyond_bps":arm.get("best_beyond",0)})
                 else:
-                    samples=int(arm.get("samples",0))
-                    arm_tape=float(arm["arm_tape_ratio"])
                     failed=[]
                     if samples<ROCKET.confirm_samples: failed.append("CONFIRM_SAMPLES")
-                    if tape<ROCKET.confirm_tape_ratio_min: failed.append("TAPE_ABSOLUTE")
-                    if tape<arm_tape*ROCKET.confirm_tape_vs_arm_min: failed.append("TAPE_VS_ARM")
-                    if beyond<ROCKET.min_beyond_level_bps: failed.append("BEYOND_LEVEL")
+                    if float(arm.get("best_tape",0.0))<ROCKET.confirm_tape_ratio_min: failed.append("TAPE_ABSOLUTE")
+                    if float(arm.get("best_tape",0.0))<float(arm["arm_tape_ratio"])*ROCKET.confirm_tape_vs_arm_min: failed.append("TAPE_VS_ARM")
+                    if float(arm.get("best_beyond",0.0))<ROCKET.min_beyond_level_bps: failed.append("BEYOND_LEVEL")
                     self._event(symbol,"ROCKET_REJECT","NO_CONTINUATION",{
                                 "side":side,"beyond_bps":beyond,
                                 "tape_ratio":tape,"samples":samples,
-                                "arm_tape_ratio":arm_tape,
+                                "total_snapshots":total,
+                                "best_tape_ratio":arm.get("best_tape",0),
+                                "best_beyond_bps":arm.get("best_beyond",0),
+                                "arm_tape_ratio":arm["arm_tape_ratio"],
                                 "failed_checks":failed,
                                 "required_samples":ROCKET.confirm_samples,
                                 "required_tape_ratio":ROCKET.confirm_tape_ratio_min,
-                                "required_tape_vs_arm":arm_tape*ROCKET.confirm_tape_vs_arm_min,
+                                "required_tape_vs_arm":float(arm["arm_tape_ratio"])*ROCKET.confirm_tape_vs_arm_min,
                                 "required_beyond_bps":ROCKET.min_beyond_level_bps
                                 },exchange_ts_ms)
                 self.arms.pop(symbol,None); self._meta()
@@ -220,7 +249,8 @@ class RocketPaper:
             side="SELL";level=lo;touches=lo_t
         if side:
             self.arms[symbol]={"side":side,"level":level,"touches":touches,"armed_ms":now,
-                               "arm_tape_ratio":tape,"samples":0,"best_beyond":0.0}
+                               "arm_tape_ratio":tape,"samples":0,"total_snapshots":0,
+                               "best_beyond":0.0,"best_tape":0.0}
             self._event(symbol,"ROCKET_ARM","BREAKOUT",self.arms[symbol],exchange_ts_ms)
             self._meta()
 
