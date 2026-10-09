@@ -11,6 +11,8 @@ from typing import Dict
 from engine import now_ms, BYBIT_FEES, ProductClass
 from rocket_profile import ROCKET, live_eligible, directional_trigger
 
+# Rejection events carry failed_checks so the dashboard can expose the exact blocked gate.
+
 
 class RocketPaper:
     def __init__(self,cx,session_id:str,start_usd:float):
