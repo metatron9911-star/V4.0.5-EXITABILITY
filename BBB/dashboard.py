@@ -78,7 +78,7 @@ def board():
             "range24h_%":round(float(x.get("range_bps") or 0)/100,2),
             "change24h_%":round(float(x.get("abs_change_bps") or 0)/100,2),
             "turnover24h_$":round(float(x.get("turnover24h") or 0),0)
-        } for x in uni],hide_index=True,use_container_width=True)
+        } for x in uni],hide_index=True,width='stretch')
     else:
         st.caption("Waiting for universe scanner...")
 
@@ -105,9 +105,46 @@ def board():
             "range24h_%":round(float(p.get("range24h_bps") or 0)/100,2)
         })
     if live:
-        st.dataframe(live,hide_index=True,use_container_width=True)
+        st.dataframe(live,hide_index=True,width='stretch')
     else:
         st.caption("Waiting for live samples...")
+
+    st.subheader("ROCKET rejection diagnostics")
+    rej=db.execute("""SELECT symbol,ts_ms,reason,payload_json FROM events
+                      WHERE session_id=? AND stage='ROCKET_REJECT'
+                      ORDER BY id DESC LIMIT 100""",(session,)).fetchall()
+    if rej:
+        reason_counts={}
+        failed_counts={}
+        recent=[]
+        for symbol,ts_ms,reason,payload_json in rej:
+            reason_counts[reason]=reason_counts.get(reason,0)+1
+            p=parse_json(payload_json)
+            for chk in p.get("failed_checks",[]) or []:
+                failed_counts[chk]=failed_counts.get(chk,0)+1
+            recent.append({
+                "symbol":symbol,
+                "age_s":round(max(0,now-int(ts_ms or now))/1000,1),
+                "reason":reason,
+                "failed_checks":", ".join(p.get("failed_checks",[]) or []),
+                "beyond_bps":round(float(p.get("beyond_bps",0) or 0),2),
+                "tape_x":round(float(p.get("tape_ratio",0) or 0),2),
+                "samples":p.get("samples",""),
+                "spread_bps":round(float(p.get("spread_bps",0) or 0),2) if "spread_bps" in p else "",
+                "trades_1s":p.get("trades_1s",""),
+                "trades_5s":p.get("trades_5s",""),
+                "dir250_bps":round(float(p.get("dir250_bps",0) or 0),2) if "dir250_bps" in p else "",
+                "dir1_bps":round(float(p.get("dir1_bps",0) or 0),2) if "dir1_bps" in p else "",
+                "flow":round(float(p.get("directional_flow",0) or 0),3) if "directional_flow" in p else ""
+            })
+        c1,c2=st.columns(2)
+        c1.dataframe([{"reject_reason":k,"count":v} for k,v in sorted(reason_counts.items(),key=lambda kv:-kv[1])],
+                     hide_index=True,width='stretch')
+        c2.dataframe([{"failed_check":k,"count":v} for k,v in sorted(failed_counts.items(),key=lambda kv:-kv[1])],
+                     hide_index=True,width='stretch')
+        st.dataframe(recent,hide_index=True,width='stretch')
+    else:
+        st.caption("No ROCKET rejections yet.")
 
     trades=db.execute("""SELECT symbol,side,status,entry_vwap,exit_vwap,net_pnl_usd,exit_reason,
                          opened_ms,closed_ms,entry_features_json FROM trades
@@ -128,7 +165,7 @@ def board():
             "best_beyond_bps":round(float(ef.get("best_beyond_bps",0) or 0),2)
         })
     if report:
-        st.dataframe(report,hide_index=True,use_container_width=True)
+        st.dataframe(report,hide_index=True,width='stretch')
     else:
         st.caption("No ROCKET fills yet.")
 
