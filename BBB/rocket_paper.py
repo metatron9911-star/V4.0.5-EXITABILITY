@@ -1,0 +1,186 @@
+"""ROCKET live-market PAPER emulator.
+
+Consumes the same live Bybit publicTrade + L50 orderbook snapshots as production
+would observe. Entries/exits are emulated through current L50 VWAP. No real orders.
+"""
+from __future__ import annotations
+from collections import defaultdict, deque
+import json, os, statistics, uuid
+from typing import Dict
+
+from engine import now_ms, BYBIT_FEES, ProductClass
+from rocket_profile import ROCKET, live_eligible, directional_trigger
+
+
+class RocketPaper:
+    def __init__(self,cx,session_id:str,start_usd:float):
+        self.cx=cx; self.session_id=session_id
+        self.start_usd=float(start_usd)
+        self.cash=self.start_usd; self.realized=0.0; self.fees=0.0
+        self.hist:Dict[str,deque]=defaultdict(lambda:deque(maxlen=90))
+        self.arms:Dict[str,dict]={}
+        self.positions:Dict[str,dict]={}
+        self.cooldown_until:Dict[str,int]={}
+        self._meta()
+
+    def _meta(self):
+        for k,v in {
+            "rocket_paper_enabled":"1",
+            "rocket_cash_usd":f"{self.cash:.8f}",
+            "rocket_realized_usd":f"{self.realized:.8f}",
+            "rocket_fees_usd":f"{self.fees:.8f}",
+            "rocket_open_positions":str(len(self.positions)),
+            "rocket_armed":str(len(self.arms)),
+            "rocket_execution_mode":"LIVE_WS_L50_VWAP",
+        }.items():
+            self.cx.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",(k,v))
+
+    def _event(self,symbol,stage,reason,payload,exchange_ts_ms=0):
+        self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (now_ms(),int(exchange_ts_ms or 0),self.session_id,"VOL",symbol,stage,reason,
+                         json.dumps(payload,separators=(",",":"))))
+
+    @staticmethod
+    def _move(side,entry,px):
+        sign=1.0 if side=="BUY" else -1.0
+        return sign*(float(px)/float(entry)-1.0)*10000.0
+
+    def _open(self,symbol,side,f,book,exchange_ts_ms,extra):
+        if symbol in self.positions or len(self.positions)>=ROCKET.max_open_positions:
+            return
+        notional=min(self.start_usd*ROCKET.position_fraction,self.cash)
+        if notional<1:return
+        vwap,filled=book.walk_vwap(side,notional)
+        if not vwap or filled<notional*0.999:
+            self._event(symbol,"ROCKET_REJECT","ENTRY_L50_INSUFFICIENT",{"side":side,"requested":notional,"filled":filled},exchange_ts_ms)
+            return
+        fee_bps=BYBIT_FEES[ProductClass.INNOVATION].taker_bps
+        fee=notional*fee_bps/10000.0
+        if self.cash<notional+fee:return
+        pid=str(uuid.uuid4()); ts=now_ms()
+        self.cash-=notional+fee; self.fees+=fee
+        p={"position_id":pid,"side":side,"entry_vwap":float(vwap),"notional":notional,
+           "entry_fee":fee,"opened_ms":ts,"peak_bps":0.0,"trough_bps":0.0,"breakeven":False,
+           **extra}
+        self.positions[symbol]=p
+        features={**dict(f),"rocket":True,**extra}
+        self.cx.execute("""INSERT INTO trades(
+            session_id,position_id,head,venue,product_class,symbol,side,leverage,margin_usd,notional_usd,
+            signal_exchange_ts_ms,receive_ts_ms,signal_ts_ms,order_ts_ms,fill_ts_ms,
+            signal_mid,signal_bid,signal_ask,expected_entry_vwap,entry_vwap,entry_fee_usd,
+            source_age_ms,processing_ms,signal_to_fill_ms,entry_score,entry_gate,risk_state,
+            entry_features_json,status,opened_ms)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (self.session_id,pid,"VOL","BYBIT","INNOVATION",symbol,side,1.0,notional,notional,
+             int(exchange_ts_ms or 0),ts,ts,ts,ts,float(f.get("mid") or vwap),
+             float(f.get("bid") or vwap),float(f.get("ask") or vwap),float(vwap),float(vwap),fee,
+             0,0,0,0,0,"ROCKET_V1",json.dumps(features,separators=(",",":")),"OPEN",ts))
+        self._event(symbol,"ROCKET_FILL","ENTRY",{"side":side,"vwap":vwap,"notional":notional,"fee_bps":fee_bps,**extra},exchange_ts_ms)
+        self._meta()
+
+    def _close(self,symbol,reason,book,exchange_ts_ms):
+        p=self.positions.get(symbol)
+        if not p:return
+        exit_side="SELL" if p["side"]=="BUY" else "BUY"
+        vwap,filled=book.walk_vwap(exit_side,float(p["notional"]))
+        if not vwap or filled<float(p["notional"])*0.999:
+            self._event(symbol,"ROCKET_REJECT","EXIT_L50_INSUFFICIENT",{"reason":reason,"filled":filled},exchange_ts_ms)
+            return
+        p=self.positions.pop(symbol)
+        gross_ret=(1 if p["side"]=="BUY" else -1)*(float(vwap)/float(p["entry_vwap"])-1)
+        gross=float(p["notional"])*gross_ret
+        fee_bps=BYBIT_FEES[ProductClass.INNOVATION].taker_bps
+        exit_fee=float(p["notional"])*fee_bps/10000.0
+        net=gross-float(p["entry_fee"])-exit_fee
+        self.cash+=float(p["notional"])+gross-exit_fee
+        self.realized+=net; self.fees+=exit_fee
+        hold=max(0,now_ms()-int(p["opened_ms"]))
+        self.cx.execute("""UPDATE trades SET status='CLOSED',exit_vwap=?,exit_fee_usd=?,gross_pnl_usd=?,
+                          net_pnl_usd=?,exit_reason=?,hold_ms=?,closed_ms=?
+                          WHERE session_id=? AND position_id=?""",
+                        (float(vwap),exit_fee,gross,net,reason,hold,now_ms(),self.session_id,p["position_id"]))
+        self._event(symbol,"ROCKET_FILL","EXIT",{"reason":reason,"side":exit_side,"vwap":vwap,
+                    "gross_pnl_usd":gross,"net_pnl_usd":net,"hold_ms":hold},exchange_ts_ms)
+        if net<0:self.cooldown_until[symbol]=now_ms()+ROCKET.cooldown_after_loss_ms
+        self._meta()
+
+    def _manage(self,symbol,f,book,exchange_ts_ms):
+        p=self.positions.get(symbol)
+        if not p or not book.mid:return
+        move=self._move(p["side"],p["entry_vwap"],float(book.mid))
+        p["peak_bps"]=max(float(p["peak_bps"]),move)
+        p["trough_bps"]=min(float(p["trough_bps"]),move)
+        age=now_ms()-int(p["opened_ms"])
+        if move>=ROCKET.breakeven_arm_bps:p["breakeven"]=True
+        stop=-ROCKET.stop_bps
+        if p["breakeven"]: stop=max(stop,0.0)
+        if p["peak_bps"]>=ROCKET.trail_arm_bps:
+            stop=max(stop,float(p["peak_bps"])-ROCKET.trail_giveback_bps)
+        if move<=stop:
+            self._close(symbol,"ROCKET_STOP_OR_TRAIL",book,exchange_ts_ms)
+        elif move>=ROCKET.hard_take_profit_bps:
+            self._close(symbol,"ROCKET_HARD_TP",book,exchange_ts_ms)
+        elif age>=ROCKET.timeout_ms:
+            self._close(symbol,"ROCKET_TIMEOUT",book,exchange_ts_ms)
+
+    def _signal(self,symbol,f,book,exchange_ts_ms):
+        if symbol in self.positions or now_ms()<self.cooldown_until.get(symbol,0):
+            self.arms.pop(symbol,None); return
+        now=now_ms(); arm=self.arms.get(symbol)
+        if arm is not None:
+            side=arm["side"]; level=float(arm["level"]); cur=float(book.mid or 0)
+            sign=1.0 if side=="BUY" else -1.0
+            beyond=sign*(cur/level-1)*10000 if cur>0 and level>0 else -999
+            prior=list(self.hist[symbol])[:-1]
+            base=statistics.median([max(1,int(x["tc1"])) for x in prior[-20:]]) if prior else 1
+            tape=float(f.get("trade_count_1s",0) or 0)/max(1.0,base)
+            if (not live_eligible(f)) or beyond<-ROCKET.max_retest_bps or not directional_trigger(side,f):
+                self._event(symbol,"ROCKET_REJECT","ARM_FAILED",{"side":side,"beyond_bps":beyond,"tape_ratio":tape},exchange_ts_ms)
+                self.arms.pop(symbol,None); self._meta(); return
+            if beyond>=ROCKET.min_beyond_level_bps:
+                arm["samples"]=int(arm.get("samples",0))+1
+                arm["best_beyond"]=max(float(arm.get("best_beyond",beyond)),beyond)
+            elapsed=now-int(arm["armed_ms"])
+            ok=(elapsed>=ROCKET.confirm_ms and int(arm.get("samples",0))>=ROCKET.confirm_samples
+                and tape>=ROCKET.confirm_tape_ratio_min
+                and tape>=float(arm["arm_tape_ratio"])*ROCKET.confirm_tape_vs_arm_min)
+            if elapsed>=ROCKET.confirm_ms:
+                if ok:
+                    self._event(symbol,"ROCKET_CONFIRM","CONTINUATION",{"side":side,"level":level,
+                                "beyond_bps":beyond,"tape_ratio":tape,"samples":arm.get("samples",0)},exchange_ts_ms)
+                    self._open(symbol,side,f,book,exchange_ts_ms,{"level":level,"arm_tape_ratio":arm["arm_tape_ratio"],
+                               "confirm_tape_ratio":tape,"best_beyond_bps":arm.get("best_beyond",0)})
+                else:
+                    self._event(symbol,"ROCKET_REJECT","NO_CONTINUATION",{"side":side,"beyond_bps":beyond,
+                                "tape_ratio":tape,"samples":arm.get("samples",0)},exchange_ts_ms)
+                self.arms.pop(symbol,None); self._meta()
+            return
+
+        if not live_eligible(f): return
+        h=list(self.hist[symbol])
+        if len(h)<12:return
+        prior=h[:-1]
+        mids=[x["mid"] for x in prior if x["mid"]>0]
+        if len(mids)<10:return
+        hi=max(mids); lo=min(mids); tol=ROCKET.touch_tolerance_bps/10000.0
+        hi_t=sum(1 for x in mids if abs(x/hi-1)<=tol); lo_t=sum(1 for x in mids if abs(x/lo-1)<=tol)
+        base=statistics.median([max(1,int(x["tc1"])) for x in prior[-20:]])
+        tape=float(f.get("trade_count_1s",0) or 0)/max(1.0,base)
+        cur=float(book.mid or 0)
+        side=None;level=0;touches=0
+        if hi_t>=ROCKET.min_level_touches and cur>hi and tape>=ROCKET.arm_tape_ratio_min and directional_trigger("BUY",f):
+            side="BUY";level=hi;touches=hi_t
+        elif lo_t>=ROCKET.min_level_touches and cur<lo and tape>=ROCKET.arm_tape_ratio_min and directional_trigger("SELL",f):
+            side="SELL";level=lo;touches=lo_t
+        if side:
+            self.arms[symbol]={"side":side,"level":level,"touches":touches,"armed_ms":now,
+                               "arm_tape_ratio":tape,"samples":0,"best_beyond":0.0}
+            self._event(symbol,"ROCKET_ARM","BREAKOUT",self.arms[symbol],exchange_ts_ms)
+            self._meta()
+
+    def on_snapshot(self,symbol,f,book,exchange_ts_ms=0):
+        if not book.synced or not book.mid:return
+        self._manage(symbol,f,book,exchange_ts_ms)
+        self.hist[symbol].append({"ts":now_ms(),"mid":float(book.mid),"tc1":int(f.get("trade_count_1s",0) or 0)})
+        if symbol not in self.positions:self._signal(symbol,f,book,exchange_ts_ms)
