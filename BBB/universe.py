@@ -55,7 +55,9 @@ def _scan_sync() -> list[Candidate]:
     excludes={x.strip().upper() for x in os.getenv(
         "BBB_VOL_EXCLUDE","BTCUSDT,ETHUSDT,SOLUSDT,USDCUSDT,USDEUSDT,USDTUSDT"
     ).split(",") if x.strip()}
-    min_turn=float(os.getenv("BBB_VOL_MIN_TURNOVER_USD","10000000"))
+    min_turn=float(os.getenv("BBB_ROCKET_MIN_TURNOVER_USD","5000000"))
+    min_range=float(os.getenv("BBB_ROCKET_MIN_RANGE24H_BPS","1000"))
+    max_n=int(os.getenv("BBB_ROCKET_UNIVERSE_N","14"))
     rows=[]
     for t in tickers:
         s=str(t.get("symbol","")).upper()
@@ -71,35 +73,14 @@ def _scan_sync() -> list[Candidate]:
             continue
         if last<=0 or hi<=0 or lo<=0 or turn<min_turn: continue
         rng=max(0.0,(hi-lo)/last*10000)
-        # Large turnover is mandatory; range rewards actual movement.
-        rank=math.log10(max(turn,1))*max(1.0,rng)
-        # Initial bucket is deliberately permissive. Real-time velocity/volatility
-        # gates in worker.py decide if the instrument is actually tradable now.
-        if turn>=100_000_000:
-            bucket="CORE"
-        elif rng>=1000:
-            bucket="EXTREME"
-        else:
-            bucket="FAST"
-        rows.append(Candidate(s,bucket,turn,rng,ch,oi,rank))
+        if rng<min_range: continue
+        # One purpose only: keep meme-like / explosive contracts.
+        # Rank prefers extreme range first, then meaningful turnover.
+        rank=rng*math.log10(max(turn,10))
+        rows.append(Candidate(s,"EXTREME",turn,rng,ch,oi,rank))
 
-    limits={
-        "CORE":int(os.getenv("BBB_VOL_CORE_N","6")),
-        "FAST":int(os.getenv("BBB_VOL_FAST_N","8")),
-        "EXTREME":int(os.getenv("BBB_VOL_EXTREME_N","5")),
-    }
-    out=[]
-    used=set()
-    # CORE prioritizes turnover, FAST/EXTREME prioritize range-adjusted rank.
-    for bucket in ("CORE","FAST","EXTREME"):
-        pool=[x for x in rows if x.bucket==bucket and x.symbol not in used]
-        if bucket=="CORE":
-            pool.sort(key=lambda x:(x.turnover24h,x.range_bps),reverse=True)
-        else:
-            pool.sort(key=lambda x:(x.score,x.turnover24h),reverse=True)
-        for x in pool[:limits[bucket]]:
-            used.add(x.symbol); out.append(x)
-    return out
+    rows.sort(key=lambda x:(x.range_bps,x.score,x.turnover24h),reverse=True)
+    return rows[:max_n]
 
 async def scan_vol_universe() -> list[Candidate]:
     return await asyncio.to_thread(_scan_sync)
@@ -109,25 +90,10 @@ def universe_json(rows:list[Candidate]) -> str:
 
 
 def fallback_vol_universe() -> list[Candidate]:
-    """Static discovery fallback; live microstructure still decides tradability.
+    """Fallback discovery pool. Live ROCKET gates still decide actual tradability."""
+    symbols=[x.strip().upper() for x in os.getenv(
+        "BBB_ROCKET_FALLBACK_SYMBOLS",
+        "HYPEUSDT,PEPEUSDT,DOGEUSDT,SUIUSDT,GRASSUSDT,ZROUSDT,JUPUSDT,ONDOUSDT,APTUSDT,ARBUSDT"
+    ).split(",") if x.strip()]
+    return [Candidate(s,"EXTREME",0.0,0.0,0.0,0.0,0.0) for s in symbols]
 
-    Used only when Bybit REST discovery is unavailable (for example regional
-    HTTP 403). It is deliberately broader than the old four-symbol fallback.
-    No 24h score is invented: the worker's live speed/impulse gate remains the
-    actual entry gate.
-    """
-    core=[x.strip().upper() for x in os.getenv(
-        "BBB_FALLBACK_CORE_SYMBOLS",
-        "XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LINKUSDT"
-    ).split(",") if x.strip()]
-    fast=[x.strip().upper() for x in os.getenv(
-        "BBB_FALLBACK_FAST_SYMBOLS",
-        "HYPEUSDT,SUIUSDT,AVAXUSDT,PEPEUSDT,ARBUSDT,APTUSDT,NEARUSDT,JUPUSDT,ONDOUSDT,ZROUSDT,GRASSUSDT"
-    ).split(",") if x.strip()]
-    out=[]; used=set()
-    for bucket,symbols in (("CORE",core),("FAST",fast)):
-        for s in symbols:
-            if s in used: continue
-            used.add(s)
-            out.append(Candidate(s,bucket,0.0,0.0,0.0,0.0,0.0))
-    return out
