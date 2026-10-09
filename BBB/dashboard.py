@@ -84,15 +84,26 @@ def board():
         unsafe_allow_html=True
     )
 
-    closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED'",(session,)).fetchone()[0]
-    wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND net_pnl_usd>0",(session,)).fetchone()[0]
-    losses=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND net_pnl_usd<=0",(session,)).fetchone()[0]
-    open_n=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='OPEN'",(session,)).fetchone()[0]
+    dynamic_on=meta.get("dynamic_scalp_paper_enabled","0")=="1"
+    if dynamic_on:
+        closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state LIKE 'DYNAMIC_%'",(session,)).fetchone()[0]
+        wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND net_pnl_usd>0 AND risk_state LIKE 'DYNAMIC_%'",(session,)).fetchone()[0]
+        losses=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND net_pnl_usd<=0 AND risk_state LIKE 'DYNAMIC_%'",(session,)).fetchone()[0]
+        open_n=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='OPEN' AND risk_state LIKE 'DYNAMIC_%'",(session,)).fetchone()[0]
+        realized=float(meta.get("dynamic_scalp_realized_usd","0") or 0)
+        fees=float(meta.get("dynamic_scalp_fees_usd","0") or 0)
+        profit_wallet=0.0
+        trading_cash=float(meta.get("dynamic_scalp_cash_usd",meta.get("paper_start_usd","500")) or 0)
+    else:
+        closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED'",(session,)).fetchone()[0]
+        wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND net_pnl_usd>0",(session,)).fetchone()[0]
+        losses=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND net_pnl_usd<=0",(session,)).fetchone()[0]
+        open_n=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='OPEN'",(session,)).fetchone()[0]
+        realized=float(meta.get("realized_pnl_usd","0") or 0)
+        fees=float(meta.get("fees_usd","0") or 0)
+        profit_wallet=float(meta.get("profit_wallet_usd","0") or 0)
+        trading_cash=float(meta.get("trading_cash_usd",meta.get("paper_start_usd","500")) or 0)
     wr=(wins/closed*100.0) if closed else 0.0
-    realized=float(meta.get("realized_pnl_usd","0") or 0)
-    fees=float(meta.get("fees_usd","0") or 0)
-    profit_wallet=float(meta.get("profit_wallet_usd","0") or 0)
-    trading_cash=float(meta.get("trading_cash_usd",meta.get("paper_start_usd","500")) or 0)
 
     elc=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND exit_reason='EARLY_LOSER_CUT'",(session,)).fetchone()[0]
     tails=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND exit_reason LIKE 'RIGHT_TAIL%'",(session,)).fetchone()[0]
@@ -101,7 +112,7 @@ def board():
 
     st.markdown(
         f"<div class='rp7-wallet-strip'>"
-        f"<span class='lbl'>Trading wallet</span> <span class='val'>USD {trading_cash:.2f}</span>"
+        f"<span class='lbl'>{'Dynamic PAPER wallet' if dynamic_on else 'Trading wallet'}</span> <span class='val'>USD {trading_cash:.2f}</span>"
         f" &nbsp;|&nbsp; "
         f"<span class='lbl'>Session</span> <span class='val'>{session if session else '—'}</span>"
         f" &nbsp;|&nbsp; "
@@ -112,12 +123,12 @@ def board():
 
     st.subheader("Session")
     a=st.columns(11)
-    a[0].metric("Entries","ON" if meta.get("paper_entries_enabled","0")=="1" else "OFF")
+    a[0].metric("Dynamic PAPER" if dynamic_on else "Entries","ON" if dynamic_on else ("ON" if meta.get("paper_entries_enabled","0")=="1" else "OFF"))
     a[1].metric("Closed",closed)
     a[2].metric("W / L",f"{wins} / {losses}",delta=f"{wr:.1f}% WR")
     a[3].metric("Realized $",f"{realized:.2f}")
     a[4].metric("Fees $",f"{fees:.2f}")
-    a[5].metric("Profit wallet $",f"{profit_wallet:.2f}")
+    a[5].metric("Execution","LIVE L50" if dynamic_on else f"Profit ${profit_wallet:.2f}")
     a[6].metric("Open positions",open_n)
     a[7].metric("ELC cuts",elc)
     a[8].metric("Tail closes",tails)
@@ -136,6 +147,10 @@ def board():
             + str(round(float(meta.get("dynamic_scalp_fees_usd","0") or 0),4))
             + " · open "
             + str(meta.get("dynamic_scalp_open_positions","0"))
+            + " · pending limits "
+            + str(meta.get("dynamic_scalp_pending_limits","0"))
+            + " · "
+            + str(meta.get("dynamic_scalp_execution_mode","—"))
         )
     ds_exits=db.execute("""SELECT symbol,reason,payload_json FROM events
                            WHERE session_id=? AND stage='DYNAMIC_SCALP_SHADOW_EXIT'
