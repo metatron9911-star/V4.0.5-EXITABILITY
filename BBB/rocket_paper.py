@@ -243,7 +243,12 @@ class RocketPaper:
             if elapsed>=ROCKET.confirm_ms:
                 samples=int(arm.get("samples",0))
                 total=int(arm.get("total_snapshots",0))
-                ok=samples>=ROCKET.confirm_samples
+                final_alive=(
+                    beyond >= ROCKET.min_beyond_level_bps
+                    and beyond <= ROCKET.max_entry_chase_bps
+                    and vote_count >= ROCKET.final_entry_min_votes
+                )
+                ok=samples>=ROCKET.confirm_samples and final_alive
                 if ok:
                     self._event(symbol,"ROCKET_CONFIRM","CONTINUATION",{
                                 "side":side,"level":level,
@@ -253,6 +258,9 @@ class RocketPaper:
                                 "best_tape_ratio":arm.get("best_tape",0),
                                 "best_vote_count":arm.get("best_vote_count",0),
                                 "required_quorum_votes":ROCKET.confirm_quorum_votes,
+                                "final_vote_count":vote_count,
+                                "final_alive":final_alive,
+                                "max_entry_chase_bps":ROCKET.max_entry_chase_bps,
                                 "vote_misses":arm.get("vote_misses",{})
                                 },exchange_ts_ms)
                     opened=self._open(symbol,side,f,book,exchange_ts_ms,{
@@ -274,6 +282,8 @@ class RocketPaper:
                     if samples<ROCKET.confirm_samples: failed.append("CONFIRM_SAMPLES")
                     if int(arm.get("best_vote_count",0))<ROCKET.confirm_quorum_votes: failed.append("QUORUM_NOT_REACHED")
                     if float(arm.get("best_beyond",0.0))<ROCKET.min_beyond_level_bps: failed.append("BEYOND_LEVEL")
+                    if samples>=ROCKET.confirm_samples and vote_count<ROCKET.final_entry_min_votes: failed.append("FINAL_MOMENTUM_FADED")
+                    if beyond>ROCKET.max_entry_chase_bps: failed.append("ENTRY_TOO_EXTENDED")
                     misses=arm.get("vote_misses",{})
                     if misses.get("TAPE",0)>=max(1,total): failed.append("TAPE_NEVER_PASSED")
                     if misses.get("DIR_250MS",0)>=max(1,total): failed.append("DIR_250MS_NEVER_PASSED")
@@ -287,6 +297,9 @@ class RocketPaper:
                                 "best_beyond_bps":arm.get("best_beyond",0),
                                 "best_vote_count":arm.get("best_vote_count",0),
                                 "required_quorum_votes":ROCKET.confirm_quorum_votes,
+                                "final_vote_count":vote_count,
+                                "final_alive":final_alive,
+                                "max_entry_chase_bps":ROCKET.max_entry_chase_bps,
                                 "vote_misses":arm.get("vote_misses",{}),
                                 "arm_tape_ratio":arm["arm_tape_ratio"],
                                 "failed_checks":failed,
