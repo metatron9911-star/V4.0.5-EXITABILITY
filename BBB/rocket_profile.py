@@ -30,7 +30,8 @@ class RocketSettings:
     confirm_ms: int = 2_000
     confirm_samples: int = 2
     confirm_quorum_votes: int = 3  # strong confirmation snapshot: 3 of 4 votes
-    final_entry_min_votes: int = 2  # final snapshot must still be alive before MARKET entry
+    confirm_consecutive_samples: int = 2  # require 2 strong snapshots in a row
+    final_entry_min_votes: int = 3  # final snapshot must still be strong before MARKET entry
     max_entry_chase_bps: float = 35.0  # do not chase an already extended breakout
     min_beyond_level_bps: float = 2.0
     max_retest_bps: float = 2.0
@@ -42,10 +43,12 @@ class RocketSettings:
 
     # PAPER execution/risk. 1x only while proving edge.
     position_fraction: float = 0.02
+    position_multiplier: float = 3.0  # ordinary stake formula, multiplied by 3
     max_open_positions: int = 2
     stop_bps: float = 25.0
     timeout_ms: int = 10_000
-    breakeven_arm_bps: float = 30.0
+    breakeven_arm_bps: float = 45.0
+    breakeven_floor_bps: float = 25.0
     trail_arm_bps: float = 55.0
     trail_giveback_bps: float = 25.0
     hard_take_profit_bps: float = 250.0
