@@ -60,11 +60,14 @@ class RocketPaper:
                 "max_open_positions":ROCKET.max_open_positions
             },exchange_ts_ms)
             return False
-        notional=min(self.start_usd*ROCKET.position_fraction,self.cash)
+        base_notional=self.start_usd*ROCKET.position_fraction
+        notional=min(base_notional*ROCKET.position_multiplier,self.cash)
         if notional<1:
             self._event(symbol,"ROCKET_REJECT","ENTRY_NOTIONAL_TOO_SMALL",{
                 "side":side,"cash":self.cash,"notional":notional,
-                "position_fraction":ROCKET.position_fraction
+                "base_notional":base_notional,
+                "position_fraction":ROCKET.position_fraction,
+                "position_multiplier":ROCKET.position_multiplier
             },exchange_ts_ms)
             return False
         vwap,filled=book.walk_vwap(side,notional)
@@ -138,7 +141,7 @@ class RocketPaper:
         age=now_ms()-int(p["opened_ms"])
         if move>=ROCKET.breakeven_arm_bps:p["breakeven"]=True
         stop=-ROCKET.stop_bps
-        if p["breakeven"]: stop=max(stop,0.0)
+        if p["breakeven"]: stop=max(stop,ROCKET.breakeven_floor_bps)
         if p["peak_bps"]>=ROCKET.trail_arm_bps:
             stop=max(stop,float(p["peak_bps"])-ROCKET.trail_giveback_bps)
         if move<=stop:
@@ -238,6 +241,13 @@ class RocketPaper:
                 misses["BEYOND_LEVEL"]=int(misses.get("BEYOND_LEVEL",0))+1
             if good_snapshot:
                 arm["samples"]=int(arm.get("samples",0))+1
+                arm["consecutive_samples"]=int(arm.get("consecutive_samples",0))+1
+                arm["best_consecutive_samples"]=max(
+                    int(arm.get("best_consecutive_samples",0)),
+                    int(arm["consecutive_samples"])
+                )
+            else:
+                arm["consecutive_samples"]=0
 
             elapsed=now-int(arm["armed_ms"])
             if elapsed>=ROCKET.confirm_ms:
@@ -248,12 +258,21 @@ class RocketPaper:
                     and beyond <= ROCKET.max_entry_chase_bps
                     and vote_count >= ROCKET.final_entry_min_votes
                 )
-                ok=samples>=ROCKET.confirm_samples and final_alive
+                consecutive=int(arm.get("consecutive_samples",0))
+                best_consecutive=int(arm.get("best_consecutive_samples",0))
+                ok=(
+                    samples>=ROCKET.confirm_samples
+                    and consecutive>=ROCKET.confirm_consecutive_samples
+                    and final_alive
+                )
                 if ok:
                     self._event(symbol,"ROCKET_CONFIRM","CONTINUATION",{
                                 "side":side,"level":level,
                                 "beyond_bps":beyond,"tape_ratio":tape,
                                 "samples":samples,"total_snapshots":total,
+                                "consecutive_samples":consecutive,
+                                "best_consecutive_samples":best_consecutive,
+                                "required_consecutive_samples":ROCKET.confirm_consecutive_samples,
                                 "best_beyond_bps":arm.get("best_beyond",0),
                                 "best_tape_ratio":arm.get("best_tape",0),
                                 "best_vote_count":arm.get("best_vote_count",0),
@@ -268,6 +287,7 @@ class RocketPaper:
                                "arm_tape_ratio":arm["arm_tape_ratio"],
                                "confirm_tape_ratio":arm.get("best_tape",tape),
                                "confirm_samples":samples,
+                               "confirm_consecutive_samples":consecutive,
                                "confirm_total_snapshots":total,
                                "best_vote_count":arm.get("best_vote_count",0),
                                "required_quorum_votes":ROCKET.confirm_quorum_votes,
@@ -280,6 +300,7 @@ class RocketPaper:
                 else:
                     failed=[]
                     if samples<ROCKET.confirm_samples: failed.append("CONFIRM_SAMPLES")
+                    if best_consecutive<ROCKET.confirm_consecutive_samples: failed.append("CONFIRM_NOT_CONSECUTIVE")
                     if int(arm.get("best_vote_count",0))<ROCKET.confirm_quorum_votes: failed.append("QUORUM_NOT_REACHED")
                     if float(arm.get("best_beyond",0.0))<ROCKET.min_beyond_level_bps: failed.append("BEYOND_LEVEL")
                     if samples>=ROCKET.confirm_samples and vote_count<ROCKET.final_entry_min_votes: failed.append("FINAL_MOMENTUM_FADED")
@@ -292,6 +313,9 @@ class RocketPaper:
                     self._event(symbol,"ROCKET_REJECT","NO_CONTINUATION",{
                                 "side":side,"beyond_bps":beyond,
                                 "tape_ratio":tape,"samples":samples,
+                                "consecutive_samples":consecutive,
+                                "best_consecutive_samples":best_consecutive,
+                                "required_consecutive_samples":ROCKET.confirm_consecutive_samples,
                                 "total_snapshots":total,
                                 "best_tape_ratio":arm.get("best_tape",0),
                                 "best_beyond_bps":arm.get("best_beyond",0),
@@ -329,7 +353,8 @@ class RocketPaper:
             side="SELL";level=lo;touches=lo_t
         if side:
             self.arms[symbol]={"side":side,"level":level,"touches":touches,"armed_ms":now,
-                               "arm_tape_ratio":tape,"samples":0,"total_snapshots":0,
+                               "arm_tape_ratio":tape,"samples":0,"consecutive_samples":0,
+                               "best_consecutive_samples":0,"total_snapshots":0,
                                "best_beyond":0.0,"best_tape":0.0,"best_vote_count":0,
                                "vote_misses":{"DIR_250MS":0,"DIR_1S":0,"FLOW":0,"TAPE":0,"BEYOND_LEVEL":0}}
             self._event(symbol,"ROCKET_ARM","BREAKOUT",self.arms[symbol],exchange_ts_ms)
