@@ -29,7 +29,9 @@ class RocketSettings:
     arm_tape_ratio_min: float = 2.5
     confirm_ms: int = 2_000
     confirm_samples: int = 2
-    confirm_quorum_votes: int = 3  # require 3 of DIR_250MS / DIR_1S / FLOW / TAPE
+    confirm_quorum_votes: int = 3  # strong confirmation snapshot: 3 of 4 votes
+    final_entry_min_votes: int = 2  # final snapshot must still be alive before MARKET entry
+    max_entry_chase_bps: float = 35.0  # do not chase an already extended breakout
     min_beyond_level_bps: float = 2.0
     max_retest_bps: float = 2.0
     confirm_tape_ratio_min: float = 2.0
