@@ -131,12 +131,12 @@ def board():
                 "beyond_bps":round(float(p.get("beyond_bps",0) or 0),2),
                 "tape_x":round(float(p.get("tape_ratio",0) or 0),2),
                 "samples":p.get("samples",""),
-                "spread_bps":round(float(p.get("spread_bps",0) or 0),2) if "spread_bps" in p else "",
-                "trades_1s":p.get("trades_1s",""),
-                "trades_5s":p.get("trades_5s",""),
-                "dir250_bps":round(float(p.get("dir250_bps",0) or 0),2) if "dir250_bps" in p else "",
-                "dir1_bps":round(float(p.get("dir1_bps",0) or 0),2) if "dir1_bps" in p else "",
-                "flow":round(float(p.get("directional_flow",0) or 0),3) if "directional_flow" in p else ""
+                "spread_bps":round(float(p.get("spread_bps",0) or 0),2) if "spread_bps" in p else None,
+                "trades_1s":int(p.get("trades_1s",0) or 0) if "trades_1s" in p else None,
+                "trades_5s":int(p.get("trades_5s",0) or 0) if "trades_5s" in p else None,
+                "dir250_bps":round(float(p.get("dir250_bps",0) or 0),2) if "dir250_bps" in p else None,
+                "dir1_bps":round(float(p.get("dir1_bps",0) or 0),2) if "dir1_bps" in p else None,
+                "flow":round(float(p.get("directional_flow",0) or 0),3) if "directional_flow" in p else None
             })
         c1,c2=st.columns(2)
         c1.dataframe([{"reject_reason":k,"count":v} for k,v in sorted(reason_counts.items(),key=lambda kv:-kv[1])],
@@ -147,22 +147,34 @@ def board():
     else:
         st.caption("No ROCKET rejections yet.")
 
-    trades=db.execute("""SELECT symbol,side,status,entry_vwap,exit_vwap,net_pnl_usd,exit_reason,
-                         opened_ms,closed_ms,entry_features_json FROM trades
+    trades=db.execute("""SELECT symbol,side,status,entry_vwap,exit_vwap,
+                         gross_pnl_usd,net_pnl_usd,entry_fee_usd,exit_fee_usd,exit_reason,
+                         opened_ms,closed_ms,hold_ms,notional_usd,entry_features_json
+                         FROM trades
                          WHERE session_id=? AND risk_state='ROCKET_V1'
                          ORDER BY id DESC LIMIT 50""",(session,)).fetchall()
     st.subheader("ROCKET trades")
     report=[]
     for r in trades:
-        ef=parse_json(r[9])
+        ef=parse_json(r[14])
+        notional=float(r[13] or 0)
+        net=float(r[6] or 0)
+        gross=float(r[5] or 0)
         report.append({
             "symbol":r[0],"side":r[1],"status":r[2],
             "entry":r[3],"exit":r[4],
-            "net_$":round(float(r[5] or 0),5),
-            "reason":r[6],
-            "hold_s":round((((r[8] or now)-(r[7] or now))/1000),2),
+            "gross_$":round(gross,5),
+            "net_$":round(net,5),
+            "gross_bps":round((gross/notional)*10000,2) if notional else None,
+            "net_bps":round((net/notional)*10000,2) if notional else None,
+            "entry_fee_$":round(float(r[7] or 0),5),
+            "exit_fee_$":round(float(r[8] or 0),5),
+            "reason":r[9],
+            "hold_s":round((float(r[12] or 0)/1000),3) if r[12] is not None else round((((r[11] or now)-(r[10] or now))/1000),3),
             "arm_tape_x":round(float(ef.get("arm_tape_ratio",0) or 0),2),
             "confirm_tape_x":round(float(ef.get("confirm_tape_ratio",0) or 0),2),
+            "confirm_samples":ef.get("confirm_samples"),
+            "best_vote_count":ef.get("best_vote_count"),
             "best_beyond_bps":round(float(ef.get("best_beyond_bps",0) or 0),2)
         })
     if report:
