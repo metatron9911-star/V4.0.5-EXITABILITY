@@ -30,7 +30,8 @@ class RocketSettings:
     confirm_ms: int = 2_000
     confirm_samples: int = 2
     confirm_quorum_votes: int = 3  # strong confirmation snapshot: 3 of 4 votes
-    confirm_consecutive_samples: int = 2  # require 2 strong snapshots in a row
+    confirm_recent_window: int = 3  # evaluate the latest 3 confirmation snapshots
+    confirm_recent_required: int = 2  # require any 2 strong snapshots out of the latest 3
     final_entry_min_votes: int = 3  # final snapshot must still be strong before MARKET entry
     max_entry_chase_bps: float = 35.0  # do not chase an already extended breakout
     min_beyond_level_bps: float = 2.0
