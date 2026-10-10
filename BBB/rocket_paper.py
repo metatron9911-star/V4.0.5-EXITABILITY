@@ -241,13 +241,16 @@ class RocketPaper:
                 misses["BEYOND_LEVEL"]=int(misses.get("BEYOND_LEVEL",0))+1
             if good_snapshot:
                 arm["samples"]=int(arm.get("samples",0))+1
-                arm["consecutive_samples"]=int(arm.get("consecutive_samples",0))+1
-                arm["best_consecutive_samples"]=max(
-                    int(arm.get("best_consecutive_samples",0)),
-                    int(arm["consecutive_samples"])
-                )
-            else:
-                arm["consecutive_samples"]=0
+            recent=list(arm.get("recent_good",[]))
+            recent.append(bool(good_snapshot))
+            if len(recent)>ROCKET.confirm_recent_window:
+                recent=recent[-ROCKET.confirm_recent_window:]
+            arm["recent_good"]=recent
+            arm["recent_good_count"]=sum(1 for x in recent if x)
+            arm["best_recent_good_count"]=max(
+                int(arm.get("best_recent_good_count",0)),
+                int(arm["recent_good_count"])
+            )
 
             elapsed=now-int(arm["armed_ms"])
             if elapsed>=ROCKET.confirm_ms:
@@ -258,11 +261,11 @@ class RocketPaper:
                     and beyond <= ROCKET.max_entry_chase_bps
                     and vote_count >= ROCKET.final_entry_min_votes
                 )
-                consecutive=int(arm.get("consecutive_samples",0))
-                best_consecutive=int(arm.get("best_consecutive_samples",0))
+                recent_good_count=int(arm.get("recent_good_count",0))
+                best_recent_good_count=int(arm.get("best_recent_good_count",0))
                 ok=(
                     samples>=ROCKET.confirm_samples
-                    and consecutive>=ROCKET.confirm_consecutive_samples
+                    and recent_good_count>=ROCKET.confirm_recent_required
                     and final_alive
                 )
                 if ok:
@@ -270,9 +273,10 @@ class RocketPaper:
                                 "side":side,"level":level,
                                 "beyond_bps":beyond,"tape_ratio":tape,
                                 "samples":samples,"total_snapshots":total,
-                                "consecutive_samples":consecutive,
-                                "best_consecutive_samples":best_consecutive,
-                                "required_consecutive_samples":ROCKET.confirm_consecutive_samples,
+                                "recent_good_count":recent_good_count,
+                                "best_recent_good_count":best_recent_good_count,
+                                "recent_good_window":ROCKET.confirm_recent_window,
+                                "required_recent_good":ROCKET.confirm_recent_required,
                                 "best_beyond_bps":arm.get("best_beyond",0),
                                 "best_tape_ratio":arm.get("best_tape",0),
                                 "best_vote_count":arm.get("best_vote_count",0),
@@ -287,7 +291,8 @@ class RocketPaper:
                                "arm_tape_ratio":arm["arm_tape_ratio"],
                                "confirm_tape_ratio":arm.get("best_tape",tape),
                                "confirm_samples":samples,
-                               "confirm_consecutive_samples":consecutive,
+                               "confirm_recent_good":recent_good_count,
+                               "confirm_recent_window":ROCKET.confirm_recent_window,
                                "confirm_total_snapshots":total,
                                "best_vote_count":arm.get("best_vote_count",0),
                                "required_quorum_votes":ROCKET.confirm_quorum_votes,
@@ -300,7 +305,7 @@ class RocketPaper:
                 else:
                     failed=[]
                     if samples<ROCKET.confirm_samples: failed.append("CONFIRM_SAMPLES")
-                    if best_consecutive<ROCKET.confirm_consecutive_samples: failed.append("CONFIRM_NOT_CONSECUTIVE")
+                    if best_recent_good_count<ROCKET.confirm_recent_required: failed.append("CONFIRM_RECENT_2_OF_3_NOT_REACHED")
                     if int(arm.get("best_vote_count",0))<ROCKET.confirm_quorum_votes: failed.append("QUORUM_NOT_REACHED")
                     if float(arm.get("best_beyond",0.0))<ROCKET.min_beyond_level_bps: failed.append("BEYOND_LEVEL")
                     if samples>=ROCKET.confirm_samples and vote_count<ROCKET.final_entry_min_votes: failed.append("FINAL_MOMENTUM_FADED")
@@ -313,9 +318,10 @@ class RocketPaper:
                     self._event(symbol,"ROCKET_REJECT","NO_CONTINUATION",{
                                 "side":side,"beyond_bps":beyond,
                                 "tape_ratio":tape,"samples":samples,
-                                "consecutive_samples":consecutive,
-                                "best_consecutive_samples":best_consecutive,
-                                "required_consecutive_samples":ROCKET.confirm_consecutive_samples,
+                                "recent_good_count":recent_good_count,
+                                "best_recent_good_count":best_recent_good_count,
+                                "recent_good_window":ROCKET.confirm_recent_window,
+                                "required_recent_good":ROCKET.confirm_recent_required,
                                 "total_snapshots":total,
                                 "best_tape_ratio":arm.get("best_tape",0),
                                 "best_beyond_bps":arm.get("best_beyond",0),
@@ -353,8 +359,8 @@ class RocketPaper:
             side="SELL";level=lo;touches=lo_t
         if side:
             self.arms[symbol]={"side":side,"level":level,"touches":touches,"armed_ms":now,
-                               "arm_tape_ratio":tape,"samples":0,"consecutive_samples":0,
-                               "best_consecutive_samples":0,"total_snapshots":0,
+                               "arm_tape_ratio":tape,"samples":0,"recent_good":[],
+                               "recent_good_count":0,"best_recent_good_count":0,"total_snapshots":0,
                                "best_beyond":0.0,"best_tape":0.0,"best_vote_count":0,
                                "vote_misses":{"DIR_250MS":0,"DIR_1S":0,"FLOW":0,"TAPE":0,"BEYOND_LEVEL":0}}
             self._event(symbol,"ROCKET_ARM","BREAKOUT",self.arms[symbol],exchange_ts_ms)
