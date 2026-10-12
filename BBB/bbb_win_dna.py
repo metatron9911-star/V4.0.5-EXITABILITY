@@ -281,4 +281,6 @@ if __name__=="__main__":
     db=Path(os.getenv("DATA_DIR",Path(__file__).resolve().parent/"data"))/"bbb.sqlite3"
     r=run_analysis(db)
     compact={k:r[k] for k in ("status","closed_trades","wins","losses","base_win_rate","split","train","holdout","feature_count","vote_portrait","approved_for_new_paper_selector","decision")}
+    compact["top_win_loss_contrasts"]=r.get("top_win_loss_contrasts",[])[:12]
+    compact["top_rules"]=r.get("top_rules",[])[:12]
     print(json.dumps(compact,separators=(",",":")))
