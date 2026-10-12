@@ -178,6 +178,8 @@ async def main():
                   WHERE status='OPEN' AND session_id<>?""",(now_ms(),session))
     cx.commit()
     rocket=RocketPaper(cx,session,float(os.getenv("BBB_PAPER_START_USD","500")))
+    rocket_entries_enabled=os.getenv("BBB_ROCKET_ENTRY_ENABLED","1").lower() in {"1","true","yes","on"}
+    setmeta(cx,"rocket_entries_enabled","1" if rocket_entries_enabled else "0")
 
     q=asyncio.Queue(maxsize=int(os.getenv("BBB_MAX_QUEUE","100000")))
     stop=asyncio.Event(); books={s:LocalBook(s) for s in symbols}; fx=FeatureEngine()
@@ -242,7 +244,14 @@ async def main():
                     score=baseline_score(snap); gate=65.0
                     state=f"{bucket}|{'ACTIVE' if trade_now else 'WAIT'}"
 
-                    rocket.on_snapshot(symbol,snap,books[symbol],books[symbol].exchange_ts_ms)
+                    if rocket_entries_enabled:
+                        rocket.on_snapshot(symbol,snap,books[symbol],books[symbol].exchange_ts_ms)
+                    else:
+                        # Old ROCKET entry logic is retired while the replacement WIN-DNA selector
+                        # is researched. Keep live market telemetry, but create no new positions.
+                        for held_symbol in list(rocket.positions.keys()):
+                            if held_symbol==symbol:
+                                rocket._manage(symbol,snap,books[symbol],books[symbol].exchange_ts_ms)
                     cx.execute("""INSERT INTO feature_samples(
                       ts_ms,exchange_ts_ms,session_id,symbol,head,mid,bid,ask,spread_bps,
                       depth_bid_5_usd,depth_ask_5_usd,book_imbalance_5,trade_count_1s,trade_count_5s,
