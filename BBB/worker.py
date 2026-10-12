@@ -106,6 +106,26 @@ async def main():
     purge_legacy_data_once()
     runtime_storage_audit()
     cx=connect()
+    if os.getenv("BBB_RUN_WIN_DNA_ON_START","0").lower() in {"1","true","yes","on"}:
+        try:
+            from bbb_win_dna import run_analysis
+            dna=run_analysis(DB)
+            setmeta(cx,"bbb_win_dna_status",dna.get("status",""))
+            setmeta(cx,"bbb_win_dna_decision",dna.get("decision",""))
+            setmeta(cx,"bbb_win_dna_closed",dna.get("closed_trades",0))
+            setmeta(cx,"bbb_win_dna_wins",dna.get("wins",0))
+            setmeta(cx,"bbb_win_dna_losses",dna.get("losses",0))
+            setmeta(cx,"bbb_win_dna_approved","1" if dna.get("approved_for_new_paper_selector") else "0")
+            print("BBB_WIN_DNA_RESULT",json.dumps({
+                "closed":dna.get("closed_trades"),"wins":dna.get("wins"),"losses":dna.get("losses"),
+                "base_win_rate":dna.get("base_win_rate"),"split":dna.get("split"),
+                "train":dna.get("train"),"holdout":dna.get("holdout"),
+                "feature_count":dna.get("feature_count"),"vote_portrait":dna.get("vote_portrait"),
+                "approved":dna.get("approved_for_new_paper_selector"),"decision":dna.get("decision")
+            },separators=(",",":")),flush=True)
+            cx.commit()
+        except Exception as e:
+            print("BBB_WIN_DNA_FAILED",repr(e),flush=True)
     old=dict(cx.execute("SELECT key,value FROM meta").fetchall()).get("session_id")
     requested_session=os.getenv("BBB_SESSION_ID") or old or str(uuid.uuid4())
     # Never mix two runtime boots into the same paper accounting session. If the
