@@ -223,6 +223,12 @@ async def main():
     rocket=RocketPaper(cx,session,float(os.getenv("BBB_PAPER_START_USD","500")))
     rocket_entries_enabled=os.getenv("BBB_ROCKET_ENTRY_ENABLED","1").lower() in {"1","true","yes","on"}
     setmeta(cx,"rocket_entries_enabled","1" if rocket_entries_enabled else "0")
+    from bbb_market_dna_paper import MarketDnaPaper
+    market_dna=MarketDnaPaper(cx,session,float(os.getenv("BBB_PAPER_START_USD","500")))
+    market_dna_entries_enabled=os.getenv("BBB_MARKET_DNA_ENTRY_ENABLED","0").lower() in {"1","true","yes","on"}
+    setmeta(cx,"market_dna_entries_enabled","1" if market_dna_entries_enabled else "0")
+    if market_dna_entries_enabled:
+        setmeta(cx,"strategy_mode","MARKET_DNA_V1")
 
     q=asyncio.Queue(maxsize=int(os.getenv("BBB_MAX_QUEUE","100000")))
     stop=asyncio.Event(); books={s:LocalBook(s) for s in symbols}; fx=FeatureEngine()
@@ -290,11 +296,12 @@ async def main():
                     if rocket_entries_enabled:
                         rocket.on_snapshot(symbol,snap,books[symbol],books[symbol].exchange_ts_ms)
                     else:
-                        # Old ROCKET entry logic is retired while the replacement WIN-DNA selector
-                        # is researched. Keep live market telemetry, but create no new positions.
+                        # Legacy ROCKET can only manage any already-open bookkeeping leftovers.
                         for held_symbol in list(rocket.positions.keys()):
                             if held_symbol==symbol:
                                 rocket._manage(symbol,snap,books[symbol],books[symbol].exchange_ts_ms)
+                    if market_dna_entries_enabled:
+                        market_dna.on_snapshot(symbol,snap,books[symbol],books[symbol].exchange_ts_ms)
                     cx.execute("""INSERT INTO feature_samples(
                       ts_ms,exchange_ts_ms,session_id,symbol,head,mid,bid,ask,spread_bps,
                       depth_bid_5_usd,depth_ask_5_usd,book_imbalance_5,trade_count_1s,trade_count_5s,
