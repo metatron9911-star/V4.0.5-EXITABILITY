@@ -159,6 +159,16 @@ async def main():
             cx.commit()
         except Exception as e:
             print("BBB_WIN_DNA_V3_FAILED",repr(e),flush=True)
+    if os.getenv("BBB_RUN_WIN_DNA_V4_ON_START","0").lower() in {"1","true","yes","on"}:
+        try:
+            from bbb_win_dna_v4_archetypes import run as run_win_dna_v4
+            v4=run_win_dna_v4(DB)
+            setmeta(cx,"bbb_win_dna_v4_status",v4.get("status",""))
+            setmeta(cx,"bbb_win_dna_v4_decision",v4.get("decision",""))
+            print("BBB_WIN_DNA_V4_RESULT",json.dumps(v4,separators=(",",":")),flush=True)
+            cx.commit()
+        except Exception as e:
+            print("BBB_WIN_DNA_V4_FAILED",repr(e),flush=True)
     old=dict(cx.execute("SELECT key,value FROM meta").fetchall()).get("session_id")
     requested_session=os.getenv("BBB_SESSION_ID") or old or str(uuid.uuid4())
     # Never mix two runtime boots into the same paper accounting session. If the
