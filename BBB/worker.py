@@ -129,6 +129,26 @@ async def main():
             cx.commit()
         except Exception as e:
             print("BBB_WIN_DNA_FAILED",repr(e),flush=True)
+    if os.getenv("BBB_RUN_MARKET_DNA_ON_START","0").lower() in {"1","true","yes","on"}:
+        try:
+            from bbb_market_win_dna import run_analysis as run_market_dna
+            mdna=run_market_dna(DB)
+            setmeta(cx,"bbb_market_dna_status",mdna.get("status",""))
+            setmeta(cx,"bbb_market_dna_decision",mdna.get("decision",""))
+            setmeta(cx,"bbb_market_dna_approved","1" if mdna.get("approved_for_fresh_paper_selector") else "0")
+            print("BBB_MARKET_WIN_DNA_RESULT",json.dumps({
+                "raw_feature_rows_scanned":mdna.get("raw_feature_rows_scanned"),
+                "symbols":mdna.get("symbols"),"decision_rows":mdna.get("decision_rows"),
+                "labels":mdna.get("labels"),"feature_count":mdna.get("feature_count"),
+                "stable_rules":mdna.get("stable_rules",[])[:10],
+                "stable_pairs":mdna.get("stable_pairs",[])[:5],
+                "vote_portrait":mdna.get("vote_portrait"),
+                "approved":mdna.get("approved_for_fresh_paper_selector"),
+                "decision":mdna.get("decision")
+            },separators=(",",":")),flush=True)
+            cx.commit()
+        except Exception as e:
+            print("BBB_MARKET_WIN_DNA_FAILED",repr(e),flush=True)
     old=dict(cx.execute("SELECT key,value FROM meta").fetchall()).get("session_id")
     requested_session=os.getenv("BBB_SESSION_ID") or old or str(uuid.uuid4())
     # Never mix two runtime boots into the same paper accounting session. If the
