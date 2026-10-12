@@ -126,3 +126,26 @@ CREATE TABLE IF NOT EXISTS feature_samples (
   payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_features_symbol_ts ON feature_samples(symbol, ts_ms);
+
+
+CREATE TABLE IF NOT EXISTS microflow_episodes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  shock_ms INTEGER NOT NULL,
+  decision_ms INTEGER NOT NULL,
+  completed_ms INTEGER NOT NULL,
+  decision_stage TEXT NOT NULL,
+  outcome_label TEXT,
+  first_touch_ms INTEGER,
+  entry_ask REAL,
+  exit_probe_bid REAL,
+  max_favorable_bps REAL,
+  max_adverse_bps REAL,
+  shock_score REAL,
+  absorb_score REAL,
+  turn_score REAL,
+  dynamic_score REAL,
+  payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_microflow_episode_ts ON microflow_episodes(session_id,decision_ms);
