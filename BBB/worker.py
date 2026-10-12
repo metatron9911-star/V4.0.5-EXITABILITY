@@ -252,6 +252,10 @@ async def main():
 
     q=asyncio.Queue(maxsize=int(os.getenv("BBB_MAX_QUEUE","100000")))
     stop=asyncio.Event(); books={s:LocalBook(s) for s in symbols}; fx=FeatureEngine()
+    from microflow_dynamic import MicroFlowDynamic
+    microflow=MicroFlowDynamic(cx,session)
+    microflow_enabled=os.getenv("BBB_MICROFLOW_SHADOW_ENABLED","1").lower() in {"1","true","yes","on"}
+    setmeta(cx,"microflow_shadow_enabled","1" if microflow_enabled else "0")
     source_ages=deque(maxlen=10000); processing=deque(maxlen=10000)
     last_sample=defaultdict(int); last_market_sample=defaultdict(int); dropped=0
     feature_persist_ms=int(os.getenv("BBB_FEATURE_PERSIST_MS","1000"))
@@ -278,11 +282,19 @@ async def main():
 
             if topic.startswith("publicTrade.") and isinstance(data,list):
                 for t in data:
-                    try:fx.on_trade(symbol,int(t.get("T") or exch or recv),float(t["p"]),float(t["v"]),str(t.get("S") or ""))
+                    try:
+                        tts=int(t.get("T") or exch or recv); tp=float(t["p"]); tv=float(t["v"]); tsd=str(t.get("S") or "")
+                        fx.on_trade(symbol,tts,tp,tv,tsd)
+                        if microflow_enabled:
+                            microflow.on_trade(symbol,tts,tp,tv,tsd)
                     except Exception:pass
             elif topic.startswith("orderbook.") and isinstance(data,dict) and symbol in books:
                 books[symbol].apply(ev.get("type"),data,exch)
-                fx.on_book(symbol,int(data.get("cts") or exch or recv),books[symbol])
+                bts=int(data.get("cts") or exch or recv)
+                fx.on_book(symbol,bts,books[symbol])
+                if microflow_enabled:
+                    microflow.on_book(symbol,bts,books[symbol])
+                    microflow.maybe_step(symbol,bts,books[symbol])
 
             # Do not persist every exchange message: Bybit can emit thousands/sec.
             # Keep a lightweight sampled evidence trail; latency counters remain in memory/meta.
