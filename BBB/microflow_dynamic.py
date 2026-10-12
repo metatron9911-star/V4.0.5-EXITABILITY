@@ -108,6 +108,8 @@ class MicroFlowDynamic:
         self.pending:list[PendingEpisode]=[]
         self.last_step=defaultdict(int)
         self.counts=defaultdict(int)
+        from broker_council import BrokerCouncil
+        self.council=BrokerCouncil(cx,session_id)
 
     def _trim(self,symbol,ts):
         cut=ts-BASELINE_MS-10_000
@@ -306,6 +308,10 @@ class MicroFlowDynamic:
           "microflow_labeled":self.counts["labeled"],
           "microflow_signal_wins":self.counts["wins"],
           "microflow_signal_losses":self.counts["losses"],
+          "council_support":self.counts["council_support"],
+          "council_veto":self.counts["council_veto"],
+          "council_reject":self.counts["council_reject"],
+          "council_wait":self.counts["council_wait"],
         }.items():
             self.cx.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",(k,str(v)))
 
@@ -324,6 +330,12 @@ class MicroFlowDynamic:
 
         scores=self._scores(symbol,f,base)
         st=self.active.get(symbol)
+        council_stage=st.stage if st is not None else "IDLE"
+        council=self.council.evaluate(symbol,ts,f,scores,council_stage)
+        if council["decision"]=="SUPPORT": self.counts["council_support"]+=1
+        elif council["decision"]=="VETO": self.counts["council_veto"]+=1
+        elif council["decision"]=="REJECT": self.counts["council_reject"]+=1
+        else: self.counts["council_wait"]+=1
 
         if st is None:
             # Adaptive sell-shock: unusual sell aggression + downside response.
