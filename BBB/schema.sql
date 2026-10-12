@@ -149,3 +149,17 @@ CREATE TABLE IF NOT EXISTS microflow_episodes (
   payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_microflow_episode_ts ON microflow_episodes(session_id,decision_ms);
+
+
+CREATE TABLE IF NOT EXISTS agent_council_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  ts_ms INTEGER NOT NULL,
+  regime TEXT NOT NULL,
+  coordinator_score REAL NOT NULL,
+  decision TEXT NOT NULL,
+  veto INTEGER NOT NULL,
+  payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_council_ts ON agent_council_decisions(session_id,ts_ms);
