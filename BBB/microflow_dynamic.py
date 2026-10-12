@@ -343,9 +343,10 @@ class MicroFlowDynamic:
             self._publish_meta();return
 
         age=ts-st.shock_ms
-        st.shock_low=min(st.shock_low,f["mid"])
+        prior_low=st.shock_low
         noise=max(0.5,median([abs(x.get("ret250",0)) for x in base],0.5)*2.0)
-        new_low_bps=(f["mid"]/st.shock_low-1)*10000 if st.shock_low>0 else 0
+        new_low_bps=(f["mid"]/prior_low-1)*10000 if prior_low>0 else 0
+        st.shock_low=min(st.shock_low,f["mid"])
 
         # Hard vetoes: renewed sell impulse or book/spread deterioration.
         hard_veto=(
