@@ -13,6 +13,7 @@ from collections import Counter
 
 HORIZON_MS=20_000
 SAMPLE_STEP_MS=2_000
+MAX_RAW_ROWS=300_000
 SCHEMES={
  "FAST":{"tp_bps":55.0,"sl_bps":-25.0},
  "QUALITY":{"tp_bps":80.0,"sl_bps":-30.0},
@@ -66,12 +67,12 @@ def parse_row(z):
 DIRECT=("spread_bps","depth_min_usd","depth_total_usd","imbalance","t1","t5",
         "buy_ratio","ret250","ret1","ret5","rv5","range24h_bps","turnover24h","activity")
 
-def load_symbol(cx,symbol):
+def load_symbol(cx,symbol,min_id):
     q="""SELECT ts_ms,mid,bid,ask,spread_bps,depth_bid_5_usd,depth_ask_5_usd,
                 book_imbalance_5,trade_count_1s,trade_count_5s,buy_ratio_1s,
                 ret_250ms_bps,ret_1s_bps,ret_5s_bps,realized_vol_5s_bps,payload_json
-         FROM feature_samples WHERE symbol=? ORDER BY ts_ms"""
-    return [parse_row(z) for z in cx.execute(q,(symbol,))]
+         FROM feature_samples WHERE symbol=? AND id>=? ORDER BY ts_ms"""
+    return [parse_row(z) for z in cx.execute(q,(symbol,min_id))]
 
 def labels(rows,i):
     ask=rows[i]["ask"]
@@ -117,10 +118,12 @@ def nearest_before(picks,ts):
     return None
 
 def build(cx):
-    symbols=[x[0] for x in cx.execute("SELECT DISTINCT symbol FROM feature_samples ORDER BY symbol")]
+    max_id=int(cx.execute("SELECT COALESCE(MAX(id),0) FROM feature_samples").fetchone()[0] or 0)
+    min_id=max(0,max_id-MAX_RAW_ROWS+1)
+    symbols=[x[0] for x in cx.execute("SELECT DISTINCT symbol FROM feature_samples WHERE id>=? ORDER BY symbol",(min_id,))]
     dataset=[]; scanned=0
     for symbol in symbols:
-        rows=load_symbol(cx,symbol); scanned+=len(rows)
+        rows=load_symbol(cx,symbol,min_id); scanned+=len(rows)
         picks=[]; last=-10**18
         for i,cur in enumerate(rows):
             if cur["ts"]-last<SAMPLE_STEP_MS:continue
@@ -228,7 +231,7 @@ def run_analysis(db_path):
         counts[name]={s:dict(Counter(r["label_"+s] for r in part)) for s in SCHEMES}
     approved=bool(vp and vp["stable"])
     report={"status":"BBB_BYBIT_MARKET_WIDE_WIN_DNA_V2","source":"BBB retained Bybit feature_samples; zero legacy ROCKET gates",
-      "raw_rows":scanned,"symbols":nsym,"decision_rows":len(ds),"feature_count":len(fs),
+      "raw_rows":scanned,"raw_row_cap":MAX_RAW_ROWS,"symbols":nsym,"decision_rows":len(ds),"feature_count":len(fs),
       "split":"chronological_70_30","labels":counts,"schemes":SCHEMES,
       "stable_rules":[x for x in rules if x["stable"]][:30],
       "stable_pairs":[x for x in ps if x["stable"]][:20],"vote_portrait":vp,
