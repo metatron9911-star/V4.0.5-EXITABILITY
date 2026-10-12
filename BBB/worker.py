@@ -120,7 +120,10 @@ async def main():
                 "closed":dna.get("closed_trades"),"wins":dna.get("wins"),"losses":dna.get("losses"),
                 "base_win_rate":dna.get("base_win_rate"),"split":dna.get("split"),
                 "train":dna.get("train"),"holdout":dna.get("holdout"),
-                "feature_count":dna.get("feature_count"),"vote_portrait":dna.get("vote_portrait"),
+                "feature_count":dna.get("feature_count"),
+                "top_contrasts":dna.get("top_win_loss_contrasts",[])[:12],
+                "top_rules":dna.get("top_rules",[])[:12],
+                "vote_portrait":dna.get("vote_portrait"),
                 "approved":dna.get("approved_for_new_paper_selector"),"decision":dna.get("decision")
             },separators=(",",":")),flush=True)
             cx.commit()
