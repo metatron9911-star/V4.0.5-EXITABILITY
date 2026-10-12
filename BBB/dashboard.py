@@ -9,9 +9,9 @@ ROOT=Path(__file__).resolve().parent
 DATA_DIR=Path(os.getenv("DATA_DIR",str(ROOT/"data")))
 DB=DATA_DIR/"bbb.sqlite3"
 
-st.set_page_config(page_title="BBB — ROCKET V1",layout="wide")
-st.title("BBB — ROCKET V1")
-st.caption("PAPER only · live Bybit publicTrade + L50 VWAP · high-volatility / tight-spread / dense-event universe")
+st.set_page_config(page_title="BBB — MARKET DNA",layout="wide")
+st.title("BBB — MARKET DNA V1")
+st.caption("PAPER only · live Bybit publicTrade + L50 VWAP · WIN portrait from BBB own Bybit history · legacy ROCKET entries OFF")
 
 def open_db():
     return sqlite3.connect(DB,check_same_thread=False) if DB.exists() else None
@@ -39,7 +39,47 @@ def board():
     start=int(meta.get("session_start_ms","0") or 0)
     elapsed=max(0,(now-start)//1000) if start else 0
     cash=float(meta.get("rocket_cash_usd","500") or 0)
-    st.markdown(f"**ROCKET PAPER wallet USD {cash:.2f}** · Session {session} · {elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}")
+    active=meta.get("active_strategy","MARKET_DNA_V1")
+    mdna_cash=float(meta.get("market_dna_cash_usd","500") or 0)
+    st.markdown(f"**{active} PAPER wallet USD {mdna_cash:.2f}** · Session {session} · {elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}")
+    st.caption(f"Selector: {meta.get('market_dna_selector','T5>=203 & ACTIVITY>=117.02 & D10_T5>=63')} · Exit: {meta.get('market_dna_exit','TP80bps_STOP30bps_TIMEOUT20s')}")
+
+    md_closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state='MARKET_DNA_V1'",(session,)).fetchone()[0]
+    md_wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state='MARKET_DNA_V1' AND net_pnl_usd>0",(session,)).fetchone()[0]
+    md_losses=md_closed-md_wins
+    md_open=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='OPEN' AND risk_state='MARKET_DNA_V1'",(session,)).fetchone()[0]
+    md_wr=100*md_wins/md_closed if md_closed else 0.0
+    md=st.columns(8)
+    md[0].metric("MARKET DNA","ON" if meta.get("market_dna_entries_enabled","0")=="1" else "OFF")
+    md[1].metric("Closed",md_closed)
+    md[2].metric("W / L",f"{md_wins} / {md_losses}")
+    md[3].metric("WR",f"{md_wr:.1f}%")
+    md[4].metric("Realized $",f"{float(meta.get('market_dna_realized_usd','0') or 0):.4f}")
+    md[5].metric("Fees $",f"{float(meta.get('market_dna_fees_usd','0') or 0):.4f}")
+    md[6].metric("Open",md_open)
+    md[7].metric("Signals",meta.get("market_dna_signals","0"))
+
+    mdtr=db.execute("""SELECT symbol,status,entry_vwap,exit_vwap,gross_pnl_usd,net_pnl_usd,
+                              exit_reason,hold_ms,notional_usd,entry_features_json
+                       FROM trades WHERE session_id=? AND risk_state='MARKET_DNA_V1'
+                       ORDER BY id DESC LIMIT 50""",(session,)).fetchall()
+    st.subheader("MARKET-DNA V1 trades")
+    mdrep=[]
+    for r in mdtr:
+        ef=parse_json(r[9]); d=(ef.get("market_dna_v1") or {})
+        n=float(r[8] or 0); g=float(r[4] or 0); net=float(r[5] or 0)
+        mdrep.append({"symbol":r[0],"status":r[1],"entry":r[2],"exit":r[3],
+                      "gross_bps":round(g/n*10000,2) if n else None,
+                      "net_bps":round(net/n*10000,2) if n else None,
+                      "reason":r[6],"hold_s":round(float(r[7] or 0)/1000,3),
+                      "t5":d.get("t5"),"activity":round(float(d.get("activity",0) or 0),2),
+                      "d10_t5":d.get("d10_t5")})
+    if mdrep: st.dataframe(mdrep,hide_index=True,width='stretch')
+    else: st.caption("Waiting for first MARKET-DNA V1 signal...")
+
+    st.divider()
+    st.caption("Legacy ROCKET diagnostics/history below — entries are disabled.")
+    st.markdown(f"**Legacy ROCKET wallet USD {cash:.2f}** · Session {session}")
 
     closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state='ROCKET_V1'",(session,)).fetchone()[0]
     wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state='ROCKET_V1' AND net_pnl_usd>0",(session,)).fetchone()[0]
