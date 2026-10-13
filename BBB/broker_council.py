@@ -149,7 +149,7 @@ class BrokerCouncil:
         if enabled("BBB_RESEARCH_PERSIST_ENABLED"):
             key=(symbol,decision)
             last=self.last_persist[key]
-            important=decision in {"SUPPORT","VETO","REJECT"}
+            important=stage!="IDLE" and decision in {"SUPPORT","VETO","REJECT"}
             if important and int(ts_ms)-last>=2000:
                 compact={
                   "stage":stage,"regime":regime["regime"],"weights":regime["weights"],
