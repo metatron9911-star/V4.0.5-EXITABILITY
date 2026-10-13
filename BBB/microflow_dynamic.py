@@ -289,16 +289,25 @@ class MicroFlowDynamic:
                 remain.append(ep);continue
             if ep.outcome_label is None:ep.outcome_label="NEUTRAL"
             if enabled("BBB_RESEARCH_PERSIST_ENABLED"):
-                compact_payload=self._compact_episode_payload(ep.frames)
-                self.cx.execute("""INSERT INTO microflow_episodes(
-                  session_id,symbol,shock_ms,decision_ms,completed_ms,decision_stage,outcome_label,
-                  first_touch_ms,entry_ask,exit_probe_bid,max_favorable_bps,max_adverse_bps,
-                  shock_score,absorb_score,turn_score,dynamic_score,payload_json)
-                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (self.session_id,ep.symbol,ep.shock_ms,ep.decision_ms,f["ts"],ep.decision_stage,
-                   ep.outcome_label,ep.first_touch_ms,ep.entry_ask,ep.exit_probe_bid,ep.max_fav_bps,
-                   ep.max_adv_bps,ep.shock_score,ep.absorb_score,ep.turn_score,ep.dynamic_score,
-                   json.dumps(compact_payload,separators=(",",":"))))
+                # Keep every actual SIGNAL, every rejected episode that later became WIN
+                # (valuable missed-winner evidence), and a 10% deterministic control sample
+                # of the remaining rejects. This preserves learning value across the day.
+                keep_episode=(
+                    ep.decision_stage=="SIGNAL" or
+                    ep.outcome_label=="WIN" or
+                    ((int(ep.decision_ms)//1000) % 10 == 0)
+                )
+                if keep_episode:
+                    compact_payload=self._compact_episode_payload(ep.frames)
+                    self.cx.execute("""INSERT INTO microflow_episodes(
+                      session_id,symbol,shock_ms,decision_ms,completed_ms,decision_stage,outcome_label,
+                      first_touch_ms,entry_ask,exit_probe_bid,max_favorable_bps,max_adverse_bps,
+                      shock_score,absorb_score,turn_score,dynamic_score,payload_json)
+                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                      (self.session_id,ep.symbol,ep.shock_ms,ep.decision_ms,f["ts"],ep.decision_stage,
+                       ep.outcome_label,ep.first_touch_ms,ep.entry_ask,ep.exit_probe_bid,ep.max_fav_bps,
+                       ep.max_adv_bps,ep.shock_score,ep.absorb_score,ep.turn_score,ep.dynamic_score,
+                       json.dumps(compact_payload,separators=(",",":"))))
             self.counts["labeled"]+=1
             self.counts["wins"]+=1 if ep.outcome_label=="WIN" and ep.decision_stage=="SIGNAL" else 0
             self.counts["losses"]+=1 if ep.outcome_label=="LOSS" and ep.decision_stage=="SIGNAL" else 0
