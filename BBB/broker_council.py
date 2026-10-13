@@ -5,6 +5,7 @@ Coordinator applies regime-dependent weights and an independent veto.
 No trading or order placement exists in this module.
 """
 from __future__ import annotations
+from collections import defaultdict
 from storage_guard import enabled
 import json, math
 
@@ -113,6 +114,7 @@ class BrokerCouncil:
         self.cx=cx; self.session_id=session_id
         self.agents=[TapeAgent(),BookAgent(),ImpulseAgent(),AbsorptionAgent()]
         self.regime_agent=RegimeAgent(); self.veto_agent=RiskVetoAgent()
+        self.last_persist=defaultdict(int)
 
     def evaluate(self,symbol,ts_ms,f,scores,stage):
         regime=self.regime_agent.evaluate(f,scores)
@@ -144,12 +146,24 @@ class BrokerCouncil:
           "frame":{"ret250":f.get("ret250"),"ret1":f.get("ret1"),"flow250":f.get("250_flow"),
                    "flow1s":f.get("1s_flow"),"imb":f.get("imb"),"spread":f.get("spread")}
         }
-        if enabled("BBB_MARKET_PERSIST_ENABLED"):
-            self.cx.execute("""INSERT INTO agent_council_decisions(
-              session_id,symbol,ts_ms,regime,coordinator_score,decision,veto,payload_json)
-              VALUES(?,?,?,?,?,?,?,?)""",
-              (self.session_id,symbol,int(ts_ms),regime["regime"],coordinator,decision,
-               1 if veto["veto"] else 0,json.dumps(payload,separators=(",",":"))))
+        if enabled("BBB_RESEARCH_PERSIST_ENABLED"):
+            key=(symbol,decision)
+            last=self.last_persist[key]
+            important=decision in {"SUPPORT","VETO","REJECT"}
+            if important and int(ts_ms)-last>=2000:
+                compact={
+                  "stage":stage,"regime":regime["regime"],"weights":regime["weights"],
+                  "votes":{k:{"score":v["score"],"confidence":v["confidence"]} for k,v in votes.items()},
+                  "risk_veto":veto,"consensus":consensus,"agreement":agreement,
+                  "dispersion":dispersion,"coordinator_score":coordinator,
+                  "frame":payload["frame"]
+                }
+                self.cx.execute("""INSERT INTO agent_council_decisions(
+                  session_id,symbol,ts_ms,regime,coordinator_score,decision,veto,payload_json)
+                  VALUES(?,?,?,?,?,?,?,?)""",
+                  (self.session_id,symbol,int(ts_ms),regime["regime"],coordinator,decision,
+                   1 if veto["veto"] else 0,json.dumps(compact,separators=(",",":"))))
+                self.last_persist[key]=int(ts_ms)
 
         return payload
 
