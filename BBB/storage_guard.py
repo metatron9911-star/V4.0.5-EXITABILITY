@@ -62,6 +62,11 @@ class StorageGuard:
                            lambda: int(enabled("BBB_ROCKET_ENTRY_ENABLED") or
                                        enabled("BBB_MARKET_DNA_ENTRY_ENABLED")))
         for table in TABLES:
+            # Rebuild guards on every boot so a mode change (CORE_ONLY -> bounded research)
+            # cannot be blocked by stale trigger definitions from the prior deployment.
+            cx.execute(f"DROP TRIGGER IF EXISTS bounded_{table}_insert")
+            cx.execute(f"DROP TRIGGER IF EXISTS bounded_{table}_rows")
+            cx.execute(f"DROP TRIGGER IF EXISTS bounded_{table}_update")
             columns = {r[1] for r in cx.execute(f"PRAGMA table_info({table})")}
             if table in RESEARCH_TABLES:
                 conditions = ["bbb_research_allowed()=0"]
