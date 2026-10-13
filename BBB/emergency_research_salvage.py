@@ -23,7 +23,7 @@ def main():
     if not DB.exists():
         out["error"]="DB_NOT_FOUND"; print("BBB_SALVAGE_JSON "+json.dumps(out,separators=(",",":"))); return
     # read-only, avoid journal writes on a full volume
-    cx=sqlite3.connect(f"file:{DB}?mode=ro",uri=True,timeout=10)
+    cx=sqlite3.connect(f"file:{DB}?mode=ro&immutable=1",uri=True,timeout=10)
     tabs={r[0] for r in cx.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     out["tables"]=sorted(tabs)
     out["db_bytes"]=DB.stat().st_size
