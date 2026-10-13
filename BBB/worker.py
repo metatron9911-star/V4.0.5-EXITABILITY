@@ -13,42 +13,40 @@ from features import FeatureEngine, classify_head, baseline_score
 from universe import scan_vol_universe, fallback_vol_universe, universe_json
 from rocket_profile import settings_json as rocket_settings_json
 from rocket_paper import RocketPaper
+from storage_guard import StorageGuard
 
 ROOT=Path(__file__).resolve().parent
 DATA_DIR=Path(os.getenv("DATA_DIR",str(ROOT/"data")))
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 DB=DATA_DIR/"bbb.sqlite3"
+STORAGE=StorageGuard(DATA_DIR)
 DEFAULT_SYMBOLS=["SOLUSDT","ETHUSDT","BTCUSDT"]
 GATES={"LIQUID":60.0,"VOL":65.0,"LAUNCH":70.0}
 
 
 def purge_legacy_data_once():
-    epoch=os.getenv("BBB_DATA_EPOCH","").strip()
+    epoch=os.getenv("BBB_DATA_EPOCH", "").strip()
     if not epoch:
         return
+    if epoch != "BBB_CORE_ONLY_PURGE_20261013":
+        raise RuntimeError("Unknown purge epoch; refusing deletion")
+    assert os.environ.get("RAILWAY_SERVICE_ID")=="c132f0ac-79ba-4e8c-906b-e04c5067e8e7"
+    assert DATA_DIR.resolve()==Path("/data") and DATA_DIR.is_mount()
     marker=DATA_DIR/(".epoch_"+epoch)
     if marker.exists():
         return
-    before=0
-    try:
-        for p in DATA_DIR.rglob("*"):
-            if p.is_file():
-                try: before+=p.stat().st_size
-                except Exception: pass
-        # Old research packages, caches and the old multi-strategy DB are not
-        # part of the new ROCKET machine. Start the new epoch from a clean volume.
-        for p in sorted(DATA_DIR.iterdir(),key=lambda x:len(str(x)),reverse=True):
-            try:
-                if p.is_dir():
-                    import shutil; shutil.rmtree(p)
-                else:
-                    p.unlink(missing_ok=True)
-            except Exception as e:
-                print("PURGE_FAIL",str(p),repr(e),flush=True)
-        marker.write_text(epoch,encoding="utf-8")
-        print("DATA_EPOCH_PURGED",epoch,"freed_bytes",before,flush=True)
-    except Exception as e:
-        print("DATA_EPOCH_PURGE_FATAL",repr(e),flush=True)
+    import shutil
+    files=[{"path":str(p),"bytes":p.lstat().st_size}
+           for p in DATA_DIR.rglob("*") if p.is_file()]
+    print("BBB_PURGE_BEFORE",json.dumps({"used_bytes":sum(p["bytes"] for p in files),"files":files}),flush=True)
+    for p in DATA_DIR.iterdir():
+        if p.is_symlink() or not p.is_dir():
+            p.unlink()
+        else:
+            shutil.rmtree(p)
+    assert not list(DATA_DIR.iterdir())
+    print("BBB_PURGE_AFTER",json.dumps({"used_bytes":0,"files":[]}),flush=True)
+    marker.write_text(epoch,encoding="utf-8")
 
 def runtime_storage_audit():
     try:
@@ -64,9 +62,8 @@ def runtime_storage_audit():
 
 def connect():
     cx=sqlite3.connect(DB,check_same_thread=False,timeout=15)
-    cx.execute("PRAGMA journal_mode=WAL")
     cx.executescript((ROOT/"schema.sql").read_text(encoding="utf-8"))
-    return cx
+    return STORAGE.install(cx)
 
 
 def setmeta(cx,key,value):
@@ -241,7 +238,7 @@ async def main():
                   WHERE status='OPEN' AND session_id<>?""",(now_ms(),session))
     cx.commit()
     rocket=RocketPaper(cx,session,float(os.getenv("BBB_PAPER_START_USD","500")))
-    rocket_entries_enabled=os.getenv("BBB_ROCKET_ENTRY_ENABLED","1").lower() in {"1","true","yes","on"}
+    rocket_entries_enabled=os.getenv("BBB_ROCKET_ENTRY_ENABLED","0").lower() in {"1","true","yes","on"}
     setmeta(cx,"rocket_entries_enabled","1" if rocket_entries_enabled else "0")
     from bbb_market_dna_paper import MarketDnaPaper
     market_dna=MarketDnaPaper(cx,session,float(os.getenv("BBB_PAPER_START_USD","500")))
@@ -249,6 +246,11 @@ async def main():
     setmeta(cx,"market_dna_entries_enabled","1" if market_dna_entries_enabled else "0")
     if market_dna_entries_enabled:
         setmeta(cx,"strategy_mode","MARKET_DNA_V1")
+    if not rocket_entries_enabled and not market_dna_entries_enabled:
+        setmeta(cx,"strategy_mode","CORE_ONLY")
+        setmeta(cx,"active_strategy","CORE_ONLY")
+        setmeta(cx,"market_dna_paper_enabled","0")
+    setmeta(cx,"live_submission_enabled","0")
 
     q=asyncio.Queue(maxsize=int(os.getenv("BBB_MAX_QUEUE","100000")))
     stop=asyncio.Event(); books={s:LocalBook(s) for s in symbols}; fx=FeatureEngine()
@@ -273,6 +275,19 @@ async def main():
     feed=BybitPublicFeed(symbols,on_event)
     feed_task=asyncio.create_task(feed.run(stop))
     last_hb=0
+    async def operational_heartbeat():
+        last_log=0
+        while not stop.is_set():
+            hb=now_ms()
+            setmeta(cx,"heartbeat_ms",hb)
+            setmeta(cx,"feed_state","CONNECTED" if feed.health.connected else "RECONNECTING")
+            setmeta(cx,"messages",feed.health.messages)
+            if hb-last_log>=30000:
+                STORAGE.publish(cx,feed,hb)
+                last_log=hb
+            cx.commit()
+            await asyncio.sleep(2)
+    heartbeat_task=asyncio.create_task(operational_heartbeat())
     try:
         while True:
             ev=await q.get(); recv=ev["receive_ts_ms"]; exch=int(ev.get("exchange_ts_ms") or 0)
@@ -298,7 +313,7 @@ async def main():
 
             # Do not persist every exchange message: Bybit can emit thousands/sec.
             # Keep a lightweight sampled evidence trail; latency counters remain in memory/meta.
-            if now_ms()-last_market_sample[symbol] >= market_persist_ms:
+            if STORAGE.allow() and now_ms()-last_market_sample[symbol] >= market_persist_ms:
                 cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
                               VALUES(?,?,?,?,?,?,?,?)""",
                            (recv,exch,session,None,symbol,"MARKET_SAMPLE",topic,
@@ -334,16 +349,17 @@ async def main():
                                 rocket._manage(symbol,snap,books[symbol],books[symbol].exchange_ts_ms)
                     if market_dna_entries_enabled:
                         market_dna.on_snapshot(symbol,snap,books[symbol],books[symbol].exchange_ts_ms)
-                    cx.execute("""INSERT INTO feature_samples(
-                      ts_ms,exchange_ts_ms,session_id,symbol,head,mid,bid,ask,spread_bps,
-                      depth_bid_5_usd,depth_ask_5_usd,book_imbalance_5,trade_count_1s,trade_count_5s,
-                      buy_ratio_1s,ret_250ms_bps,ret_1s_bps,ret_5s_bps,realized_vol_5s_bps,
-                      score,gate,state,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                      (now_ms(),books[symbol].exchange_ts_ms,session,symbol,head,snap["mid"],snap["bid"],snap["ask"],
-                       snap["spread_bps"],snap["depth_bid_5_usd"],snap["depth_ask_5_usd"],snap["book_imbalance_5"],
-                       snap["trade_count_1s"],snap["trade_count_5s"],snap["buy_ratio_1s"],snap["ret_250ms_bps"],
-                       snap["ret_1s_bps"],snap["ret_5s_bps"],snap["realized_vol_5s_bps"],score,gate,state,
-                       json.dumps(snap,separators=(",",":"))))
+                    if STORAGE.allow():
+                        cx.execute("""INSERT INTO feature_samples(
+                          ts_ms,exchange_ts_ms,session_id,symbol,head,mid,bid,ask,spread_bps,
+                          depth_bid_5_usd,depth_ask_5_usd,book_imbalance_5,trade_count_1s,trade_count_5s,
+                          buy_ratio_1s,ret_250ms_bps,ret_1s_bps,ret_5s_bps,realized_vol_5s_bps,
+                          score,gate,state,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                          (now_ms(),books[symbol].exchange_ts_ms,session,symbol,head,snap["mid"],snap["bid"],snap["ask"],
+                           snap["spread_bps"],snap["depth_bid_5_usd"],snap["depth_ask_5_usd"],snap["book_imbalance_5"],
+                           snap["trade_count_1s"],snap["trade_count_5s"],snap["buy_ratio_1s"],snap["ret_250ms_bps"],
+                           snap["ret_1s_bps"],snap["ret_5s_bps"],snap["realized_vol_5s_bps"],score,gate,state,
+                           json.dumps(snap,separators=(",",":"))))
                     last_sample[symbol]=now_ms()
 
             processing.append(max(0,now_ms()-start))
@@ -379,24 +395,10 @@ async def main():
                 setmeta(cx,"queue_depth",q.qsize()); setmeta(cx,"dropped",dropped)
                 setmeta(cx,"source_age_p50_ms",round(pct(source_ages,.50),2)); setmeta(cx,"source_age_p99_ms",round(pct(source_ages,.99),2))
                 setmeta(cx,"processing_p50_ms",round(pct(processing,.50),2)); setmeta(cx,"processing_p99_ms",round(pct(processing,.99),2))
-                # Session-aware retention:
-                # - NEVER delete heavy telemetry from the active session.
-                # - After a session changes, keep its heavy telemetry for retention_hours.
-                # - trades and wallet_ledger are never deleted here, so compact session results
-                #   remain available for long-term analysis after raw telemetry expires.
-                if now_ms()-last_maintenance >= 60000:
-                    cutoff=now_ms()-retention_hours*3600*1000
-                    cx.execute("DELETE FROM events WHERE session_id<>? AND ts_ms < ?",(session,cutoff))
-                    cx.execute("DELETE FROM feature_samples WHERE session_id<>? AND ts_ms < ?",(session,cutoff))
-                    cx.execute("DELETE FROM equity_samples WHERE session_id<>? AND ts_ms < ?",(session,cutoff))
-                    setmeta(cx,"retention_policy","ACTIVE_SESSION_FULL; PRIOR_SESSIONS_RAW_%sh; TRADES_LEDGER_KEEP" % retention_hours)
-                    setmeta(cx,"retention_last_cleanup_ms",now_ms())
-                    # Do not checkpoint from the hot writer loop: dashboard readers can
-                    # legitimately hold read locks. WAL autocheckpoint handles this safely.
-                    last_maintenance=now_ms()
                 cx.commit(); last_hb=now_ms()
     finally:
-        stop.set(); await feed_task; cx.commit(); cx.close()
+        stop.set(); heartbeat_task.cancel(); await feed_task; cx.commit(); cx.close()
 
 if __name__=="__main__":
     asyncio.run(main())
+

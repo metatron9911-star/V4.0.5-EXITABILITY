@@ -12,6 +12,7 @@ movement and persisted for later WIN-vs-LOSS research.
 from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from storage_guard import enabled
 import json, math, statistics, time
 from typing import Deque
 
@@ -233,6 +234,7 @@ class MicroFlowDynamic:
         }
 
     def _emit(self,symbol,stage,reason,payload):
+        if not enabled("BBB_MARKET_PERSIST_ENABLED"):return
         self.cx.execute("""INSERT INTO events(ts_ms,exchange_ts_ms,session_id,head,symbol,stage,reason,payload_json)
                            VALUES(?,?,?,?,?,?,?,?)""",
                         (now_ms(),0,self.session_id,"VOL",symbol,stage,reason,json.dumps(payload,separators=(",",":"))))
@@ -278,15 +280,16 @@ class MicroFlowDynamic:
             if f["ts"]<ep.deadline_ms:
                 remain.append(ep);continue
             if ep.outcome_label is None:ep.outcome_label="NEUTRAL"
-            self.cx.execute("""INSERT INTO microflow_episodes(
-              session_id,symbol,shock_ms,decision_ms,completed_ms,decision_stage,outcome_label,
-              first_touch_ms,entry_ask,exit_probe_bid,max_favorable_bps,max_adverse_bps,
-              shock_score,absorb_score,turn_score,dynamic_score,payload_json)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-              (self.session_id,ep.symbol,ep.shock_ms,ep.decision_ms,f["ts"],ep.decision_stage,
-               ep.outcome_label,ep.first_touch_ms,ep.entry_ask,ep.exit_probe_bid,ep.max_fav_bps,
-               ep.max_adv_bps,ep.shock_score,ep.absorb_score,ep.turn_score,ep.dynamic_score,
-               json.dumps({"frames":ep.frames},separators=(",",":"))))
+            if enabled("BBB_MARKET_PERSIST_ENABLED"):
+                self.cx.execute("""INSERT INTO microflow_episodes(
+                  session_id,symbol,shock_ms,decision_ms,completed_ms,decision_stage,outcome_label,
+                  first_touch_ms,entry_ask,exit_probe_bid,max_favorable_bps,max_adverse_bps,
+                  shock_score,absorb_score,turn_score,dynamic_score,payload_json)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (self.session_id,ep.symbol,ep.shock_ms,ep.decision_ms,f["ts"],ep.decision_stage,
+                   ep.outcome_label,ep.first_touch_ms,ep.entry_ask,ep.exit_probe_bid,ep.max_fav_bps,
+                   ep.max_adv_bps,ep.shock_score,ep.absorb_score,ep.turn_score,ep.dynamic_score,
+                   json.dumps({"frames":ep.frames},separators=(",",":"))))
             self.counts["labeled"]+=1
             self.counts["wins"]+=1 if ep.outcome_label=="WIN" and ep.decision_stage=="SIGNAL" else 0
             self.counts["losses"]+=1 if ep.outcome_label=="LOSS" and ep.decision_stage=="SIGNAL" else 0
@@ -406,3 +409,4 @@ class MicroFlowDynamic:
                 self._finalize_decision(symbol,"SIGNAL",f,scores,"TWO_FRAME_REVERSAL_CONFIRM")
 
         self._publish_meta()
+

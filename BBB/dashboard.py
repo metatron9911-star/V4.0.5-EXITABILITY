@@ -10,7 +10,7 @@ DATA_DIR=Path(os.getenv("DATA_DIR",str(ROOT/"data")))
 DB=DATA_DIR/"bbb.sqlite3"
 
 st.set_page_config(page_title="BBB — MARKET DNA",layout="wide")
-st.title("BBB — MARKET DNA V1")
+st.title("BBB — CORE / HEALTH")
 st.caption("PAPER only · live Bybit publicTrade + L50 VWAP · WIN portrait from BBB own Bybit history · legacy ROCKET entries OFF")
 
 def open_db():
@@ -28,6 +28,7 @@ def board():
         return
 
     meta=dict(db.execute("SELECT key,value FROM meta").fetchall())
+    st.caption(f"Storage: {meta.get('storage_mode','CORE_ONLY')} · persistence {meta.get('market_persist_enabled','0')} · guard {meta.get('storage_guard_state','OK')} · bytes {meta.get('storage_used_bytes','0')}")
     now=int(time.time()*1000)
     session=meta.get("session_id","")
     hb=int(meta.get("heartbeat_ms","0") or 0)
@@ -94,7 +95,7 @@ def board():
     exitfills=db.execute("SELECT COUNT(*) FROM events WHERE session_id=? AND stage='ROCKET_FILL' AND reason='EXIT'",(session,)).fetchone()[0]
 
     a=st.columns(8)
-    a[0].metric("ROCKET PAPER","ON")
+    a[0].metric("ROCKET PAPER","ON" if meta.get("rocket_entries_enabled","0")=="1" else "OFF")
     a[1].metric("Closed",closed)
     a[2].metric("W / L",f"{wins} / {losses}")
     a[3].metric("WR",f"{wr:.1f}%")
@@ -223,3 +224,4 @@ def board():
         st.caption("No ROCKET fills yet.")
 
 board()
+

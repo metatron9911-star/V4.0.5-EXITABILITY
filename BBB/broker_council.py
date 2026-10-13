@@ -5,6 +5,7 @@ Coordinator applies regime-dependent weights and an independent veto.
 No trading or order placement exists in this module.
 """
 from __future__ import annotations
+from storage_guard import enabled
 import json, math
 
 def clamp(x,a=-1.0,b=1.0):
@@ -143,9 +144,12 @@ class BrokerCouncil:
           "frame":{"ret250":f.get("ret250"),"ret1":f.get("ret1"),"flow250":f.get("250_flow"),
                    "flow1s":f.get("1s_flow"),"imb":f.get("imb"),"spread":f.get("spread")}
         }
-        self.cx.execute("""INSERT INTO agent_council_decisions(
-          session_id,symbol,ts_ms,regime,coordinator_score,decision,veto,payload_json)
-          VALUES(?,?,?,?,?,?,?,?)""",
-          (self.session_id,symbol,int(ts_ms),regime["regime"],coordinator,decision,
-           1 if veto["veto"] else 0,json.dumps(payload,separators=(",",":"))))
+        if enabled("BBB_MARKET_PERSIST_ENABLED"):
+            self.cx.execute("""INSERT INTO agent_council_decisions(
+              session_id,symbol,ts_ms,regime,coordinator_score,decision,veto,payload_json)
+              VALUES(?,?,?,?,?,?,?,?)""",
+              (self.session_id,symbol,int(ts_ms),regime["regime"],coordinator,decision,
+               1 if veto["veto"] else 0,json.dumps(payload,separators=(",",":"))))
+
         return payload
+

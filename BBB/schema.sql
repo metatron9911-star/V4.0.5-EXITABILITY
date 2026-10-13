@@ -1,4 +1,4 @@
-PRAGMA journal_mode=WAL;
+PRAGMA journal_mode=DELETE;
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -163,3 +163,4 @@ CREATE TABLE IF NOT EXISTS agent_council_decisions (
   payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_council_ts ON agent_council_decisions(session_id,ts_ms);
+
