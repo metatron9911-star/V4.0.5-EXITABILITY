@@ -166,6 +166,17 @@ async def main():
             cx.commit()
         except Exception as e:
             print("BBB_WIN_DNA_V4_FAILED",repr(e),flush=True)
+    if os.getenv("BBB_RUN_COUNCIL_REVIEW_ON_START","0").lower() in {"1","true","yes","on"}:
+        try:
+            from council_daily_review import analyze as analyze_council
+            council_review=analyze_council()
+            print("BBB_COUNCIL_REVIEW "+json.dumps(council_review,separators=(",",":")),flush=True)
+            setmeta(cx,"council_review_tuning_readiness",council_review.get("tuning_readiness",""))
+            setmeta(cx,"council_review_matched",council_review.get("matched",0))
+            setmeta(cx,"council_review_signal_precision",council_review.get("signal_precision",""))
+            cx.commit()
+        except Exception as e:
+            print("BBB_COUNCIL_REVIEW_FAILED",repr(e),flush=True)
     old=dict(cx.execute("SELECT key,value FROM meta").fetchall()).get("session_id")
     requested_session=os.getenv("BBB_SESSION_ID") or old or str(uuid.uuid4())
     # Never mix two runtime boots into the same paper accounting session. If the
