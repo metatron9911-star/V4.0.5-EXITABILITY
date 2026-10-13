@@ -150,7 +150,7 @@ class BrokerCouncil:
             key=(symbol,decision)
             last=self.last_persist[key]
             important=stage!="IDLE" and decision in {"SUPPORT","VETO","REJECT"}
-            if important and int(ts_ms)-last>=2000:
+            if important and int(ts_ms)-last>=10000:
                 compact={
                   "stage":stage,"regime":regime["regime"],"weights":regime["weights"],
                   "votes":{k:{"score":v["score"],"confidence":v["confidence"]} for k,v in votes.items()},
