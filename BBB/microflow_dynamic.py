@@ -261,6 +261,14 @@ class MicroFlowDynamic:
             "frame":f,"scores":scores
         })
 
+    def _compact_episode_payload(self,frames):
+        if not frames:return {"frames":[]}
+        keep=sorted(set([0,len(frames)//5,2*len(frames)//5,3*len(frames)//5,4*len(frames)//5,len(frames)-1]))
+        fields=("ts","mid","bid","ask","spread","imb","ret250","ret1",
+                "250_flow","1s_flow","250_total_usd","1s_total_usd",
+                "250_sell_share","1s_sell_share","bid5_d250","ask5_d250","imb_d250")
+        return {"frames":[{k:frames[i].get(k) for k in fields if k in frames[i]} for i in keep]}
+
     def _update_pending(self,symbol,f):
         remain=[]
         for ep in self.pending:
@@ -280,7 +288,8 @@ class MicroFlowDynamic:
             if f["ts"]<ep.deadline_ms:
                 remain.append(ep);continue
             if ep.outcome_label is None:ep.outcome_label="NEUTRAL"
-            if enabled("BBB_MARKET_PERSIST_ENABLED"):
+            if enabled("BBB_RESEARCH_PERSIST_ENABLED"):
+                compact_payload=self._compact_episode_payload(ep.frames)
                 self.cx.execute("""INSERT INTO microflow_episodes(
                   session_id,symbol,shock_ms,decision_ms,completed_ms,decision_stage,outcome_label,
                   first_touch_ms,entry_ask,exit_probe_bid,max_favorable_bps,max_adverse_bps,
@@ -289,7 +298,7 @@ class MicroFlowDynamic:
                   (self.session_id,ep.symbol,ep.shock_ms,ep.decision_ms,f["ts"],ep.decision_stage,
                    ep.outcome_label,ep.first_touch_ms,ep.entry_ask,ep.exit_probe_bid,ep.max_fav_bps,
                    ep.max_adv_bps,ep.shock_score,ep.absorb_score,ep.turn_score,ep.dynamic_score,
-                   json.dumps({"frames":ep.frames},separators=(",",":"))))
+                   json.dumps(compact_payload,separators=(",",":"))))
             self.counts["labeled"]+=1
             self.counts["wins"]+=1 if ep.outcome_label=="WIN" and ep.decision_stage=="SIGNAL" else 0
             self.counts["losses"]+=1 if ep.outcome_label=="LOSS" and ep.decision_stage=="SIGNAL" else 0
@@ -311,6 +320,7 @@ class MicroFlowDynamic:
           "microflow_labeled":self.counts["labeled"],
           "microflow_signal_wins":self.counts["wins"],
           "microflow_signal_losses":self.counts["losses"],
+          "research_persist_enabled":"1" if enabled("BBB_RESEARCH_PERSIST_ENABLED") else "0",
           "council_support":self.counts["council_support"],
           "council_veto":self.counts["council_veto"],
           "council_reject":self.counts["council_reject"],
