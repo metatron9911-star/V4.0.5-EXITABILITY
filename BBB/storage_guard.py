@@ -150,8 +150,8 @@ class StorageGuard:
     def install(self, cx):
         prior = cx.execute("SELECT value FROM meta WHERE key='storage_guard_state'").fetchone()
         self.active = bool(prior and prior[0] == "STORAGE_GUARD_ACTIVE")
-        # DELETE journal has no endlessly growing WAL under dashboard readers.
-        cx.execute("PRAGMA journal_mode=DELETE")
+        # Observe existing journal mode; never checkpoint/clear/switch a live WAL here.
+        self.journal_mode = cx.execute("PRAGMA journal_mode").fetchone()[0]
         cx.execute("PRAGMA busy_timeout=1000")
         page_size = cx.execute("PRAGMA page_size").fetchone()[0]
         cx.execute(f"PRAGMA max_page_count={128_000_000 // page_size}")
@@ -227,6 +227,7 @@ class StorageGuard:
             "storage_housekeeping_runs": str(self.housekeeping_runs),
             "storage_temp_removed_bytes": str(self.temp_removed_bytes),
             "storage_scan_error": str(self.last_scan_error or "NONE"),
+            "storage_journal_mode": str(getattr(self, "journal_mode", "UNKNOWN")),
             "storage_measurement_scope": "FILES_AND_MOUNT; RAILWAY_SERVICE_DISK_IS_SEPARATE",
             "storage_warning_bytes": str(WARNING_BYTES),
             "storage_hard_stop_bytes": str(HARD_BYTES),
