@@ -6,10 +6,14 @@ from pathlib import Path
 
 TABLES = ("events", "trades", "wallet_ledger", "equity_samples",
           "feature_samples", "microflow_episodes", "agent_council_decisions")
+RESEARCH_TABLES = {"microflow_episodes", "agent_council_decisions"}
 WARNING_BYTES = 150_000_000
 HARD_BYTES = 250_000_000
+RESEARCH_SOFT_BYTES = 25_000_000
 ROW_CAP = 1000
+RESEARCH_ROW_CAP = {"microflow_episodes": 2000, "agent_council_decisions": 3000}
 PAYLOAD_CAP = 16_384
+RESEARCH_PAYLOAD_CAP = 12_288
 
 def enabled(name):
     return os.getenv(name, "0").lower() in {"1", "true", "yes", "on"}
@@ -18,6 +22,7 @@ class StorageGuard:
     def __init__(self, directory):
         self.directory = Path(directory)
         self.requested = enabled("BBB_MARKET_PERSIST_ENABLED")
+        self.research_requested = enabled("BBB_RESEARCH_PERSIST_ENABLED")
         self.active = False
         self.used_bytes = 0
 
@@ -37,6 +42,12 @@ class StorageGuard:
         self.scan()
         return int(self.requested and not self.active)
 
+    def allow_research(self):
+        if not self.research_requested:
+            return 0
+        self.scan()
+        return int(self.research_requested and not self.active and self.used_bytes < RESEARCH_SOFT_BYTES)
+
     def install(self, cx):
         prior = cx.execute("SELECT value FROM meta WHERE key='storage_guard_state'").fetchone()
         self.active = bool(prior and prior[0] == "STORAGE_GUARD_ACTIVE")
@@ -46,25 +57,33 @@ class StorageGuard:
         page_size = cx.execute("PRAGMA page_size").fetchone()[0]
         cx.execute(f"PRAGMA max_page_count={128_000_000 // page_size}")
         cx.create_function("bbb_market_allowed", 0, self.allow)
+        cx.create_function("bbb_research_allowed", 0, self.allow_research)
         cx.create_function("bbb_trade_allowed", 0,
                            lambda: int(enabled("BBB_ROCKET_ENTRY_ENABLED") or
                                        enabled("BBB_MARKET_DNA_ENTRY_ENABLED")))
         for table in TABLES:
             columns = {r[1] for r in cx.execute(f"PRAGMA table_info({table})")}
-            conditions = ["bbb_market_allowed()=0"]
+            if table in RESEARCH_TABLES:
+                conditions = ["bbb_research_allowed()=0"]
+                row_cap = RESEARCH_ROW_CAP[table]
+                payload_cap = RESEARCH_PAYLOAD_CAP
+            else:
+                conditions = ["bbb_market_allowed()=0"]
+                row_cap = ROW_CAP
+                payload_cap = PAYLOAD_CAP
             if table in {"trades", "wallet_ledger"}:
                 conditions.append("bbb_trade_allowed()=0")
             if "payload_json" in columns:
-                conditions.append(f"length(CAST(NEW.payload_json AS BLOB))>{PAYLOAD_CAP}")
+                conditions.append(f"length(CAST(NEW.payload_json AS BLOB))>{payload_cap}")
             if "entry_features_json" in columns:
-                conditions.append(f"length(CAST(NEW.entry_features_json AS BLOB))>{PAYLOAD_CAP}")
+                conditions.append(f"length(CAST(NEW.entry_features_json AS BLOB))>{payload_cap}")
             cx.execute(f"""CREATE TRIGGER IF NOT EXISTS bounded_{table}_insert
                 BEFORE INSERT ON {table} WHEN {' OR '.join(conditions)}
                 BEGIN SELECT RAISE(IGNORE); END""")
             cx.execute(f"""CREATE TRIGGER IF NOT EXISTS bounded_{table}_rows
                 AFTER INSERT ON {table} BEGIN
                 DELETE FROM {table} WHERE id IN
-                  (SELECT id FROM {table} ORDER BY id DESC LIMIT -1 OFFSET {ROW_CAP});
+                  (SELECT id FROM {table} ORDER BY id DESC LIMIT -1 OFFSET {row_cap});
                 END""")
             cx.execute(f"""CREATE TRIGGER IF NOT EXISTS bounded_{table}_update
                 BEFORE UPDATE ON {table} WHEN {' OR '.join(conditions)}
@@ -81,13 +100,15 @@ class StorageGuard:
         state = "STORAGE_GUARD_ACTIVE" if self.active else (
             "STORAGE_WARNING" if self.used_bytes >= WARNING_BYTES else "OK")
         values = {
-            "storage_mode": "BOUNDED" if self.requested else "CORE_ONLY",
+            "storage_mode": "BOUNDED" if self.requested else ("CORE+RESEARCH" if self.research_requested else "CORE_ONLY"),
             "market_persist_enabled": str(int(self.requested and not self.active)),
+            "research_persist_enabled": str(int(self.research_requested and not self.active and self.used_bytes < RESEARCH_SOFT_BYTES)),
             "storage_guard_state": state,
             "storage_used_bytes": str(self.used_bytes),
             "storage_warning_bytes": str(WARNING_BYTES),
             "storage_hard_stop_bytes": str(HARD_BYTES),
-            "retention_policy": "ALL_SESSIONS_MAX_1000_ROWS_PER_TABLE; PAYLOAD_MAX_16KiB",
+            "research_soft_stop_bytes": str(RESEARCH_SOFT_BYTES),
+            "retention_policy": "MARKET_OFF; RESEARCH microflow<=2000 council<=3000; RESEARCH_PAYLOAD<=12KiB",
             "live_submission_enabled": "0",
         }
         for k, v in values.items():
