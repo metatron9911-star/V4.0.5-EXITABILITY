@@ -109,6 +109,7 @@ class MicroFlowDynamic:
         self.pending:list[PendingEpisode]=[]
         self.last_step=defaultdict(int)
         self.counts=defaultdict(int)
+        self.signal_handler=None
         from broker_council import BrokerCouncil
         self.council=BrokerCouncil(cx,session_id)
 
@@ -425,6 +426,11 @@ class MicroFlowDynamic:
             alive=(f["ret250"]>=0 and f["250_flow"]>=0 and scores["spread_z"]<2.0)
             st.confirm_frames=st.confirm_frames+1 if alive else 0
             if st.confirm_frames>=2:
+                if self.signal_handler is not None:
+                    try:
+                        self.signal_handler(symbol,f,book,getattr(book,"exchange_ts_ms",0),council)
+                    except Exception as e:
+                        print("COMMITTEE_SIGNAL_HANDLER_FAILED",repr(e),flush=True)
                 self._finalize_decision(symbol,"SIGNAL",f,scores,"TWO_FRAME_REVERSAL_CONFIRM")
 
         self._publish_meta()
