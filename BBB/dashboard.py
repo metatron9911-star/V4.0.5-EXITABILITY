@@ -46,11 +46,11 @@ def board():
     st.caption(f"Selector: {meta.get('market_dna_selector','T5>=203 & ACTIVITY>=117.02 & D10_T5>=63')} · Exit: {meta.get('market_dna_exit','TP80bps_STOP30bps_TIMEOUT20s')}")
 
     if meta.get("committee_paper_enabled","0")=="1":
-        st.subheader("Expert Committee V1 — PAPER")
-        c_closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state='COMMITTEE_V1'",(session,)).fetchone()[0]
-        c_wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state='COMMITTEE_V1' AND net_pnl_usd>0",(session,)).fetchone()[0]
+        st.subheader("Expert Committee — PAPER")
+        c_closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state LIKE 'COMMITTEE_V%'",(session,)).fetchone()[0]
+        c_wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state LIKE 'COMMITTEE_V%' AND net_pnl_usd>0",(session,)).fetchone()[0]
         c_losses=c_closed-c_wins
-        c_open=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='OPEN' AND risk_state='COMMITTEE_V1'",(session,)).fetchone()[0]
+        c_open=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='OPEN' AND risk_state LIKE 'COMMITTEE_V%'",(session,)).fetchone()[0]
         c_wr=100*c_wins/c_closed if c_closed else 0.0
         cc=st.columns(8)
         cc[0].metric("Committee","ON")
@@ -61,11 +61,11 @@ def board():
         cc[5].metric("Fees $",f"{float(meta.get('committee_fees_usd','0') or 0):.4f}")
         cc[6].metric("Open",c_open)
         cc[7].metric("Approved / Signals",f"{meta.get('committee_approved','0')} / {meta.get('committee_signals','0')}")
-        st.caption(f"Experts: IMPULSE 40% · ABSORPTION 30% · TAPE 20% · BOOK 10% · absolute RISK VETO · {meta.get('committee_selector','')}")
+        st.caption(f"Experts: IMPULSE 40% · ABSORPTION 30% · TAPE 20% · BOOK 10% · V2 hard-veto envelope · absolute RISK VETO · {meta.get('committee_selector','')}")
         st.caption(f"Exit: {meta.get('committee_exit','')}")
         ctr=db.execute("""SELECT symbol,status,entry_vwap,exit_vwap,net_pnl_usd,exit_reason,
                                  hold_ms,notional_usd,entry_features_json
-                          FROM trades WHERE session_id=? AND risk_state='COMMITTEE_V1'
+                          FROM trades WHERE session_id=? AND risk_state LIKE 'COMMITTEE_V%'
                           ORDER BY id DESC LIMIT 50""",(session,)).fetchall()
         crep=[]
         for r in ctr:
