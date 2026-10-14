@@ -269,6 +269,15 @@ async def main():
     microflow=MicroFlowDynamic(cx,session)
     microflow_enabled=os.getenv("BBB_MICROFLOW_SHADOW_ENABLED","1").lower() in {"1","true","yes","on"}
     setmeta(cx,"microflow_shadow_enabled","1" if microflow_enabled else "0")
+    committee_enabled=os.getenv("BBB_COMMITTEE_PAPER_ENABLED","0").lower() in {"1","true","yes","on"}
+    committee=None
+    if committee_enabled:
+        from committee_paper import ExpertCommitteePaper
+        committee=ExpertCommitteePaper(cx,session,float(os.getenv("BBB_PAPER_START_USD","500")))
+        microflow.signal_handler=committee.on_microflow_signal
+        setmeta(cx,"active_strategy","COMMITTEE_V1")
+        setmeta(cx,"strategy_mode","COMMITTEE_V1_PAPER")
+    setmeta(cx,"committee_paper_enabled","1" if committee_enabled else "0")
     source_ages=deque(maxlen=10000); processing=deque(maxlen=10000)
     last_sample=defaultdict(int); last_market_sample=defaultdict(int); dropped=0
     feature_persist_ms=int(os.getenv("BBB_FEATURE_PERSIST_MS","1000"))
@@ -321,6 +330,8 @@ async def main():
                 if microflow_enabled:
                     microflow.on_book(symbol,bts,books[symbol])
                     microflow.maybe_step(symbol,bts,books[symbol])
+                if committee is not None:
+                    committee.on_tick(symbol,books[symbol])
 
             # Do not persist every exchange message: Bybit can emit thousands/sec.
             # Keep a lightweight sampled evidence trail; latency counters remain in memory/meta.
