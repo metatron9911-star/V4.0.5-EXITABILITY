@@ -1,10 +1,11 @@
 """BBB expert committee PAPER trader.
 
-Research/PAPER only. No private Bybit API and no live order submission.
+Two frozen research profiles:
+- Variant 1: strict forward-test profile.
+- Variant 2: historical WIN-envelope experiment. On the original 37 V1 trades,
+  AGREEMENT window + FLOW1S window retained 5/5 WIN and 3/32 LOSS.
 
-Entry is allowed only after a completed microflow SIGNAL and a separate
-multi-agent committee decision. Execution is emulated against the current L50
-book using VWAP and Bybit innovation taker fees.
+PAPER only. No private Bybit API and no live order submission.
 """
 from __future__ import annotations
 import json, os, uuid
@@ -14,25 +15,27 @@ from engine import now_ms, BYBIT_FEES, ProductClass
 TP_BPS=float(os.getenv("BBB_COMMITTEE_TP_BPS","80"))
 SL_BPS=float(os.getenv("BBB_COMMITTEE_SL_BPS","30"))
 TIMEOUT_MS=int(os.getenv("BBB_COMMITTEE_TIMEOUT_MS","20000"))
-POSITION_FRACTION=float(os.getenv("BBB_COMMITTEE_POSITION_FRACTION","0.05"))
+POSITION_FRACTION=float(os.getenv("BBB_COMMITTEE_POSITION_FRACTION","0.20"))
 MAX_OPEN=int(os.getenv("BBB_COMMITTEE_MAX_OPEN","2"))
 COOLDOWN_MS=int(os.getenv("BBB_COMMITTEE_COOLDOWN_MS","20000"))
-
-# Evidence-informed V1 thresholds from overnight matched WIN/LOSS review.
-IMPULSE_MIN=float(os.getenv("BBB_COMMITTEE_IMPULSE_MIN","0.45"))
-ABSORPTION_MIN=float(os.getenv("BBB_COMMITTEE_ABSORPTION_MIN","0.20"))
-TAPE_MIN=float(os.getenv("BBB_COMMITTEE_TAPE_MIN","0.30"))
-BOOK_MIN=float(os.getenv("BBB_COMMITTEE_BOOK_MIN","-0.05"))
-WEIGHTED_MIN=float(os.getenv("BBB_COMMITTEE_WEIGHTED_MIN","0.40"))
-AGREEMENT_MIN=float(os.getenv("BBB_COMMITTEE_AGREEMENT_MIN","0.69"))
-DISPERSION_MAX=float(os.getenv("BBB_COMMITTEE_DISPERSION_MAX","0.61"))
-RET250_MIN=float(os.getenv("BBB_COMMITTEE_RET250_MIN","1.5"))
-RET250_MAX=float(os.getenv("BBB_COMMITTEE_RET250_MAX","10.5"))
-RET1_MIN=float(os.getenv("BBB_COMMITTEE_RET1_MIN","-2.0"))
-RET1_MAX=float(os.getenv("BBB_COMMITTEE_RET1_MAX","14.0"))
-SPREAD_MAX=float(os.getenv("BBB_COMMITTEE_SPREAD_MAX","7.0"))
-IMB_MIN=float(os.getenv("BBB_COMMITTEE_IMB_MIN","0.15"))
+VARIANT=str(os.getenv("BBB_COMMITTEE_VARIANT","1")).strip()
 ALLOWED_REGIMES={"ACTIVE","QUIET"}
+
+VARIANT_1={
+  "impulse_min":0.48,"absorption_min":0.20,"tape_min":0.32,"book_min":0.25,
+  "weighted_min":0.42,"agreement_min":0.69,"dispersion_max":0.61,
+  "ret250_min":1.5,"ret250_max":10.5,"ret1_min":-2.0,"ret1_max":14.0,
+  "spread_max":7.0,"imb_min":0.15,
+}
+
+VARIANT_2={
+  "impulse_min":0.45,"absorption_min":0.20,"tape_min":0.30,"book_min":-0.05,
+  "weighted_min":0.40,
+  "agreement_lo":0.6983031332207035,
+  "agreement_hi":0.8677086708817653,
+  "flow1s_lo":-0.2277099099360245,
+  "flow1s_hi":1.0,
+}
 
 class ExpertCommitteePaper:
     def __init__(self,cx,session_id,start_usd=500.0):
@@ -44,26 +47,46 @@ class ExpertCommitteePaper:
         self.positions:Dict[str,dict]={}
         self.cooldown_until:Dict[str,int]={}
         self.signals=0; self.approved=0; self.rejected=0
+        self.variant="2" if VARIANT=="2" else "1"
+        self.strategy_name=f"COMMITTEE_VARIANT_{self.variant}"
         self._meta()
+
+    def _selector_text(self):
+        if self.variant=="2":
+            p=VARIANT_2
+            return (
+              "VARIANT2 HISTORICAL_5WIN_3LOSS; REGIME ACTIVE|QUIET; VETO=0; "
+              f"IMPULSE>={p['impulse_min']}; ABSORPTION>={p['absorption_min']}; "
+              f"TAPE>={p['tape_min']}; BOOK>={p['book_min']}; WEIGHTED>={p['weighted_min']}; "
+              f"AGREEMENT={p['agreement_lo']:.6f}..{p['agreement_hi']:.6f}; "
+              f"FLOW1S={p['flow1s_lo']:.6f}..{p['flow1s_hi']:.1f}"
+            )
+        p=VARIANT_1
+        return (
+          "VARIANT1 STRICT_FORWARD; REGIME ACTIVE|QUIET; VETO=0; "
+          f"IMPULSE>={p['impulse_min']}; ABSORPTION>={p['absorption_min']}; "
+          f"TAPE>={p['tape_min']}; BOOK>={p['book_min']}; WEIGHTED>={p['weighted_min']}; "
+          f"AGREE>={p['agreement_min']}; DISP<={p['dispersion_max']}; "
+          f"RET250={p['ret250_min']}..{p['ret250_max']}; RET1={p['ret1_min']}..{p['ret1_max']}; "
+          f"SPREAD<={p['spread_max']}; IMB>={p['imb_min']}"
+        )
 
     def _meta(self):
         vals={
-          "active_strategy":"COMMITTEE_V2",
+          "active_strategy":self.strategy_name,
+          "committee_variant":self.variant,
           "committee_paper_enabled":"1",
           "committee_cash_usd":f"{self.cash:.8f}",
+          "committee_start_usd":f"{self.start_usd:.8f}",
+          "committee_position_fraction":f"{POSITION_FRACTION:.6f}",
+          "committee_stake_basis":"CURRENT_WORKING_CASH",
           "committee_realized_usd":f"{self.realized:.8f}",
           "committee_fees_usd":f"{self.fees:.8f}",
           "committee_open_positions":str(len(self.positions)),
           "committee_signals":str(self.signals),
           "committee_approved":str(self.approved),
           "committee_rejected":str(self.rejected),
-          "committee_selector":(
-            f"REGIME ACTIVE|QUIET; VETO=0; IMPULSE>={IMPULSE_MIN}; "
-            f"ABSORPTION>={ABSORPTION_MIN}; TAPE>={TAPE_MIN}; "
-            f"BOOK>={BOOK_MIN}; WEIGHTED>={WEIGHTED_MIN}; AGREE>={AGREEMENT_MIN}; "
-            f"DISP<={DISPERSION_MAX}; RET250={RET250_MIN}..{RET250_MAX}; "
-            f"RET1={RET1_MIN}..{RET1_MAX}; SPREAD<={SPREAD_MAX}; IMB>={IMB_MIN}"
-          ),
+          "committee_selector":self._selector_text(),
           "committee_exit":f"TP{TP_BPS:g}bps_STOP{SL_BPS:g}bps_TIMEOUT{TIMEOUT_MS/1000:g}s",
           "committee_execution_mode":"LIVE_WS_L50_VWAP_PAPER",
           "live_submission_enabled":"0",
@@ -90,29 +113,48 @@ class ExpertCommitteePaper:
         dispersion=float(council.get("dispersion") or 99.0)
         ret250=float(frame.get("ret250") or 0.0)
         ret1=float(frame.get("ret1") or 0.0)
+        flow1s=float(frame.get("flow1s") or 0.0)
         spread=float(frame.get("spread") or 999.0)
         imb=float(frame.get("imb") or 0.0)
-        checks={
-          "REGIME":regime in ALLOWED_REGIMES,
-          "NO_VETO":not veto,
-          "IMPULSE":impulse>=IMPULSE_MIN,
-          "ABSORPTION":absorption>=ABSORPTION_MIN,
-          "TAPE":tape>=TAPE_MIN,
-          "BOOK":book>=BOOK_MIN,
-          "WEIGHTED":weighted>=WEIGHTED_MIN,
-          "AGREEMENT":agreement>=AGREEMENT_MIN,
-          "DISPERSION":dispersion<=DISPERSION_MAX,
-          "RET250_WINDOW":RET250_MIN<=ret250<=RET250_MAX,
-          "RET1_WINDOW":RET1_MIN<=ret1<=RET1_MAX,
-          "SPREAD":spread<=SPREAD_MAX,
-          "IMBALANCE":imb>=IMB_MIN,
-        }
+
+        if self.variant=="2":
+            p=VARIANT_2
+            checks={
+              "REGIME":regime in ALLOWED_REGIMES,
+              "NO_VETO":not veto,
+              "IMPULSE":impulse>=p["impulse_min"],
+              "ABSORPTION":absorption>=p["absorption_min"],
+              "TAPE":tape>=p["tape_min"],
+              "BOOK":book>=p["book_min"],
+              "WEIGHTED":weighted>=p["weighted_min"],
+              "AGREEMENT_ENVELOPE":p["agreement_lo"]<=agreement<=p["agreement_hi"],
+              "FLOW1S_ENVELOPE":p["flow1s_lo"]<=flow1s<=p["flow1s_hi"],
+            }
+        else:
+            p=VARIANT_1
+            checks={
+              "REGIME":regime in ALLOWED_REGIMES,
+              "NO_VETO":not veto,
+              "IMPULSE":impulse>=p["impulse_min"],
+              "ABSORPTION":absorption>=p["absorption_min"],
+              "TAPE":tape>=p["tape_min"],
+              "BOOK":book>=p["book_min"],
+              "WEIGHTED":weighted>=p["weighted_min"],
+              "AGREEMENT":agreement>=p["agreement_min"],
+              "DISPERSION":dispersion<=p["dispersion_max"],
+              "RET250_WINDOW":p["ret250_min"]<=ret250<=p["ret250_max"],
+              "RET1_WINDOW":p["ret1_min"]<=ret1<=p["ret1_max"],
+              "SPREAD":spread<=p["spread_max"],
+              "IMBALANCE":imb>=p["imb_min"],
+            }
+
         return all(checks.values()),{
-          "regime":regime,"veto":veto,"impulse":impulse,"absorption":absorption,
-          "tape":tape,"book":book,"weighted":weighted,"checks":checks,
+          "variant":self.variant,"regime":regime,"veto":veto,
+          "impulse":impulse,"absorption":absorption,"tape":tape,"book":book,
+          "weighted":weighted,"checks":checks,
           "coordinator_score":council.get("coordinator_score"),
           "agreement":agreement,"dispersion":dispersion,
-          "ret250":ret250,"ret1":ret1,"spread":spread,"imb":imb
+          "ret250":ret250,"ret1":ret1,"flow1s":flow1s,"spread":spread,"imb":imb
         }
 
     def on_microflow_signal(self,symbol,f,book,exchange_ts_ms,council):
@@ -124,7 +166,8 @@ class ExpertCommitteePaper:
             detail["capacity_block"]=True
         if not ok:
             self.rejected+=1; self._meta(); return False
-        notional=min(self.start_usd*POSITION_FRACTION,self.cash*0.95)
+
+        notional=self.cash*POSITION_FRACTION
         if notional<1:
             self.rejected+=1; self._meta(); return False
         vwap,filled=book.walk_vwap("BUY",notional)
@@ -140,11 +183,12 @@ class ExpertCommitteePaper:
           "position_id":pid,"entry_vwap":float(vwap),"notional":notional,
           "entry_fee":fee,"opened_ms":now,"detail":detail
         }
-        features={"committee_v1":detail,"microflow":{
+        features={"committee":detail,"committee_v1":detail,"microflow":{
           "mid":f.get("mid"),"ret250":f.get("ret250"),"ret1":f.get("ret1"),
           "flow250":f.get("250_flow"),"flow1s":f.get("1s_flow"),
           "imb":f.get("imb"),"spread":f.get("spread")
         }}
+        gate=VARIANT_2["weighted_min"] if self.variant=="2" else VARIANT_1["weighted_min"]
         self.cx.execute("""INSERT INTO trades(
           session_id,position_id,head,venue,product_class,symbol,side,leverage,margin_usd,notional_usd,
           signal_exchange_ts_ms,receive_ts_ms,signal_ts_ms,order_ts_ms,fill_ts_ms,
@@ -155,7 +199,7 @@ class ExpertCommitteePaper:
           (self.session_id,pid,"VOL","BYBIT","INNOVATION",symbol,"BUY",1.0,notional,notional,
            int(exchange_ts_ms or 0),now,now,now,now,float(f.get("mid") or vwap),
            float(f.get("bid") or vwap),float(f.get("ask") or vwap),float(vwap),float(vwap),fee,
-           0,0,0,float(detail["weighted"]),WEIGHTED_MIN,"COMMITTEE_V2",
+           0,0,0,float(detail["weighted"]),gate,self.strategy_name,
            json.dumps(features,separators=(",",":")),"OPEN",now))
         self.approved+=1; self._meta()
         return True
