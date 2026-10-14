@@ -281,8 +281,8 @@ async def main():
         from committee_paper import ExpertCommitteePaper
         committee=ExpertCommitteePaper(cx,session,float(os.getenv("BBB_PAPER_START_USD","500")))
         microflow.signal_handler=committee.on_microflow_signal
-        setmeta(cx,"active_strategy","COMMITTEE_V1")
-        setmeta(cx,"strategy_mode","COMMITTEE_V1_PAPER")
+        setmeta(cx,"active_strategy",committee.strategy_name)
+        setmeta(cx,"strategy_mode",committee.strategy_name+"_PAPER")
     setmeta(cx,"committee_paper_enabled","1" if committee_enabled else "0")
     source_ages=deque(maxlen=10000); processing=deque(maxlen=10000)
     last_sample=defaultdict(int); last_market_sample=defaultdict(int); dropped=0
