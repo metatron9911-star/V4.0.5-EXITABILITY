@@ -112,6 +112,43 @@ def main():
                        "test_n":len(te),"test_w":tw,"test_l":len(te)-tw,
                        "test_precision":tw/len(te) if te else None})
     out["chronological_single_rules"]=chrono
+    # WIN-envelope search: ranges that retain every observed WIN, ranked by LOSS rejection.
+    wins_all=[x for x in rec if x["label"]=="WIN"]
+    losses_all=[x for x in rec if x["label"]=="LOSS"]
+    envelope_rules=[]
+    for k in feats:
+        wv=[float(x[k]) for x in wins_all if x[k] is not None]
+        if len(wv)!=len(wins_all) or not wv:continue
+        lo,hi=min(wv),max(wv)
+        surv=[x for x in losses_all if x[k] is not None and lo<=float(x[k])<=hi]
+        envelope_rules.append({"feature":k,"lo":lo,"hi":hi,
+                               "wins_kept":len(wins_all),"losses_kept":len(surv),
+                               "losses_rejected":len(losses_all)-len(surv)})
+    envelope_rules=sorted(envelope_rules,key=lambda z:(z["losses_rejected"],-(z["hi"]-z["lo"])),reverse=True)
+    out["win_envelope_single"]=envelope_rules
+    envpairs=[]
+    for a,b in itertools.combinations(envelope_rules[:10],2):
+        surv=[x for x in losses_all
+              if x[a["feature"]] is not None and a["lo"]<=float(x[a["feature"]])<=a["hi"]
+              and x[b["feature"]] is not None and b["lo"]<=float(x[b["feature"]])<=b["hi"]]
+        envpairs.append({"rules":[[a["feature"],a["lo"],a["hi"]],[b["feature"],b["lo"],b["hi"]]],
+                         "wins_kept":len(wins_all),"losses_kept":len(surv),
+                         "losses_rejected":len(losses_all)-len(surv)})
+    out["win_envelope_pairs"]=sorted(envpairs,key=lambda z:(z["losses_rejected"],-z["losses_kept"]),reverse=True)[:15]
+    envtrip=[]
+    for combo in itertools.combinations(envelope_rules[:8],3):
+        surv=[]
+        for x in losses_all:
+            ok=True
+            for a in combo:
+                if x[a["feature"]] is None or not (a["lo"]<=float(x[a["feature"]])<=a["hi"]):
+                    ok=False;break
+            if ok:surv.append(x)
+        envtrip.append({"rules":[[a["feature"],a["lo"],a["hi"]] for a in combo],
+                        "wins_kept":len(wins_all),"losses_kept":len(surv),
+                        "losses_rejected":len(losses_all)-len(surv)})
+    out["win_envelope_triples"]=sorted(envtrip,key=lambda z:(z["losses_rejected"],-z["losses_kept"]),reverse=True)[:15]
+
     # Full rows compactly for exact diagnosis.
     out["trades"]=rec
     cx.close()
