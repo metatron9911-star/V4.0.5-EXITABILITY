@@ -24,6 +24,14 @@ ABSORPTION_MIN=float(os.getenv("BBB_COMMITTEE_ABSORPTION_MIN","0.20"))
 TAPE_MIN=float(os.getenv("BBB_COMMITTEE_TAPE_MIN","0.30"))
 BOOK_MIN=float(os.getenv("BBB_COMMITTEE_BOOK_MIN","-0.05"))
 WEIGHTED_MIN=float(os.getenv("BBB_COMMITTEE_WEIGHTED_MIN","0.40"))
+AGREEMENT_MIN=float(os.getenv("BBB_COMMITTEE_AGREEMENT_MIN","0.69"))
+DISPERSION_MAX=float(os.getenv("BBB_COMMITTEE_DISPERSION_MAX","0.61"))
+RET250_MIN=float(os.getenv("BBB_COMMITTEE_RET250_MIN","1.5"))
+RET250_MAX=float(os.getenv("BBB_COMMITTEE_RET250_MAX","10.5"))
+RET1_MIN=float(os.getenv("BBB_COMMITTEE_RET1_MIN","-2.0"))
+RET1_MAX=float(os.getenv("BBB_COMMITTEE_RET1_MAX","14.0"))
+SPREAD_MAX=float(os.getenv("BBB_COMMITTEE_SPREAD_MAX","7.0"))
+IMB_MIN=float(os.getenv("BBB_COMMITTEE_IMB_MIN","0.15"))
 ALLOWED_REGIMES={"ACTIVE","QUIET"}
 
 class ExpertCommitteePaper:
@@ -40,7 +48,7 @@ class ExpertCommitteePaper:
 
     def _meta(self):
         vals={
-          "active_strategy":"COMMITTEE_V1",
+          "active_strategy":"COMMITTEE_V2",
           "committee_paper_enabled":"1",
           "committee_cash_usd":f"{self.cash:.8f}",
           "committee_realized_usd":f"{self.realized:.8f}",
@@ -52,7 +60,9 @@ class ExpertCommitteePaper:
           "committee_selector":(
             f"REGIME ACTIVE|QUIET; VETO=0; IMPULSE>={IMPULSE_MIN}; "
             f"ABSORPTION>={ABSORPTION_MIN}; TAPE>={TAPE_MIN}; "
-            f"BOOK>={BOOK_MIN}; WEIGHTED>={WEIGHTED_MIN}"
+            f"BOOK>={BOOK_MIN}; WEIGHTED>={WEIGHTED_MIN}; AGREE>={AGREEMENT_MIN}; "
+            f"DISP<={DISPERSION_MAX}; RET250={RET250_MIN}..{RET250_MAX}; "
+            f"RET1={RET1_MIN}..{RET1_MAX}; SPREAD<={SPREAD_MAX}; IMB>={IMB_MIN}"
           ),
           "committee_exit":f"TP{TP_BPS:g}bps_STOP{SL_BPS:g}bps_TIMEOUT{TIMEOUT_MS/1000:g}s",
           "committee_execution_mode":"LIVE_WS_L50_VWAP_PAPER",
@@ -75,6 +85,13 @@ class ExpertCommitteePaper:
         tape=self._vote(council,"TAPE")
         book=self._vote(council,"BOOK")
         weighted=.40*impulse+.30*absorption+.20*tape+.10*book
+        frame=council.get("frame") or {}
+        agreement=float(council.get("agreement") or 0.0)
+        dispersion=float(council.get("dispersion") or 99.0)
+        ret250=float(frame.get("ret250") or 0.0)
+        ret1=float(frame.get("ret1") or 0.0)
+        spread=float(frame.get("spread") or 999.0)
+        imb=float(frame.get("imb") or 0.0)
         checks={
           "REGIME":regime in ALLOWED_REGIMES,
           "NO_VETO":not veto,
@@ -83,12 +100,19 @@ class ExpertCommitteePaper:
           "TAPE":tape>=TAPE_MIN,
           "BOOK":book>=BOOK_MIN,
           "WEIGHTED":weighted>=WEIGHTED_MIN,
+          "AGREEMENT":agreement>=AGREEMENT_MIN,
+          "DISPERSION":dispersion<=DISPERSION_MAX,
+          "RET250_WINDOW":RET250_MIN<=ret250<=RET250_MAX,
+          "RET1_WINDOW":RET1_MIN<=ret1<=RET1_MAX,
+          "SPREAD":spread<=SPREAD_MAX,
+          "IMBALANCE":imb>=IMB_MIN,
         }
         return all(checks.values()),{
           "regime":regime,"veto":veto,"impulse":impulse,"absorption":absorption,
           "tape":tape,"book":book,"weighted":weighted,"checks":checks,
           "coordinator_score":council.get("coordinator_score"),
-          "agreement":council.get("agreement"),"dispersion":council.get("dispersion")
+          "agreement":agreement,"dispersion":dispersion,
+          "ret250":ret250,"ret1":ret1,"spread":spread,"imb":imb
         }
 
     def on_microflow_signal(self,symbol,f,book,exchange_ts_ms,council):
@@ -131,7 +155,7 @@ class ExpertCommitteePaper:
           (self.session_id,pid,"VOL","BYBIT","INNOVATION",symbol,"BUY",1.0,notional,notional,
            int(exchange_ts_ms or 0),now,now,now,now,float(f.get("mid") or vwap),
            float(f.get("bid") or vwap),float(f.get("ask") or vwap),float(vwap),float(vwap),fee,
-           0,0,0,float(detail["weighted"]),WEIGHTED_MIN,"COMMITTEE_V1",
+           0,0,0,float(detail["weighted"]),WEIGHTED_MIN,"COMMITTEE_V2",
            json.dumps(features,separators=(",",":")),"OPEN",now))
         self.approved+=1; self._meta()
         return True
