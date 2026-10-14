@@ -177,6 +177,12 @@ async def main():
             cx.commit()
         except Exception as e:
             print("BBB_COUNCIL_REVIEW_FAILED",repr(e),flush=True)
+    if os.getenv("BBB_RUN_COMMITTEE_TRADE_REVIEW_ON_START","0").lower() in {"1","true","yes","on"}:
+        try:
+            import committee_trade_review
+            committee_trade_review.main()
+        except Exception as e:
+            print("BBB_COMMITTEE_TRADE_REVIEW_FAILED",repr(e),flush=True)
     old=dict(cx.execute("SELECT key,value FROM meta").fetchall()).get("session_id")
     requested_session=os.getenv("BBB_SESSION_ID") or old or str(uuid.uuid4())
     # Never mix two runtime boots into the same paper accounting session. If the
