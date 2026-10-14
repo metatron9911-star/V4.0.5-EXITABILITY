@@ -159,7 +159,8 @@ class StorageGuard:
         cx.create_function("bbb_research_allowed", 0, self.allow_research)
         cx.create_function("bbb_trade_allowed", 0,
                            lambda: int(enabled("BBB_ROCKET_ENTRY_ENABLED") or
-                                       enabled("BBB_MARKET_DNA_ENTRY_ENABLED")))
+                                       enabled("BBB_MARKET_DNA_ENTRY_ENABLED") or
+                                       enabled("BBB_COMMITTEE_PAPER_ENABLED")))
         for table in TABLES:
             # Rebuild guards on every boot so a mode change (CORE_ONLY -> bounded research)
             # cannot be blocked by stale trigger definitions from the prior deployment.
@@ -172,7 +173,7 @@ class StorageGuard:
                 row_cap = RESEARCH_ROW_CAP[table]
                 payload_cap = RESEARCH_PAYLOAD_CAP
             else:
-                conditions = ["bbb_market_allowed()=0"]
+                conditions = [] if table in {"trades", "wallet_ledger"} else ["bbb_market_allowed()=0"]
                 row_cap = ROW_CAP
                 payload_cap = PAYLOAD_CAP
             if table in {"trades", "wallet_ledger"}:
@@ -234,6 +235,7 @@ class StorageGuard:
             "research_soft_stop_bytes": str(RESEARCH_SOFT_BYTES),
             "retention_policy": "MARKET_OFF; RESEARCH microflow<=2000 council<=3000; RESEARCH_PAYLOAD<=12KiB",
             "live_submission_enabled": "0",
+            "committee_paper_enabled": str(int(enabled("BBB_COMMITTEE_PAPER_ENABLED"))),
         }
         for k, v in values.items():
             cx.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (k, v))
