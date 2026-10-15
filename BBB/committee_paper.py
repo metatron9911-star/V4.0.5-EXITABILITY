@@ -165,18 +165,25 @@ class ExpertCommitteePaper:
             ok=False
             detail["capacity_block"]=True
         if not ok:
-            self.rejected+=1; self._meta(); return False
+            self.rejected+=1; self._meta()
+            return {"approved":False,"detail":detail,"strategy":self.strategy_name}
 
         notional=self.cash*POSITION_FRACTION
         if notional<1:
-            self.rejected+=1; self._meta(); return False
+            self.rejected+=1; self._meta()
+            detail["execution_block"]="NOTIONAL_LT_1"
+            return {"approved":False,"detail":detail,"strategy":self.strategy_name}
         vwap,filled=book.walk_vwap("BUY",notional)
         if not vwap or filled<notional*.999:
-            self.rejected+=1; self._meta(); return False
+            self.rejected+=1; self._meta()
+            detail["execution_block"]="INSUFFICIENT_L50"
+            return {"approved":False,"detail":detail,"strategy":self.strategy_name}
         fee_bps=BYBIT_FEES[ProductClass.INNOVATION].taker_bps
         fee=notional*fee_bps/10000.0
         if self.cash<notional+fee:
-            self.rejected+=1; self._meta(); return False
+            self.rejected+=1; self._meta()
+            detail["execution_block"]="INSUFFICIENT_CASH"
+            return {"approved":False,"detail":detail,"strategy":self.strategy_name}
         pid=str(uuid.uuid4())
         self.cash-=notional+fee; self.fees+=fee
         self.positions[symbol]={
@@ -202,7 +209,8 @@ class ExpertCommitteePaper:
            0,0,0,float(detail["weighted"]),gate,self.strategy_name,
            json.dumps(features,separators=(",",":")),"OPEN",now))
         self.approved+=1; self._meta()
-        return True
+        return {"approved":True,"detail":detail,"strategy":self.strategy_name,
+                "paper_entry_vwap":float(vwap),"paper_notional":float(notional)}
 
     def _close(self,symbol,reason,book):
         p=self.positions.get(symbol)
