@@ -112,6 +112,7 @@ def parse(row):
     out={
       "decision_ms":int(ts),"symbol":sym,"stage":stage,"label":label or "NULL",
       "entry_ask":fnum(p.get("entry_ask")),"decision_mid":fnum(p.get("decision_mid")),
+      "collector_epoch_ms":p.get("collector_epoch_ms"),"signal_seq":p.get("signal_seq"),
       "mfe_bps":fnum(mfe),"mae_bps":fnum(mae),
       "shock_score":fnum(shock),"absorb_score":fnum(absorb),
       "turn_score":fnum(turn),"dynamic_score":fnum(dynamic),
@@ -152,6 +153,21 @@ def parse(row):
         out["economic_label"]="ECON_NEUTRAL"
     return out
 
+
+def dedupe_signal_rows(rows,window_ms=30_000):
+    """One representative per symbol per 30s bucket for modelling only.
+
+    Raw episodes remain untouched. This prevents one continuing move from
+    contributing multiple near-identical training examples.
+    """
+    seen=set(); out=[]
+    for r in rows:
+        bucket=int(r["decision_ms"]//window_ms)
+        key=(r["symbol"],bucket)
+        if key in seen:continue
+        seen.add(key); out.append(r)
+    return out
+
 def match_losses(win,losses,k=3):
     # First choice: same regime + same spread bucket + +/-30m.
     levels=[
@@ -176,6 +192,8 @@ def main():
       "min_decision_ms":MIN_TS,
       "roundtrip_fee_bps":ROUNDTRIP_FEE_BPS,
       "min_net_edge_bps":MIN_NET_EDGE_BPS,
+      "label_horizon_ms":20_000,
+      "paper_timeout_alignment":"CURRENT_COMMITTEE_TIMEOUT_IS_20S; label horizon aligned",
     }
     if not DB.exists():
         out["error"]="DB_NOT_FOUND"
@@ -197,6 +215,24 @@ def main():
     out["economic_labels"]=dict(Counter(x["economic_label"] for x in valid))
     out["regimes"]=dict(Counter(str(x["regime"]) for x in valid))
 
+    signal_eps=[x for x in valid if x["stage"]=="SIGNAL"]
+    epoch_groups={}
+    for x in signal_eps:
+        ep=x.get("collector_epoch_ms")
+        seq=x.get("signal_seq")
+        if ep is None or seq is None:continue
+        g=epoch_groups.setdefault(str(ep),{"n":0,"min_seq":None,"max_seq":None})
+        g["n"]+=1
+        si=int(seq)
+        g["min_seq"]=si if g["min_seq"] is None else min(g["min_seq"],si)
+        g["max_seq"]=si if g["max_seq"] is None else max(g["max_seq"],si)
+    for g in epoch_groups.values():
+        denom=(g["max_seq"]-g["min_seq"]+1) if g["max_seq"] is not None else 0
+        g["coverage"]=g["n"]/denom if denom>0 else None
+    out["signal_episode_coverage_by_epoch"]=epoch_groups
+    coverages=[g["coverage"] for g in epoch_groups.values() if g["coverage"] is not None]
+    out["signal_episode_coverage_min"]=min(coverages) if coverages else None
+
     rejects=[x for x in valid if x["committee_approved"] is False]
     hard=[x for x in rejects if x["hard_veto"]]
     soft_rejects=[x for x in rejects if not x["hard_veto"]]
@@ -215,7 +251,11 @@ def main():
     out["soft_reject_economic_labels"]=dict(Counter(x["economic_label"] for x in soft_rejects))
 
     # NEUTRAL remains visible but is excluded from binary WIN-vs-LOSS modelling.
-    binary=[x for x in soft_rejects if x["label"] in ("WIN","LOSS")]
+    binary_raw=[x for x in soft_rejects if x["label"] in ("WIN","LOSS")]
+    binary=dedupe_signal_rows(binary_raw,30_000)
+    out["binary_raw_n"]=len(binary_raw)
+    out["binary_dedup_n"]=len(binary)
+    out["duplicate_rows_removed"]=len(binary_raw)-len(binary)
     wins=[x for x in binary if x["label"]=="WIN"]
     losses=[x for x in binary if x["label"]=="LOSS"]
 
@@ -241,6 +281,7 @@ def main():
       "train_win_rate":train_wr,"test_win_rate":test_wr,
       "absolute_win_rate_shift":abs_shift,
       "relative_win_rate_shift":rel_shift,
+      "relative_shift_definition":"abs(test_win_rate-train_win_rate)/train_win_rate",
       "cut_decision_ms":test[0]["decision_ms"] if test else None,
     }
 
@@ -303,6 +344,10 @@ def main():
       "committee_snapshot_coverage_ge_95pct":(
           out["committee_snapshot_coverage"] is not None and
           out["committee_snapshot_coverage"]>=.95
+      ),
+      "signal_episode_coverage_ge_80pct":(
+          out["signal_episode_coverage_min"] is not None and
+          out["signal_episode_coverage_min"]>=.80
       ),
     }
     out["readiness_checks"]=criteria
