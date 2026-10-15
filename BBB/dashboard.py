@@ -45,6 +45,46 @@ def board():
     st.markdown(f"**{active} PAPER wallet USD {mdna_cash:.2f}** · Session {session} · {elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}")
     st.caption(f"Selector: {meta.get('market_dna_selector','T5>=203 & ACTIVITY>=117.02 & D10_T5>=63')} · Exit: {meta.get('market_dna_exit','TP80bps_STOP30bps_TIMEOUT20s')}")
 
+    if meta.get("committee_paper_enabled","0")=="1":
+        st.subheader("Expert Committee — PAPER")
+        c_closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state LIKE 'COMMITTEE_V%'",(session,)).fetchone()[0]
+        c_wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state LIKE 'COMMITTEE_V%' AND net_pnl_usd>0",(session,)).fetchone()[0]
+        c_losses=c_closed-c_wins
+        c_open=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='OPEN' AND risk_state LIKE 'COMMITTEE_V%'",(session,)).fetchone()[0]
+        c_wr=100*c_wins/c_closed if c_closed else 0.0
+        cc=st.columns(8)
+        cc[0].metric("Committee","ON")
+        cc[1].metric("Closed",c_closed)
+        cc[2].metric("W / L",f"{c_wins} / {c_losses}")
+        cc[3].metric("WR",f"{c_wr:.1f}%")
+        cc[4].metric("Realized $",f"{float(meta.get('committee_realized_usd','0') or 0):.4f}")
+        cc[5].metric("Fees $",f"{float(meta.get('committee_fees_usd','0') or 0):.4f}")
+        cc[6].metric("Open",c_open)
+        cc[7].metric("Approved / Signals",f"{meta.get('committee_approved','0')} / {meta.get('committee_signals','0')}")
+        st.caption(f"Experts: IMPULSE 40% · ABSORPTION 30% · TAPE 20% · BOOK 10% · V2 hard-veto envelope · absolute RISK VETO · {meta.get('committee_selector','')}")
+        st.caption(f"Exit: {meta.get('committee_exit','')}")
+        ctr=db.execute("""SELECT symbol,status,entry_vwap,exit_vwap,net_pnl_usd,exit_reason,
+                                 hold_ms,notional_usd,entry_features_json
+                          FROM trades WHERE session_id=? AND risk_state LIKE 'COMMITTEE_V%'
+                          ORDER BY id DESC LIMIT 50""",(session,)).fetchall()
+        crep=[]
+        for r in ctr:
+            ef=parse_json(r[8]); d=ef.get("committee_v1") or {}
+            n=float(r[7] or 0); net=float(r[4] or 0)
+            crep.append({
+              "symbol":r[0],"status":r[1],"entry":r[2],"exit":r[3],
+              "net_$":round(net,5),"net_bps":round(net/n*10000,2) if n else None,
+              "reason":r[5],"hold_s":round(float(r[6] or 0)/1000,3),
+              "regime":d.get("regime"),"weighted":round(float(d.get("weighted",0) or 0),3),
+              "IMP":round(float(d.get("impulse",0) or 0),3),
+              "ABS":round(float(d.get("absorption",0) or 0),3),
+              "TAPE":round(float(d.get("tape",0) or 0),3),
+              "BOOK":round(float(d.get("book",0) or 0),3)
+            })
+        if crep: st.dataframe(crep,hide_index=True,width='stretch')
+        else: st.caption("Waiting for the committee's first approved PAPER BUY…")
+        st.divider()
+
     md_closed=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state='MARKET_DNA_V1'",(session,)).fetchone()[0]
     md_wins=db.execute("SELECT COUNT(*) FROM trades WHERE session_id=? AND status='CLOSED' AND risk_state='MARKET_DNA_V1' AND net_pnl_usd>0",(session,)).fetchone()[0]
     md_losses=md_closed-md_wins

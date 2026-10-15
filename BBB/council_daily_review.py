@@ -16,10 +16,10 @@ def med(xs):
     xs=[float(x) for x in xs if x is not None]
     return statistics.median(xs) if xs else None
 
-def main():
+def analyze():
     out={"status":"BBB_COUNCIL_DAILY_REVIEW"}
     if not DB.exists():
-        out["error"]="DB_NOT_FOUND"; print("BBB_COUNCIL_REVIEW "+json.dumps(out,separators=(",",":"))); return
+        out["error"]="DB_NOT_FOUND"; return out
     cx=sqlite3.connect(f"file:{DB}?mode=ro",uri=True,timeout=5)
     eps=list(cx.execute("""SELECT symbol,decision_ms,decision_stage,outcome_label,
                                  shock_score,absorb_score,turn_score,dynamic_score,
@@ -82,7 +82,11 @@ def main():
     else:
         out["tuning_readiness"]="INSUFFICIENT_SAMPLE_DO_NOT_OVERFIT"
     cx.close()
-    print("BBB_COUNCIL_REVIEW "+json.dumps(out,separators=(",",":")))
+    return out
+
+def main():
+    out=analyze()
+    print("BBB_COUNCIL_REVIEW "+json.dumps(out,separators=(",",":")),flush=True)
 
 if __name__=="__main__":
     main()

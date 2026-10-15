@@ -1,0 +1,17 @@
+name: BBB storage control
+on:
+  push:
+    paths: ['BBB/storage_guard.py', 'BBB/test_storage_guard.py', 'BBB/schema.sql', '.github/workflows/bbb-storage-control.yml']
+  pull_request:
+    paths: ['BBB/storage_guard.py', 'BBB/test_storage_guard.py', 'BBB/schema.sql', '.github/workflows/bbb-storage-control.yml']
+jobs:
+  storage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Storage guard regressions
+        working-directory: BBB
+        run: python -m unittest -v test_storage_guard.py
