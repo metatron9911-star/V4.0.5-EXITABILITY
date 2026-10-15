@@ -100,6 +100,7 @@ class PendingEpisode:
     exit_probe_bid:float|None=None
     council_snapshot:dict|None=None
     decision_mid:float|None=None
+    committee_snapshot:dict|None=None
 
 class MicroFlowDynamic:
     def __init__(self,cx,session_id:str):
@@ -242,7 +243,7 @@ class MicroFlowDynamic:
                            VALUES(?,?,?,?,?,?,?,?)""",
                         (now_ms(),0,self.session_id,"VOL",symbol,stage,reason,json.dumps(payload,separators=(",",":"))))
 
-    def _finalize_decision(self,symbol,decision_stage,f,scores,reason,council=None):
+    def _finalize_decision(self,symbol,decision_stage,f,scores,reason,council=None,committee_snapshot=None):
         st=self.active.pop(symbol,None)
         if not st:return
         dyn=.30*st.shock_score+.30*st.absorb_score+.40*st.turn_score
@@ -254,7 +255,8 @@ class MicroFlowDynamic:
           turn_score=st.turn_score,dynamic_score=dyn,
           frames=list(pre),deadline_ms=f["ts"]+POST_LABEL_MS,
           council_snapshot=council,
-          decision_mid=float(f["mid"]) if f.get("mid") is not None else None
+          decision_mid=float(f["mid"]) if f.get("mid") is not None else None,
+          committee_snapshot=committee_snapshot
         )
         self.pending.append(ep)
         self.counts["decisions"]+=1
@@ -266,9 +268,10 @@ class MicroFlowDynamic:
             "frame":f,"scores":scores
         })
 
-    def _compact_episode_payload(self,frames,council_snapshot=None,entry_ask=None,decision_mid=None):
+    def _compact_episode_payload(self,frames,council_snapshot=None,entry_ask=None,decision_mid=None,committee_snapshot=None):
         if not frames:
             return {"frames":[],"council":council_snapshot or {},
+                    "committee":committee_snapshot or {},
                     "entry_ask":entry_ask,"decision_mid":decision_mid}
         keep=sorted(set([0,len(frames)//5,2*len(frames)//5,3*len(frames)//5,4*len(frames)//5,len(frames)-1]))
         fields=("ts","mid","bid","ask","spread","imb","ret250","ret1",
@@ -277,6 +280,7 @@ class MicroFlowDynamic:
         return {
             "frames":[{k:frames[i].get(k) for k in fields if k in frames[i]} for i in keep],
             "council":council_snapshot or {},
+            "committee":committee_snapshot or {},
             "entry_ask":entry_ask,
             "decision_mid":decision_mid
         }
@@ -311,7 +315,7 @@ class MicroFlowDynamic:
                 )
                 if keep_episode:
                     compact_payload=self._compact_episode_payload(
-                        ep.frames,ep.council_snapshot,ep.entry_ask,ep.decision_mid
+                        ep.frames,ep.council_snapshot,ep.entry_ask,ep.decision_mid,ep.committee_snapshot
                     )
                     self.cx.execute("""INSERT INTO microflow_episodes(
                       session_id,symbol,shock_ms,decision_ms,completed_ms,decision_stage,outcome_label,
@@ -439,12 +443,17 @@ class MicroFlowDynamic:
             alive=(f["ret250"]>=0 and f["250_flow"]>=0 and scores["spread_z"]<2.0)
             st.confirm_frames=st.confirm_frames+1 if alive else 0
             if st.confirm_frames>=2:
+                committee_snapshot=None
                 if self.signal_handler is not None:
                     try:
-                        self.signal_handler(symbol,f,book,getattr(book,"exchange_ts_ms",0),council)
+                        committee_snapshot=self.signal_handler(
+                            symbol,f,book,getattr(book,"exchange_ts_ms",0),council
+                        )
                     except Exception as e:
                         print("COMMITTEE_SIGNAL_HANDLER_FAILED",repr(e),flush=True)
-                self._finalize_decision(symbol,"SIGNAL",f,scores,"TWO_FRAME_REVERSAL_CONFIRM",council)
+                self._finalize_decision(
+                    symbol,"SIGNAL",f,scores,"TWO_FRAME_REVERSAL_CONFIRM",council,committee_snapshot
+                )
 
         self._publish_meta()
 
